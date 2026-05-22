@@ -680,6 +680,47 @@ function extractRelayIdFromThreadRequest(params: unknown): string {
   return match[1];
 }
 
+describe("resolveCodexTurnTerminalIdleTimeoutMs", () => {
+  const BASE = testing.CODEX_TURN_TERMINAL_IDLE_TIMEOUT_MS;
+  const resolve = testing.resolveCodexTurnTerminalIdleTimeoutMs;
+
+  it("falls back to the 30-minute default when no override and no run budget", () => {
+    expect(resolve(undefined)).toBe(BASE);
+  });
+
+  it("derives from the effective run timeout when it exceeds the 30-minute floor (#85242)", () => {
+    // A run configured with a 45-minute timeout must not be aborted early by
+    // the internal 30-minute terminal-idle default.
+    const fortyFiveMin = 45 * 60_000;
+    expect(resolve(undefined, fortyFiveMin)).toBe(fortyFiveMin);
+  });
+
+  it("keeps the 30-minute floor when the run budget is shorter", () => {
+    // Never shorten existing terminal-idle protection below the default floor.
+    expect(resolve(undefined, 10 * 60_000)).toBe(BASE);
+  });
+
+  it("honors an explicit override regardless of the run budget", () => {
+    expect(resolve(5, 200)).toBe(5);
+    expect(resolve(500, 999_999)).toBe(500);
+  });
+
+  it("floors an explicit override at 1ms", () => {
+    expect(resolve(0)).toBe(1);
+    expect(resolve(-100)).toBe(1);
+  });
+
+  it("ignores a non-finite run budget and falls back to the default", () => {
+    expect(resolve(undefined, Infinity)).toBe(BASE);
+    expect(resolve(undefined, Number.NaN)).toBe(BASE);
+  });
+
+  it("ignores a non-finite explicit override and follows the run budget", () => {
+    const fortyFiveMin = 45 * 60_000;
+    expect(resolve(Number.NaN, fortyFiveMin)).toBe(fortyFiveMin);
+  });
+});
+
 describe("runCodexAppServerAttempt", () => {
   beforeEach(async () => {
     clearInternalHooks();

@@ -1560,6 +1560,7 @@ export async function runCodexAppServerAttempt(
     );
   const turnTerminalIdleTimeoutMs = resolveCodexTurnTerminalIdleTimeoutMs(
     options.turnTerminalIdleTimeoutMs,
+    params.timeoutMs,
   );
   let turnCompletionIdleTimer: ReturnType<typeof setTimeout> | undefined;
   let turnCompletionIdleWatchArmed = false;
@@ -4092,14 +4093,24 @@ function resolveCodexPostToolRawAssistantCompletionIdleTimeoutMs(
   return Math.max(1, Math.floor(value));
 }
 
-function resolveCodexTurnTerminalIdleTimeoutMs(value: number | undefined): number {
-  if (value === undefined) {
-    return CODEX_TURN_TERMINAL_IDLE_TIMEOUT_MS;
+function resolveCodexTurnTerminalIdleTimeoutMs(
+  value: number | undefined,
+  effectiveRunTimeoutMs?: number,
+): number {
+  // An explicit terminal-idle override always wins (advanced config / tests).
+  if (value !== undefined && Number.isFinite(value)) {
+    return Math.max(1, Math.floor(value));
   }
-  if (!Number.isFinite(value)) {
-    return CODEX_TURN_TERMINAL_IDLE_TIMEOUT_MS;
+  // No explicit override: follow the effective run-timeout budget so a run
+  // configured with a longer timeout is not cut short by the internal 30-minute
+  // default terminal-idle watchdog (the failure reported in #85242). Take the
+  // larger of the 30-minute floor and the run budget so existing protection is
+  // never shortened. Falls back to the 30-minute constant when no run budget
+  // is known.
+  if (effectiveRunTimeoutMs !== undefined && Number.isFinite(effectiveRunTimeoutMs)) {
+    return Math.max(CODEX_TURN_TERMINAL_IDLE_TIMEOUT_MS, Math.max(1, Math.floor(effectiveRunTimeoutMs)));
   }
-  return Math.max(1, Math.floor(value));
+  return CODEX_TURN_TERMINAL_IDLE_TIMEOUT_MS;
 }
 
 function readDynamicToolCallParams(
@@ -5215,6 +5226,7 @@ export const testing = {
   CODEX_DYNAMIC_MESSAGE_TOOL_TIMEOUT_MS,
   CODEX_TURN_COMPLETION_IDLE_TIMEOUT_MS,
   CODEX_TURN_TERMINAL_IDLE_TIMEOUT_MS,
+  resolveCodexTurnTerminalIdleTimeoutMs,
   createCodexSteeringQueue,
   buildCodexNativeHookRelayId,
   buildDeveloperInstructions,

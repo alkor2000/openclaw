@@ -1,5 +1,19 @@
 import "./runs.js";
-import type { EmbeddedAgentQueueHandle } from "./run-state.js";
+import {
+  ACTIVE_EMBEDDED_RUNS,
+  ACTIVE_EMBEDDED_RUNS_BY_RUN_ID,
+  ACTIVE_EMBEDDED_RUN_SESSION_IDS_BY_FILE,
+  ACTIVE_EMBEDDED_RUN_SESSION_IDS_BY_KEY,
+  ACTIVE_EMBEDDED_RUN_SNAPSHOTS,
+  ABANDONED_EMBEDDED_RUNS_BY_SESSION_ID,
+  ABANDONED_EMBEDDED_RUN_SESSION_IDS_BY_FILE,
+  ABANDONED_EMBEDDED_RUN_SESSION_IDS_BY_KEY,
+  EMBEDDED_RUN_COMPLETION_CLAIMS,
+  EMBEDDED_RUN_FORCED_TERMINAL_SETTLEMENTS,
+  EMBEDDED_RUN_WAITERS,
+  RETAINED_EMBEDDED_RUN_ABORTABILITY_RUN_IDS,
+  type EmbeddedAgentQueueHandle,
+} from "./run-state.js";
 
 type RunHandle = EmbeddedAgentQueueHandle;
 
@@ -12,6 +26,7 @@ export function createEmbeddedRunHandle(
     isStopped?: () => boolean;
     messageInjection?: RunHandle["messageInjection"];
     runId?: string;
+    toolAuthorityFingerprint?: string;
     queueMessage?: RunHandle["queueMessage"];
     supportsQueueMessageImages?: boolean;
     supportsTranscriptCommitWait?: boolean;
@@ -22,6 +37,7 @@ export function createEmbeddedRunHandle(
   const abort = overrides.abort ?? (() => {});
   return {
     runId: overrides.runId,
+    toolAuthorityFingerprint: overrides.toolAuthorityFingerprint,
     queueMessage: overrides.queueMessage ?? (async () => {}),
     ...(overrides.messageInjection ? { messageInjection: overrides.messageInjection } : {}),
     isStreaming: () => overrides.isStreaming ?? true,
@@ -44,7 +60,6 @@ type EmbeddedRunsTestApi = {
     storePath: string;
     updatedAt: number;
   }): Promise<void>;
-  resetActiveEmbeddedRuns(): void;
 };
 
 function getTestApi(): EmbeddedRunsTestApi {
@@ -57,4 +72,33 @@ function getTestApi(): EmbeddedRunsTestApi {
   return api as EmbeddedRunsTestApi;
 }
 
-export const testing = getTestApi();
+export const testing = {
+  ...getTestApi(),
+  resetActiveEmbeddedRuns() {
+    for (const handle of ACTIVE_EMBEDDED_RUNS.values()) {
+      EMBEDDED_RUN_FORCED_TERMINAL_SETTLEMENTS.delete(handle);
+    }
+    for (const waiters of EMBEDDED_RUN_WAITERS.values()) {
+      for (const waiter of waiters) {
+        if (waiter.timer) {
+          clearTimeout(waiter.timer);
+        }
+        waiter.resolve(!waiter.handle);
+      }
+    }
+    EMBEDDED_RUN_WAITERS.clear();
+    ACTIVE_EMBEDDED_RUNS.clear();
+    ACTIVE_EMBEDDED_RUNS_BY_RUN_ID.clear();
+    for (const claim of EMBEDDED_RUN_COMPLETION_CLAIMS.values()) {
+      claim.settleRegistration(undefined);
+    }
+    EMBEDDED_RUN_COMPLETION_CLAIMS.clear();
+    RETAINED_EMBEDDED_RUN_ABORTABILITY_RUN_IDS.clear();
+    ACTIVE_EMBEDDED_RUN_SNAPSHOTS.clear();
+    ACTIVE_EMBEDDED_RUN_SESSION_IDS_BY_KEY.clear();
+    ACTIVE_EMBEDDED_RUN_SESSION_IDS_BY_FILE.clear();
+    ABANDONED_EMBEDDED_RUNS_BY_SESSION_ID.clear();
+    ABANDONED_EMBEDDED_RUN_SESSION_IDS_BY_KEY.clear();
+    ABANDONED_EMBEDDED_RUN_SESSION_IDS_BY_FILE.clear();
+  },
+};

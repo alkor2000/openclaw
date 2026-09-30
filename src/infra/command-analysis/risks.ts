@@ -1,6 +1,6 @@
+import { parseStrictPositiveInteger } from "@openclaw/normalization-core/number-coercion";
 // Command risk detection follows nested carriers, shell wrappers, and inline
 // interpreter eval paths used by approval policy and command explanations.
-import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import { splitShellArgs } from "../../utils/shell-argv.js";
 import {
   COMMAND_CARRIER_EXECUTABLES,
@@ -12,8 +12,11 @@ import {
 import { unwrapKnownDispatchWrapperInvocation } from "../dispatch-wrapper-resolution.js";
 import type { ExecCommandSegment } from "../exec-approvals-analysis.js";
 import { normalizeExecutableToken } from "../exec-wrapper-resolution.js";
-import { parseStrictPositiveInteger } from "../parse-finite-number.js";
-import { POSIX_INLINE_COMMAND_FLAGS, resolveInlineCommandMatch } from "../shell-inline-command.js";
+import {
+  isDirectShellPositionalCarrierCommand,
+  POSIX_INLINE_COMMAND_FLAGS,
+  resolveInlineCommandMatch,
+} from "../shell-inline-command.js";
 import {
   extractShellWrapperInlineCommand,
   isShellWrapperExecutable,
@@ -44,14 +47,14 @@ function isCommandCarrierExecutable(executable: string, options?: { includeExec?
   );
 }
 
-/** Builds candidate command payload strings from nested carriers and shell wrappers. */
-export function buildCommandPayloadCandidates(
+/** Builds candidate command argv arrays from nested carriers and shell wrappers. */
+export function buildCommandPayloadArgvCandidates(
   argv: string[],
   seenArgv = new Set<string>(),
-): string[] {
+): string[][] {
   const key = commandArgvKey(argv);
   if (seenArgv.has(key)) {
-    return argv.length > 0 ? [argv.join(" ")] : [];
+    return argv.length > 0 ? [argv] : [];
   }
   seenArgv.add(key);
   const assignmentStrippedArgv = stripLeadingEnvAssignments(argv);
@@ -59,18 +62,20 @@ export function buildCommandPayloadCandidates(
     includeExec: true,
   });
   const executableArgv = carriedArgv ?? assignmentStrippedArgv;
-  const carriedCandidates = carriedArgv ? buildCommandPayloadCandidates(carriedArgv, seenArgv) : [];
+  const carriedCandidates = carriedArgv
+    ? buildCommandPayloadArgvCandidates(carriedArgv, seenArgv)
+    : [];
   const shellWrapperPayload = extractShellWrapperInlineCommand(executableArgv);
   const shellWrapperCandidates = shellWrapperPayload
     ? (() => {
         const innerArgv = splitShellArgs(shellWrapperPayload);
         return innerArgv
-          ? buildCommandPayloadCandidates(innerArgv, seenArgv)
-          : [shellWrapperPayload];
+          ? buildCommandPayloadArgvCandidates(innerArgv, seenArgv)
+          : [[shellWrapperPayload]];
       })()
     : [];
-  return uniqueCommandPayloadCandidates([
-    ...(executableArgv.length > 0 ? [executableArgv.join(" ")] : []),
+  return uniqueCommandPayloadArgvCandidates([
+    ...(executableArgv.length > 0 ? [executableArgv] : []),
     ...carriedCandidates,
     ...shellWrapperCandidates,
   ]);
@@ -84,8 +89,19 @@ function stripLeadingEnvAssignments(argv: string[]): string[] {
   return index > 0 ? argv.slice(index) : argv;
 }
 
-function uniqueCommandPayloadCandidates(candidates: string[]): string[] {
-  return uniqueStrings(candidates.filter((candidate) => candidate.trim().length > 0));
+function uniqueCommandPayloadArgvCandidates(candidates: string[][]): string[][] {
+  const seen = new Set<string>();
+  return candidates.filter((candidate) => {
+    if (candidate.length === 0) {
+      return false;
+    }
+    const key = commandArgvKey(candidate);
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
 }
 
 type ShellPositionalCarrierPlan = { kind: "all" } | { kind: "indexes"; indexes: number[] };
@@ -115,19 +131,7 @@ function normalizeShellPositionalToken(
 
 function resolveShellPositionalCarrierPlan(command: string): ShellPositionalCarrierPlan | null {
   const trimmed = command.trim();
-  if (trimmed.length === 0) {
-    return null;
-  }
-
-  const shellWhitespace = String.raw`[^\S\r\n]+`;
-  const positionalZero = String.raw`(?:\$(?:0|\{0\})|"\$(?:0|\{0\})")`;
-  const positionalArg = String.raw`(?:\$(?:[@*]|[1-9]|\{[@*1-9]\})|"\$(?:[@*]|[1-9]|\{[@*1-9]\})")`;
-  if (
-    !new RegExp(
-      `^(?:exec${shellWhitespace}(?:--${shellWhitespace})?)?${positionalZero}(?:${shellWhitespace}${positionalArg})*$`,
-      "u",
-    ).test(trimmed)
-  ) {
+  if (!isDirectShellPositionalCarrierCommand(trimmed)) {
     return null;
   }
 

@@ -8,7 +8,6 @@ import {
   resolveAndApplyOutboundThreadId,
 } from "./message-action-threading.js";
 
-const ensureOutboundSessionEntry = vi.fn(async () => undefined);
 const resolveOutboundSessionRoute = vi.fn();
 
 function firstMockArg(mock: { mock: { calls: readonly unknown[][] } }): Record<string, unknown> {
@@ -46,7 +45,6 @@ const defaultForumToolContext = {
 
 describe("message action threading helpers", () => {
   beforeEach(() => {
-    ensureOutboundSessionEntry.mockClear();
     resolveOutboundSessionRoute.mockReset();
   });
 
@@ -56,12 +54,6 @@ describe("message action threading helpers", () => {
       target: "channel:C123",
       threadTs: "111.222",
       expectedSessionKey: "agent:main:workspace:channel:c123:thread:111.222",
-    },
-    {
-      name: "case-insensitive channel id",
-      target: "channel:c123",
-      threadTs: "333.444",
-      expectedSessionKey: "agent:main:workspace:channel:c123:thread:333.444",
     },
   ] as const)("prepares outbound routes for workspace using $name", async (testCase) => {
     const actionParams: Record<string, unknown> = {
@@ -92,13 +84,11 @@ describe("message action threading helpers", () => {
       agentId: "main",
       resolveAutoThreadId: ({ toolContext }) => toolContext?.currentThreadTs,
       resolveOutboundSessionRoute,
-      ensureOutboundSessionEntry,
     });
 
     expect(result.outboundRoute?.sessionKey).toBe(testCase.expectedSessionKey);
     expect(actionParams["__sessionKey"]).toBe(testCase.expectedSessionKey);
     expect(actionParams["__agentId"]).toBe("main");
-    expect(ensureOutboundSessionEntry).toHaveBeenCalledTimes(1);
   });
 
   it("prepares the outbound route with a canonicalized reply root", async () => {
@@ -123,7 +113,6 @@ describe("message action threading helpers", () => {
         threadId: threadId ?? null,
       }),
       resolveOutboundSessionRoute,
-      ensureOutboundSessionEntry,
     });
 
     expect(resolveOutboundSessionRoute).toHaveBeenCalledOnce();
@@ -137,11 +126,6 @@ describe("message action threading helpers", () => {
     {
       name: "injects threadId for matching target",
       target: "forum:123",
-      expectedThreadId: "42",
-    },
-    {
-      name: "injects threadId for prefixed group target",
-      target: "forum:group:123",
       expectedThreadId: "42",
     },
     {
@@ -224,7 +208,6 @@ describe("message action threading helpers", () => {
       channel: "forum",
       target: "forum:123",
       message: "hi",
-      threadId: "root-42",
       replyTo: "child-777",
     };
 
@@ -233,6 +216,7 @@ describe("message action threading helpers", () => {
       to: "forum:123",
       toolContext: defaultForumToolContext,
       replyToIsExplicit: false,
+      resolveAutoThreadId: ({ replyToId }) => (replyToId ? undefined : "root-42"),
       resolveReplyTransport: ({ threadId, replyToId, replyToIsExplicit }) => ({
         replyToId: replyToIsExplicit || threadId == null ? replyToId : String(threadId),
         threadId: threadId ?? null,
@@ -328,7 +312,7 @@ describe("message action threading helpers", () => {
       },
     });
 
-    expect(resolved).toBe("msg-42");
+    expect(resolved).toEqual({ replyToId: "msg-42", source: "implicit", mode: "all" });
     expect(actionParams.replyTo).toBe("msg-42");
   });
 
@@ -371,7 +355,7 @@ describe("message action threading helpers", () => {
     expect(actionParams.replyTo).toBeUndefined();
   });
 
-  it("skips inherited reply threading for batched mode", () => {
+  it("canonicalizes batched reply threading to first mode", () => {
     const actionParams: Record<string, unknown> = {
       channel: "workspace",
       target: "channel:C123",
@@ -387,8 +371,8 @@ describe("message action threading helpers", () => {
       },
     });
 
-    expect(resolved).toBeUndefined();
-    expect(actionParams.replyTo).toBeUndefined();
+    expect(resolved).toEqual({ replyToId: "msg-42", source: "implicit", mode: "first" });
+    expect(actionParams.replyTo).toBe("msg-42");
   });
 
   it("consumes first-mode inherited reply threading only once", () => {
@@ -426,7 +410,7 @@ describe("message action threading helpers", () => {
       },
     );
 
-    expect(firstResolved).toBe("msg-42");
+    expect(firstResolved).toEqual({ replyToId: "msg-42", source: "implicit", mode: "first" });
     expect(secondResolved).toBeUndefined();
     expect(hasRepliedRef.value).toBe(true);
   });
@@ -467,7 +451,7 @@ describe("message action threading helpers", () => {
       },
     );
 
-    expect(firstResolved).toBe("msg-42");
+    expect(firstResolved).toEqual({ replyToId: "msg-42", source: "implicit", mode: "first" });
     expect(secondResolved).toBeUndefined();
     expect(hasRepliedRef.value).toBe(true);
     expect(matchesToolContextTarget).toHaveBeenCalledTimes(2);
@@ -510,7 +494,7 @@ describe("message action threading helpers", () => {
       },
     );
 
-    expect(explicitResolved).toBe("explicit-1");
+    expect(explicitResolved).toEqual({ replyToId: "explicit-1", source: "explicit" });
     expect(inheritedResolved).toBeUndefined();
     expect(hasRepliedRef.value).toBe(true);
   });

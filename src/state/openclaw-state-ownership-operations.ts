@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import { assertStateDatabaseAccessAllowed } from "../infra/gateway-state-owner.js";
 import { isGatewayExternallySupervised } from "../infra/gateway-supervision.js";
 import {
   clearNodeSqliteKyselyCacheForDatabase,
@@ -7,23 +8,22 @@ import {
 } from "../infra/kysely-sync.js";
 import { openNodeSqliteDatabase } from "../infra/node-sqlite.js";
 import { assertSqliteIntegrity } from "../infra/sqlite-integrity.js";
+import { OpenClawStateOwnershipMetadataError } from "../infra/sqlite-lifecycle-errors.js";
 import { runSqliteImmediateTransactionSync } from "../infra/sqlite-transaction.js";
 import { configureSqliteWalMaintenance, type SqliteWalMaintenance } from "../infra/sqlite-wal.js";
+import { openClawStateDatabaseCache } from "./openclaw-state-db-cache.js";
 import { OPENCLAW_SQLITE_BUSY_TIMEOUT_MS } from "./openclaw-state-db-contract.js";
-import {
-  assertOpenClawStateDatabaseForMaintenance,
-  resolveDatabasePath,
-} from "./openclaw-state-db-maintenance.js";
+import { assertOpenClawStateDatabaseForMaintenance } from "./openclaw-state-db-maintenance.js";
 import type { DB as OpenClawStateKyselyDatabase } from "./openclaw-state-db.generated.js";
 import {
   openOpenClawStateDatabase,
   runOpenClawStateWriteTransaction,
   type OpenClawStateDatabaseOptions,
 } from "./openclaw-state-db.js";
+import { resolveDatabasePath } from "./openclaw-state-db.paths.js";
 import {
   inspectOpenClawStateOwnershipFromDatabase,
   normalizeOpenClawStateManagerId,
-  OpenClawStateOwnershipMetadataError,
   STATE_SUPERVISION_KEY,
   type OpenClawExternalStateOwnership,
 } from "./openclaw-state-ownership.js";
@@ -96,22 +96,27 @@ function repairMalformedOwnershipClaim(
   databasePath: string,
   managerId: string,
 ): OpenClawExternalStateOwnership {
-  const database = openNodeSqliteDatabase(databasePath);
+  assertStateDatabaseAccessAllowed(databasePath);
+  const existing = openClawStateDatabaseCache.getOpenClawStateDatabaseIfOpenAtPath(databasePath);
+  const database = existing?.db ?? openNodeSqliteDatabase(databasePath);
   let walMaintenance: SqliteWalMaintenance | undefined;
   try {
     database.exec(`PRAGMA busy_timeout = ${OPENCLAW_SQLITE_BUSY_TIMEOUT_MS};`);
     assertSqliteIntegrity(database, databasePath);
     assertOpenClawStateDatabaseForMaintenance(database, { pathname: databasePath });
-    walMaintenance = configureSqliteWalMaintenance(database, {
-      busyTimeoutMs: OPENCLAW_SQLITE_BUSY_TIMEOUT_MS,
-      checkpointIntervalMs: 0,
-      checkpointMode: "TRUNCATE",
-      databaseLabel: "OpenClaw shared state ownership",
-      databasePath,
-    });
+    walMaintenance =
+      existing?.walMaintenance ??
+      configureSqliteWalMaintenance(database, {
+        busyTimeoutMs: OPENCLAW_SQLITE_BUSY_TIMEOUT_MS,
+        checkpointIntervalMs: 0,
+        checkpointMode: "TRUNCATE",
+        databaseLabel: "OpenClaw shared state ownership",
+        databasePath,
+      });
     const ownership = runSqliteImmediateTransactionSync(
       database,
       () => {
+        assertStateDatabaseAccessAllowed(databasePath);
         assertOpenClawStateDatabaseForMaintenance(database, { pathname: databasePath });
         return claimOwnershipRow(database, databasePath, managerId, true);
       },
@@ -124,9 +129,11 @@ function repairMalformedOwnershipClaim(
     requireOwnershipCheckpoint(walMaintenance, databasePath);
     return ownership;
   } finally {
-    walMaintenance?.close({ checkpointMode: "PASSIVE" });
-    clearNodeSqliteKyselyCacheForDatabase(database);
-    database.close();
+    if (!existing) {
+      walMaintenance?.close({ checkpointMode: "PASSIVE" });
+      clearNodeSqliteKyselyCacheForDatabase(database);
+      database.close();
+    }
   }
 }
 

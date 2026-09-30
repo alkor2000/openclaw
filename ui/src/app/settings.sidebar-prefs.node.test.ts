@@ -1,76 +1,96 @@
 // @vitest-environment node
-// Sidebar zone and session-section persistence split from settings.node.test.ts
-// to keep both files under the lint size budget.
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createStorageMock } from "../test-helpers/storage.ts";
-import { loadSettings, saveSettings, type UiSettings } from "./settings.ts";
-
-function setTestLocation(params: { protocol: string; host: string; pathname: string }) {
-  vi.stubGlobal("location", {
-    protocol: params.protocol,
-    host: params.host,
-    hostname: params.host.replace(/:\d+$/, ""),
-    pathname: params.pathname,
-  } as Location);
-}
-
-function expectedGatewayUrl(basePath: string): string {
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  return `${proto}://${location.host}${basePath}`;
-}
-
-function makeSettings(gatewayUrl: string, overrides: Partial<UiSettings> = {}): UiSettings {
-  return {
-    gatewayUrl,
-    token: "",
-    sessionKey: "main",
-    lastActiveSessionKey: "main",
-    theme: "claw",
-    themeMode: "system",
-    chatShowThinking: true,
-    chatShowToolCalls: true,
-    navCollapsed: false,
-    navWidth: 258,
-    sidebarEntries: [],
-    ...overrides,
-  };
-}
+// Sidebar zone and session-section persistence split from the settings suites
+// to keep each file under the lint size budget.
+import { beforeEach, describe, expect, it } from "vitest";
+import {
+  expectedGatewayUrl,
+  installSettingsStorageLifecycle,
+  makeUiSettings,
+  setTestLocation,
+} from "../test-helpers/settings-node.ts";
+import { loadSettings, saveSettings } from "./settings.ts";
 
 describe("sidebar preference persistence", () => {
+  installSettingsStorageLifecycle();
   beforeEach(() => {
-    vi.stubGlobal("localStorage", createStorageMock());
-    vi.stubGlobal("sessionStorage", createStorageMock());
-    vi.stubGlobal("navigator", { language: "en-US" } as Navigator);
-    localStorage.clear();
-    sessionStorage.clear();
+    setTestLocation({ protocol: "https:", host: "gateway.example:8443", pathname: "/" });
   });
 
-  afterEach(() => {
-    vi.restoreAllMocks();
-    vi.stubGlobal("localStorage", createStorageMock());
-    vi.stubGlobal("sessionStorage", createStorageMock());
-    vi.stubGlobal("navigator", { language: "en-US" } as Navigator);
+  it("defaults old or invalid agent modes to chip and persists explicit roster mode", () => {
     setTestLocation({ protocol: "https:", host: "gateway.example", pathname: "/" });
-    saveSettings(loadSettings());
-    vi.unstubAllGlobals();
+    const gatewayUrl = expectedGatewayUrl("");
+    const key = `openclaw.control.settings.v1:${gatewayUrl}`;
+    expect(loadSettings().sidebarAgentsMode).toBe("chip");
+    for (const mode of ["roster", "chip"]) {
+      saveSettings(
+        makeUiSettings(gatewayUrl, { sidebarAgentsMode: mode === "roster" ? "roster" : "chip" }),
+      );
+      expect(loadSettings().sidebarAgentsMode).toBe(mode);
+    }
+    for (const mode of [undefined, true, "invalid", null]) {
+      localStorage.setItem(
+        key,
+        JSON.stringify({ ...makeUiSettings(gatewayUrl), sidebarAgentsMode: mode }),
+      );
+      expect(loadSettings().sidebarAgentsMode).toBe("chip");
+    }
+  });
+
+  it.each([
+    [" Research ", "research"],
+    [null, null],
+    [undefined, undefined],
+    [" ", undefined],
+    [true, undefined],
+    [42, undefined],
+    [{ agent: "research" }, undefined],
+  ])(
+    "normalizes remembered team scope %j without conflating all agents and unset",
+    (value, expected) => {
+      setTestLocation({ protocol: "https:", host: "gateway.example", pathname: "/" });
+      const gatewayUrl = expectedGatewayUrl("");
+      const key = `openclaw.control.settings.v1:${gatewayUrl}`;
+      localStorage.setItem(
+        key,
+        JSON.stringify({ ...makeUiSettings(gatewayUrl), sidebarPreTeamScope: value }),
+      );
+      const settings = loadSettings();
+      expect(settings.sidebarPreTeamScope).toBe(expected);
+      saveSettings(settings);
+      expect(loadSettings().sidebarPreTeamScope).toBe(expected);
+      const persisted = JSON.parse(localStorage.getItem(key) ?? "{}") as Record<string, unknown>;
+      expect(Object.hasOwn(persisted, "sidebarPreTeamScope")).toBe(expected !== undefined);
+    },
+  );
+
+  it("persists sidebar width without leaking tab-local visibility across reloads", () => {
+    const gatewayUrl = expectedGatewayUrl("");
+    const scopedKey = `openclaw.control.settings.v1:${gatewayUrl}`;
+
+    saveSettings(makeUiSettings(gatewayUrl, { navCollapsed: true, navWidth: 320 }));
+
+    const persisted = JSON.parse(localStorage.getItem(scopedKey) ?? "{}") as Record<
+      string,
+      unknown
+    >;
+    expect(persisted).not.toHaveProperty("navCollapsed");
+    expect(persisted.navWidth).toBe(320);
+    expect(loadSettings()).toMatchObject({ navCollapsed: false, navWidth: 320 });
+
+    localStorage.setItem(scopedKey, JSON.stringify({ ...persisted, navCollapsed: true }));
+    expect(loadSettings()).toMatchObject({ navCollapsed: false, navWidth: 320 });
   });
 
   it("persists sidebar entries across save and load, normalizing bad values", () => {
-    setTestLocation({
-      protocol: "https:",
-      host: "gateway.example:8443",
-      pathname: "/",
-    });
-
     const gwUrl = expectedGatewayUrl("");
     saveSettings(
-      makeSettings(gwUrl, {
+      makeUiSettings(gwUrl, {
         sidebarEntries: ["route:tasks", "route:cron"],
         textScale: 100,
       }),
     );
 
-    expect(loadSettings().sidebarEntries).toEqual(["route:tasks", "route:cron"]);
+    expect(loadSettings().sidebarEntries).toEqual(["route:cron"]);
     expect(loadSettings().navWidth).toBe(258);
 
     // Corrupt the persisted list; load falls back to the default pinned set.
@@ -83,26 +103,27 @@ describe("sidebar preference persistence", () => {
     persisted.navWidth = 220;
     localStorage.setItem(scopedKey, JSON.stringify(persisted));
 
-    expect(loadSettings().sidebarEntries).toEqual(["route:cron", "route:plugins"]);
+    expect(loadSettings().sidebarEntries).toEqual([
+      "route:agents-home",
+      "route:dashboards",
+      "route:systems",
+      "route:cron",
+      "route:plugins",
+    ]);
     expect(loadSettings().navWidth).toBe(258);
   });
 
   it("migrates the legacy route-only list once and writes only sidebarEntries", () => {
-    setTestLocation({
-      protocol: "https:",
-      host: "gateway.example:8443",
-      pathname: "/",
-    });
     const gwUrl = expectedGatewayUrl("");
     const scopedKey = `openclaw.control.settings.v1:${gwUrl}`;
-    const legacy = makeSettings(gwUrl) as unknown as Record<string, unknown>;
+    const legacy = makeUiSettings(gwUrl) as unknown as Record<string, unknown>;
     delete legacy.sidebarEntries;
-    legacy.sidebarPinnedRoutes = ["usage", "tasks", "usage", "worktrees", 7];
+    legacy.sidebarPinnedRoutes = ["workboard", "usage", "tasks", "usage", "worktrees", 7];
     localStorage.setItem(scopedKey, JSON.stringify(legacy));
 
-    expect(loadSettings().sidebarEntries).toEqual(["route:usage", "route:tasks"]);
+    expect(loadSettings().sidebarEntries).toEqual(["plugin:workboard/workboard", "route:usage"]);
     const migrated = JSON.parse(localStorage.getItem(scopedKey) ?? "{}") as Record<string, unknown>;
-    expect(migrated.sidebarEntries).toEqual(["route:usage", "route:tasks"]);
+    expect(migrated.sidebarEntries).toEqual(["plugin:workboard/workboard", "route:usage"]);
     expect(migrated).not.toHaveProperty("sidebarPinnedRoutes");
   });
 });

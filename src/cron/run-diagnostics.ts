@@ -1,16 +1,18 @@
 /** Builds bounded, redacted diagnostics for cron run logs and UI surfaces. */
 import { asOptionalObjectRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import {
+  CODE_MODE_MCP_CATALOG_MISS_MESSAGE,
+  isEmbeddedRunTerminalToolFailure,
+} from "../agents/embedded-agent-runner/terminal-tool-failure.js";
 import { isToolAllowedByPolicyName } from "../agents/tool-policy-match.js";
-import { normalizeToolName as normalizePolicyToolName } from "../agents/tool-policy.js";
-import { getReplyPayloadMetadata } from "../auto-reply/reply-payload.js";
+import { normalizeToolPolicyName as normalizePolicyToolName } from "../agents/tool-policy.js";
 import { redactSensitiveText } from "../logging/redact.js";
 import {
   formatUnknownError,
   normalizeCronRunDiagnosticSummary,
-  normalizeCronRunDiagnostics as normalizeCronRunDiagnosticsValue,
+  normalizeCronRunDiagnosticsCore as normalizeCronRunDiagnosticsValue,
   normalizeExitCode,
-  normalizeToolName,
   tailText,
 } from "./run-diagnostics-normalize.js";
 import type {
@@ -139,20 +141,10 @@ export function createCronRunDiagnosticsFromMissingWebSearchProvider(params: {
   if (!toolsAllowRequestsWebSearch(params.toolsAllow)) {
     return undefined;
   }
-  return normalizeCronRunDiagnostics(
-    {
-      summary: MISSING_WEB_SEARCH_PROVIDER_DIAGNOSTIC_MESSAGE,
-      entries: [
-        {
-          ts: params.nowMs?.() ?? Date.now(),
-          source: "cron-preflight",
-          severity: "warn",
-          message: MISSING_WEB_SEARCH_PROVIDER_DIAGNOSTIC_MESSAGE,
-          toolName: WEB_SEARCH_TOOL_NAME,
-        },
-      ],
-    },
-    { nowMs: params.nowMs },
+  return createCronRunDiagnosticsFromError(
+    "cron-preflight",
+    MISSING_WEB_SEARCH_PROVIDER_DIAGNOSTIC_MESSAGE,
+    { severity: "warn", nowMs: params.nowMs, toolName: WEB_SEARCH_TOOL_NAME },
   );
 }
 
@@ -181,22 +173,12 @@ function createCronRunDiagnosticsFromExecDetails(
     : typeof exitCode === "number"
       ? `exec failed with exit code ${exitCode}`
       : "exec failed";
-  return normalizeCronRunDiagnostics(
-    {
-      summary: message,
-      entries: [
-        {
-          ts: opts?.nowMs?.() ?? Date.now(),
-          source: "exec",
-          severity: opts?.finalStatus === "ok" ? "warn" : status === "failed" ? "error" : "warn",
-          message,
-          toolName: opts?.toolName,
-          exitCode,
-        },
-      ],
-    },
-    opts,
-  );
+  return createCronRunDiagnosticsFromError("exec", message, {
+    severity: opts?.finalStatus === "ok" ? "warn" : status === "failed" ? "error" : "warn",
+    nowMs: opts?.nowMs,
+    toolName: opts?.toolName,
+    exitCode,
+  });
 }
 
 /** Extracts tool-call failure diagnostics from an agent reply payload. */
@@ -208,7 +190,7 @@ function createCronRunDiagnosticsFromToolPayload(
   if (!record) {
     return undefined;
   }
-  const toolName = normalizeToolName(record.toolName) ?? normalizeToolName(record.name);
+  const toolName = normalizeOptionalString(record.toolName) ?? normalizeOptionalString(record.name);
   const detailsDiagnostics = createCronRunDiagnosticsFromExecDetails(record.details, {
     nowMs: opts?.nowMs,
     toolName,
@@ -216,13 +198,10 @@ function createCronRunDiagnosticsFromToolPayload(
   });
   const isError = record.isError === true;
   const text = typeof record.text === "string" ? record.text : undefined;
-  const isNonTerminalToolWarning =
-    opts?.finalStatus === "ok" &&
-    getReplyPayloadMetadata(record)?.nonTerminalToolErrorWarning === true;
   const textDiagnostics =
     isError && text
       ? createCronRunDiagnosticsFromError("tool", text, {
-          severity: isNonTerminalToolWarning || opts?.finalStatus === "ok" ? "warn" : "error",
+          severity: opts?.finalStatus === "ok" ? "warn" : "error",
           nowMs: opts?.nowMs,
           toolName,
         })
@@ -249,6 +228,16 @@ export function createCronRunDiagnosticsFromAgentResult(
       : undefined;
   if (typeof metaError?.message === "string") {
     diagnostics.push(createCronRunDiagnosticsFromError("agent-run", metaError.message, opts));
+  }
+  const terminalToolFailure = meta.terminalToolFailure;
+  if (isEmbeddedRunTerminalToolFailure(terminalToolFailure)) {
+    diagnostics.push(
+      createCronRunDiagnosticsFromError("tool", CODE_MODE_MCP_CATALOG_MISS_MESSAGE, {
+        ...opts,
+        severity: opts?.finalStatus === "ok" ? "warn" : "error",
+        toolName: terminalToolFailure.toolName,
+      }),
+    );
   }
   const failureSignal =
     meta.failureSignal && typeof meta.failureSignal === "object"

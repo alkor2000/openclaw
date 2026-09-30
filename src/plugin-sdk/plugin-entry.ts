@@ -1,5 +1,4 @@
-// Plugin entry contracts define the manifest-facing hooks implemented by plugin packages.
-export type { OpenClawConfig } from "../config/types.openclaw.js";
+// All public plugin SDK contracts are experimental; see docs/plugins/sdk-overview.md#api-stability.
 import { emptyPluginConfigSchema } from "../plugins/config-schema.js";
 import type {
   OpenClawPluginConfigSchema,
@@ -7,6 +6,14 @@ import type {
   ProviderBuiltInModelSuppressionContext as ProviderBuiltInModelSuppressionContextType,
 } from "../plugins/types.js";
 import { createCachedLazyValueGetter } from "./lazy-value.js";
+export type {
+  PluginCapabilityCatalogContext,
+  PluginCapabilityCatalogEntry,
+  PluginCapabilityCatalogHostContext,
+  PluginCapabilityCatalogHostEntry,
+} from "../plugins/capability-catalog-context.types.js";
+export type { PluginCapabilityCatalog } from "../plugins/capability-catalog.types.js";
+export type { OpenClawConfig } from "../config/types.openclaw.js";
 
 export type {
   AgentHarness,
@@ -105,6 +112,7 @@ export type {
   ProviderPrepareExtraParamsContext,
   ProviderPrepareRuntimeAuthContext,
   ProviderPreparedRuntimeAuth,
+  ProviderReconcileLocalServiceContext,
   ProviderReasoningOutputMode,
   ProviderReasoningOutputModeContext,
   ProviderReplayPolicy,
@@ -131,9 +139,11 @@ export type {
   TranscriptSourceProvider,
   UnifiedModelCatalogProviderContext,
   UnifiedModelCatalogProviderPlugin,
+  WorkerDesktopApp,
   WorkerDesktopEndpoint,
   WorkerLease,
   WorkerLeaseStatus,
+  WorkerMachineOption,
   WorkerProfile,
   WorkerProvider,
   WorkerSshEndpoint,
@@ -162,8 +172,10 @@ export type {
   PluginHookInboundClaimEvent,
   PluginHookInboundClaimResult,
   PluginHookInboundMessageMetadata,
+  PluginHookLocation,
   PluginHookMediaFact,
   PluginHookMessageReceivedEvent,
+  PluginHookProviderUpdate,
   PluginHookSkillArtifact,
   PluginHookSkillBundleFile,
   PluginHookSkillBundleSnapshot,
@@ -218,6 +230,8 @@ type DefinedPluginEntry = Omit<DefinePluginEntryOptions, "configSchema"> & {
  * Use this for provider, tool, command, service, memory, and context-engine
  * plugins. Channel plugins should use `defineChannelPluginEntry(...)` from
  * `openclaw/plugin-sdk/core` so they inherit the channel capability wiring.
+ *
+ * @experimental Pin and test OpenClaw host versions; existing compatibility windows still apply.
  */
 export function definePluginEntry({
   id,

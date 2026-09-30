@@ -2,12 +2,12 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createSolidPngBuffer } from "../../test/helpers/image-fixtures.js";
 import { toInboundMediaFactsWithMetadata } from "../channels/inbound-event/media.js";
 import { createManagedOutgoingMediaBlocks } from "../gateway/managed-image-attachments.js";
-import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import { withEnvAsync } from "../test-utils/env.js";
+import { cleanupSessionStateForTest } from "../test-utils/session-state-cleanup.js";
 import { resolveLocalMediaPath } from "./local-media-path.js";
 import { appendLocalMediaParentRoots } from "./local-roots.js";
 
@@ -20,8 +20,8 @@ vi.mock("./media-probe.js", async (importOriginal) => ({
   probeMediaFilesWithinBudget,
 }));
 
-function toUppercaseFileUrl(filePath: string): string {
-  return pathToFileURL(filePath).href.replace(/^file:/u, "FILE:");
+function toSingleSlashUppercaseFileUrl(filePath: string): string {
+  return pathToFileURL(filePath).href.replace(/^file:\/\//u, "FILE:");
 }
 
 async function withTempRoot<T>(run: (root: string) => Promise<T>): Promise<T> {
@@ -29,7 +29,7 @@ async function withTempRoot<T>(run: (root: string) => Promise<T>): Promise<T> {
   try {
     return await run(root);
   } finally {
-    closeOpenClawStateDatabaseForTest();
+    await cleanupSessionStateForTest({ stateDir: root, rootPath: root });
     await fs.rm(root, { recursive: true, force: true });
   }
 }
@@ -39,31 +39,27 @@ describe.runIf(process.platform === "win32")("Windows local media file URLs", ()
     probeMediaFilesWithinBudget.mockReset();
   });
 
-  afterEach(() => {
-    closeOpenClawStateDatabaseForTest();
-  });
-
-  it("resolves mixed-case local file schemes and rejects unsafe file URLs", async () => {
+  it("resolves single-slash mixed-case file schemes and rejects unsafe file URLs", async () => {
     await withTempRoot(async (root) => {
       const sourcePath = path.join(root, "Media Folder Ω", "photo.png");
 
-      expect(resolveLocalMediaPath(toUppercaseFileUrl(sourcePath))).toBe(sourcePath);
+      expect(resolveLocalMediaPath(toSingleSlashUppercaseFileUrl(sourcePath))).toBe(sourcePath);
       expect(resolveLocalMediaPath("FILE://server/share/photo.png")).toBeUndefined();
       expect(resolveLocalMediaPath("FILE:///C:/Media%2Fphoto.png")).toBeUndefined();
     });
   });
 
-  it("adds the exact parent root for an uppercase file URL", async () => {
+  it("adds the exact parent root for a single-slash uppercase file URL", async () => {
     await withTempRoot(async (root) => {
       const sourcePath = path.join(root, "Media Folder Ω", "photo.png");
 
-      expect(appendLocalMediaParentRoots([], [toUppercaseFileUrl(sourcePath)])).toEqual([
+      expect(appendLocalMediaParentRoots([], [toSingleSlashUppercaseFileUrl(sourcePath)])).toEqual([
         path.dirname(sourcePath),
       ]);
     });
   });
 
-  it("probes inbound metadata through an uppercase file URL", async () => {
+  it("probes inbound metadata through a single-slash uppercase file URL", async () => {
     await withTempRoot(async (root) => {
       const sourcePath = path.join(root, "Media Folder Ω", "voice.mp3");
       await fs.mkdir(path.dirname(sourcePath), { recursive: true });
@@ -72,10 +68,13 @@ describe.runIf(process.platform === "win32")("Windows local media file URLs", ()
 
       await expect(
         toInboundMediaFactsWithMetadata([
-          { path: toUppercaseFileUrl(sourcePath), contentType: "audio/mpeg" },
+          { path: toSingleSlashUppercaseFileUrl(sourcePath), contentType: "audio/mpeg" },
         ]),
       ).resolves.toEqual([
-        expect.objectContaining({ path: toUppercaseFileUrl(sourcePath), durationMs: 1250 }),
+        expect.objectContaining({
+          path: toSingleSlashUppercaseFileUrl(sourcePath),
+          durationMs: 1250,
+        }),
       ]);
       expect(probeMediaFilesWithinBudget).toHaveBeenCalledWith(
         [{ filePath: sourcePath, kind: "audio" }],
@@ -84,12 +83,12 @@ describe.runIf(process.platform === "win32")("Windows local media file URLs", ()
     });
   });
 
-  it("ingests an uppercase file URL into managed outgoing media", async () => {
+  it("ingests a single-slash uppercase file URL into managed outgoing media", async () => {
     await withTempRoot(async (root) => {
       const sourcePath = path.join(root, "workspace", "Media Folder Ω", "photo.png");
       await fs.mkdir(path.dirname(sourcePath), { recursive: true });
       await fs.writeFile(sourcePath, createSolidPngBuffer(8, 8, { r: 24, g: 64, b: 128 }));
-      const sourceUrl = new URL(toUppercaseFileUrl(sourcePath));
+      const sourceUrl = new URL(toSingleSlashUppercaseFileUrl(sourcePath));
       sourceUrl.searchParams.set("sig", "secret");
       sourceUrl.hash = "preview";
 
@@ -97,7 +96,12 @@ describe.runIf(process.platform === "win32")("Windows local media file URLs", ()
         const blocks = await createManagedOutgoingMediaBlocks({
           stateDir: root,
           sessionKey: "agent:main:main",
-          mediaUrls: [sourceUrl.href.replace(/^file:/u, "FILE:")],
+          items: [
+            {
+              url: sourceUrl.href.replace(/^file:/u, "FILE:"),
+              trustedLocal: false,
+            },
+          ],
           localRoots: [path.join(root, "workspace")],
         });
 

@@ -1,9 +1,8 @@
-/** Facade-backed doctor checks and cleanup for bundled browser plugin state. */
 import fs from "node:fs";
 import path from "node:path";
 import { note } from "../../packages/terminal-core/src/note.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { loadBundledPluginPublicSurfaceModuleSync } from "../plugin-sdk/facade-loader.js";
+import { loadBundledPluginPublicSurfaceModuleSyncCore } from "../plugin-sdk/facade-loader.js";
 import { resolveConfigDir } from "../utils.js";
 
 type BrowserDoctorDeps = {
@@ -28,11 +27,17 @@ type BrowserDoctorRepairDeps = {
   movePathToTrash?: (targetPath: string) => Promise<string>;
 };
 
-/** Legacy browser profile paths detected before cleanup moves them aside. */
 export type LegacyClawdBrowserProfileResidue = {
   legacyProfileDir: string;
   legacyUserDataDir: string;
   canonicalUserDataDir: string;
+};
+
+type BrowserNativeHostRepairResult = {
+  status?: "repaired" | "skipped" | "failed";
+  reason?: string;
+  changes: string[];
+  warnings: string[];
 };
 
 type BrowserDoctorSurface = {
@@ -45,13 +50,28 @@ type BrowserDoctorSurface = {
     cfg: OpenClawConfig,
     deps?: BrowserDoctorRepairDeps,
   ) => Promise<{ changes: string[]; warnings: string[] }>;
+  maybeRepairOwnedChromeExtensionNativeHosts?: () => Promise<BrowserNativeHostRepairResult>;
 };
 
 function loadBrowserDoctorSurface(): BrowserDoctorSurface {
-  return loadBundledPluginPublicSurfaceModuleSync<BrowserDoctorSurface>({
+  return loadBundledPluginPublicSurfaceModuleSyncCore<BrowserDoctorSurface>({
     dirName: "browser",
     artifactBasename: "browser-doctor.js",
   });
+}
+
+export async function maybeRepairOwnedChromeExtensionNativeHosts(): Promise<BrowserNativeHostRepairResult> {
+  try {
+    const repair = loadBrowserDoctorSurface().maybeRepairOwnedChromeExtensionNativeHosts;
+    return repair ? await repair() : { changes: [], warnings: [] };
+  } catch (error) {
+    return {
+      changes: [],
+      warnings: [
+        `Browser extension native-host repair is unavailable: ${error instanceof Error ? error.message : String(error)}`,
+      ],
+    };
+  }
 }
 
 function mayHaveLegacyClawdBrowserProfileResidue(deps?: BrowserDoctorRepairDeps): boolean {
@@ -66,7 +86,6 @@ function mayHaveLegacyClawdBrowserProfileResidue(deps?: BrowserDoctorRepairDeps)
   }
 }
 
-/** Emits browser readiness notes through the bundled browser plugin doctor surface. */
 export async function noteChromeMcpBrowserReadiness(cfg: OpenClawConfig, deps?: BrowserDoctorDeps) {
   try {
     await loadBrowserDoctorSurface().noteChromeMcpBrowserReadiness(cfg, deps);
@@ -92,7 +111,6 @@ export async function detectLegacyClawdBrowserProfileResidue(
   return detect(cfg, deps);
 }
 
-/** Archives legacy clawd browser profile residue through the browser plugin repair hook. */
 export async function maybeArchiveLegacyClawdBrowserProfileResidue(
   cfg: OpenClawConfig,
   deps?: BrowserDoctorRepairDeps,

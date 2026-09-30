@@ -1,5 +1,9 @@
 import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 import { GatewayClientRequestError, type GatewayClientOptions } from "../gateway/client.js";
+import {
+  NODE_RUNNER_INVENTORY_UPDATE_METHOD,
+  NODE_WORKER_SUPERVISOR_PROTOCOL_FEATURE,
+} from "../infra/node-runner-inventory.js";
 import type { configureNodeHost } from "./config.js";
 import { runNodeHost } from "./runner.js";
 
@@ -11,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   capturedGatewayClients: [] as Array<{
     request: Mock<(method: string, params?: unknown) => Promise<unknown>>;
     stop: ReturnType<typeof vi.fn>;
+    stopAndWait: ReturnType<typeof vi.fn<() => Promise<void>>>;
     updateNodeManifest: ReturnType<typeof vi.fn>;
   }>,
   nodePluginTools: [] as Array<Record<string, unknown>>,
@@ -18,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   nodeHostCommands: [] as string[],
   nodeHostCaps: [] as string[],
   availabilityChanged: undefined as (() => void) | undefined,
+  closeMcpManager: vi.fn(async () => undefined),
   configureNodeHost: vi.fn(async (params: Parameters<typeof configureNodeHost>[0]) => ({
     version: 1 as const,
     nodeId: params.nodeId?.trim() || "node-test",
@@ -35,7 +41,7 @@ vi.mock("../config/config.js", () => ({
   getRuntimeConfig: vi.fn(() => ({ gateway: { handshakeTimeoutMs: 1_000 } })),
 }));
 
-vi.mock("../gateway/client-start-readiness.js", () => ({
+vi.mock("../../packages/gateway-client/src/readiness.js", () => ({
   startGatewayClientWhenEventLoopReady: mocks.startGatewayClientWhenEventLoopReady,
 }));
 
@@ -47,6 +53,7 @@ vi.mock("../gateway/client.js", async (importOriginal) => {
       const client = {
         request: vi.fn(async () => ({})),
         stop: vi.fn(),
+        stopAndWait: vi.fn(async () => {}),
         updateNodeManifest: vi.fn(),
       };
       mocks.capturedGatewayClientOptions.push(opts);
@@ -82,10 +89,12 @@ vi.mock("../infra/path-env.js", () => ({
 
 vi.mock("./config.js", () => ({
   configureNodeHost: mocks.configureNodeHost,
+  loadNodeHostConfig: async () => null,
 }));
 
 vi.mock("./plugin-node-host.js", () => ({
   ensureNodeHostPluginRegistry: vi.fn(async () => undefined),
+  notifyRegisteredNodeHostCommandDisconnect: vi.fn(async () => {}),
   listRegisteredNodeHostCapsAndCommands: vi.fn(() => ({
     commands: [...mocks.nodeHostCommands],
     caps: [...mocks.nodeHostCaps],
@@ -101,10 +110,9 @@ vi.mock("./plugin-node-host.js", () => ({
 
 vi.mock("./mcp.js", () => ({
   startNodeHostMcpManager: vi.fn(async () => ({
-    configuredServerCount: 0,
     descriptors: [],
     callMcpTool: vi.fn(),
-    close: vi.fn(async () => {}),
+    close: mocks.closeMcpManager,
   })),
 }));
 
@@ -112,13 +120,32 @@ vi.mock("./skills.js", () => ({
   scanNodeHostedSkills: vi.fn(() => mocks.nodeSkillDescriptors),
 }));
 
-vi.mock("./startup-state-migrations.js", () => ({
-  runStartupMigrations: vi.fn(async () => undefined),
+vi.mock("./startup-state-readiness.js", () => ({
+  ensureNodeHostStateReady: () => {},
 }));
+
+type CapturedClient = (typeof mocks.capturedGatewayClients)[number];
+
+function getPublications(client: CapturedClient, method = NODE_PLUGIN_TOOLS_UPDATE_METHOD) {
+  return client.request.mock.calls.filter(([calledMethod]) => calledMethod === method);
+}
+
+function receiveHello(options: GatewayClientOptions | undefined, protocol = 4) {
+  options?.onHelloOk?.({
+    protocol,
+    features: { methods: [], events: [] },
+  } as unknown as Parameters<NonNullable<GatewayClientOptions["onHelloOk"]>>[0]);
+}
+
+async function settlePublications() {
+  await new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
+}
 
 async function withReadyNodeHost(
   runTest: (params: {
-    client: (typeof mocks.capturedGatewayClients)[number];
+    client: CapturedClient;
     options: GatewayClientOptions | undefined;
   }) => Promise<void>,
 ): Promise<void> {
@@ -127,7 +154,7 @@ async function withReadyNodeHost(
     aborted: false,
     elapsedMs: 0,
   });
-  const processOnceSpy = vi.spyOn(process, "once");
+  const processOnSpy = vi.spyOn(process, "on");
   const previousExitCode = process.exitCode;
   let running: Promise<void> | undefined;
   try {
@@ -139,23 +166,23 @@ async function withReadyNodeHost(
     }
     await runTest({ client, options: mocks.capturedGatewayClientOptions.at(-1) });
   } finally {
-    const onSigterm = processOnceSpy.mock.calls.find(([event]) => event === "SIGTERM")?.[1];
+    const onSigterm = processOnSpy.mock.calls.find(([event]) => event === "SIGTERM")?.[1];
     try {
       onSigterm?.("SIGTERM");
       await running;
     } finally {
-      for (const [event, listener] of processOnceSpy.mock.calls) {
+      for (const [event, listener] of processOnSpy.mock.calls) {
         if ((event === "SIGINT" || event === "SIGTERM") && typeof listener === "function") {
           process.off(event, listener);
         }
       }
       process.exitCode = previousExitCode;
-      processOnceSpy.mockRestore();
+      processOnSpy.mockRestore();
     }
   }
 }
 
-describe("runNodeHost optional publications", () => {
+describe("runNodeHost connection and optional publications", () => {
   beforeEach(() => {
     mocks.capturedGatewayClientOptions.length = 0;
     mocks.capturedGatewayClients.length = 0;
@@ -175,6 +202,98 @@ describe("runNodeHost optional publications", () => {
     vi.clearAllMocks();
   });
 
+  it("exits after three identical permanent Gateway upgrade rejections", async () => {
+    await withReadyNodeHost(async ({ client, options }) => {
+      const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      try {
+        const rejection = new GatewayClientRequestError({
+          code: "UNAVAILABLE",
+          message: "gateway rejected websocket upgrade (HTTP 403)",
+          details: {
+            reason: "websocket-upgrade-rejected",
+            httpStatus: 403,
+            gatewayErrorType: "proxy_attribution_required",
+            gatewayErrorMessage: "Configure gateway.trustedProxies narrowly",
+          },
+        });
+        options?.onConnectError?.(rejection);
+        options?.onConnectError?.(rejection);
+        expect(client.stopAndWait).not.toHaveBeenCalled();
+        options?.onConnectError?.(rejection);
+
+        await vi.waitFor(() => expect(process.exitCode).toBe(1));
+        expect(client.stopAndWait).toHaveBeenCalledOnce();
+        expect(mocks.closeMcpManager).toHaveBeenCalledOnce();
+        expect(stderr).toHaveBeenCalledWith(
+          "node host gateway permanently rejected connection (proxy_attribution_required): Configure gateway.trustedProxies narrowly; exiting\n",
+        );
+      } finally {
+        stderr.mockRestore();
+      }
+    });
+  });
+
+  it("keeps retrying transient upgrade failures and resets permanent rejection streaks", async () => {
+    await withReadyNodeHost(async ({ client, options }) => {
+      const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      try {
+        const permanentRejection = new GatewayClientRequestError({
+          code: "UNAVAILABLE",
+          details: {
+            reason: "websocket-upgrade-rejected",
+            httpStatus: 403,
+            gatewayErrorType: "proxy_attribution_required",
+          },
+        });
+        const rejectTwice = () => {
+          options?.onConnectError?.(permanentRejection);
+          options?.onConnectError?.(permanentRejection);
+        };
+        const transientErrors = [
+          new Error("connect ECONNRESET"),
+          ...[
+            { httpStatus: 429, gatewayErrorType: "rate_limited" },
+            { httpStatus: 503, gatewayErrorType: "proxy_attribution_required" },
+            { httpStatus: 403 },
+            { httpStatus: 403, gatewayErrorType: "another_rejection" },
+          ].map(
+            (details) =>
+              new GatewayClientRequestError({
+                code: "UNAVAILABLE",
+                details: { reason: "websocket-upgrade-rejected", ...details },
+              }),
+          ),
+        ];
+
+        for (const transientError of transientErrors) {
+          rejectTwice();
+          options?.onConnectError?.(transientError);
+          expect(client.stopAndWait).not.toHaveBeenCalled();
+        }
+        rejectTwice();
+        options?.onHelloOk?.({
+          type: "hello-ok",
+          protocol: 4,
+          server: { version: "test", connId: "test-connection" },
+          features: { methods: [], events: [] },
+          snapshot: {
+            presence: [],
+            health: {},
+            stateVersion: { presence: 0, health: 0 },
+            uptimeMs: 0,
+          },
+          auth: { role: "node", scopes: [] },
+          policy: { maxPayload: 1, maxBufferedBytes: 1, tickIntervalMs: 1 },
+        });
+        rejectTwice();
+        expect(client.stopAndWait).not.toHaveBeenCalled();
+        expect(stderr).not.toHaveBeenCalledWith(expect.stringContaining("permanently rejected"));
+      } finally {
+        stderr.mockRestore();
+      }
+    });
+  });
+
   it("learns unsupported optional publications once per connection without a request flood", async () => {
     mocks.nodeSkillDescriptors = [
       {
@@ -185,7 +304,11 @@ describe("runNodeHost optional publications", () => {
     ];
     await withReadyNodeHost(async ({ client, options }) => {
       client.request.mockImplementation(async (method: string) => {
-        if (method === NODE_PLUGIN_TOOLS_UPDATE_METHOD || method === NODE_SKILLS_UPDATE_METHOD) {
+        if (
+          method === NODE_PLUGIN_TOOLS_UPDATE_METHOD ||
+          method === NODE_SKILLS_UPDATE_METHOD ||
+          method === NODE_RUNNER_INVENTORY_UPDATE_METHOD
+        ) {
           throw new GatewayClientRequestError({
             code: "INVALID_REQUEST",
             message: `unknown method: ${method}`,
@@ -203,14 +326,17 @@ describe("runNodeHost optional publications", () => {
       }
 
       await vi.waitFor(() => {
-        expect(
-          client.request.mock.calls.filter(
-            ([method]) => method === NODE_PLUGIN_TOOLS_UPDATE_METHOD,
-          ),
-        ).toHaveLength(1);
-        expect(
-          client.request.mock.calls.filter(([method]) => method === NODE_SKILLS_UPDATE_METHOD),
-        ).toHaveLength(1);
+        expect(getPublications(client)).toHaveLength(1);
+        expect(getPublications(client, NODE_SKILLS_UPDATE_METHOD)).toHaveLength(1);
+        expect(getPublications(client, NODE_RUNNER_INVENTORY_UPDATE_METHOD)).toEqual([
+          [
+            NODE_RUNNER_INVENTORY_UPDATE_METHOD,
+            {
+              protocolFeatures: [NODE_WORKER_SUPERVISOR_PROTOCOL_FEATURE],
+              workerHost: { enabled: false },
+            },
+          ],
+        ]);
       });
     });
   });
@@ -225,7 +351,11 @@ describe("runNodeHost optional publications", () => {
     ];
     await withReadyNodeHost(async ({ client, options }) => {
       client.request.mockImplementation(async (method: string) => {
-        if (method === NODE_PLUGIN_TOOLS_UPDATE_METHOD || method === NODE_SKILLS_UPDATE_METHOD) {
+        if (
+          method === NODE_PLUGIN_TOOLS_UPDATE_METHOD ||
+          method === NODE_SKILLS_UPDATE_METHOD ||
+          method === NODE_RUNNER_INVENTORY_UPDATE_METHOD
+        ) {
           throw new GatewayClientRequestError({
             code: "INVALID_REQUEST",
             message: "unauthorized role: node",
@@ -233,46 +363,50 @@ describe("runNodeHost optional publications", () => {
         }
         return {};
       });
-      options?.onHelloOk?.({
-        protocol: 3,
-        features: { methods: [], events: [] },
-      } as unknown as Parameters<NonNullable<GatewayClientOptions["onHelloOk"]>>[0]);
+      receiveHello(options, 3);
       await vi.waitFor(() => {
-        expect(
-          client.request.mock.calls.filter(
-            ([method]) => method === NODE_PLUGIN_TOOLS_UPDATE_METHOD,
-          ),
-        ).toHaveLength(1);
+        expect(getPublications(client)).toHaveLength(1);
       });
 
       mocks.availabilityChanged?.();
-      await new Promise<void>((resolve) => {
-        setImmediate(resolve);
-      });
-      expect(
-        client.request.mock.calls.filter(([method]) => method === NODE_PLUGIN_TOOLS_UPDATE_METHOD),
-      ).toHaveLength(1);
-      expect(
-        client.request.mock.calls.filter(([method]) => method === NODE_SKILLS_UPDATE_METHOD),
-      ).toHaveLength(1);
+      await settlePublications();
+      expect(getPublications(client)).toHaveLength(1);
+      expect(getPublications(client, NODE_SKILLS_UPDATE_METHOD)).toHaveLength(1);
+      expect(getPublications(client, NODE_RUNNER_INVENTORY_UPDATE_METHOD)).toHaveLength(1);
 
       client.request.mockResolvedValue({});
       options?.onClose?.(1000, "legacy gateway closed");
-      options?.onHelloOk?.({
-        protocol: 4,
-        features: { methods: [], events: [] },
-      } as unknown as Parameters<NonNullable<GatewayClientOptions["onHelloOk"]>>[0]);
+      receiveHello(options);
 
       await vi.waitFor(() => {
-        expect(
-          client.request.mock.calls.filter(
-            ([method]) => method === NODE_PLUGIN_TOOLS_UPDATE_METHOD,
-          ),
-        ).toHaveLength(2);
-        expect(
-          client.request.mock.calls.filter(([method]) => method === NODE_SKILLS_UPDATE_METHOD),
-        ).toHaveLength(2);
+        expect(getPublications(client)).toHaveLength(2);
+        expect(getPublications(client, NODE_SKILLS_UPDATE_METHOD)).toHaveLength(2);
+        expect(getPublications(client, NODE_RUNNER_INVENTORY_UPDATE_METHOD)).toHaveLength(2);
       });
+    });
+  });
+
+  it("treats the exact v4 inventory authorization shape as an unsupported hidden method", async () => {
+    await withReadyNodeHost(async ({ client, options }) => {
+      client.request.mockImplementation(async (method: string) => {
+        if (method === NODE_RUNNER_INVENTORY_UPDATE_METHOD) {
+          throw new GatewayClientRequestError({
+            code: "INVALID_REQUEST",
+            message: "unauthorized role: node",
+          });
+        }
+        return {};
+      });
+      receiveHello(options);
+      await vi.waitFor(() => {
+        expect(getPublications(client, NODE_RUNNER_INVENTORY_UPDATE_METHOD)).toHaveLength(1);
+      });
+
+      for (let index = 0; index < 10; index += 1) {
+        mocks.availabilityChanged?.();
+      }
+      await settlePublications();
+      expect(getPublications(client, NODE_RUNNER_INVENTORY_UPDATE_METHOD)).toHaveLength(1);
     });
   });
 
@@ -290,45 +424,26 @@ describe("runNodeHost optional publications", () => {
         }
         return {};
       });
-      options?.onHelloOk?.({
-        protocol,
-        features: { methods: [], events: [] },
-      } as unknown as Parameters<NonNullable<GatewayClientOptions["onHelloOk"]>>[0]);
+      receiveHello(options, protocol);
       await vi.waitFor(() => {
-        expect(
-          client.request.mock.calls.filter(
-            ([method]) => method === NODE_PLUGIN_TOOLS_UPDATE_METHOD,
-          ),
-        ).toHaveLength(1);
+        expect(getPublications(client)).toHaveLength(1);
       });
 
       for (let index = 0; index < 10; index += 1) {
         mocks.availabilityChanged?.();
       }
 
-      await new Promise<void>((resolve) => {
-        setImmediate(resolve);
-      });
-      expect(
-        client.request.mock.calls.filter(([method]) => method === NODE_PLUGIN_TOOLS_UPDATE_METHOD),
-      ).toHaveLength(1);
+      await settlePublications();
+      expect(getPublications(client)).toHaveLength(1);
 
       mocks.nodePluginTools = [];
       mocks.availabilityChanged?.();
       await vi.waitFor(() => {
-        expect(
-          client.request.mock.calls.filter(
-            ([method]) => method === NODE_PLUGIN_TOOLS_UPDATE_METHOD,
-          ),
-        ).toHaveLength(2);
+        expect(getPublications(client)).toHaveLength(2);
       });
       mocks.availabilityChanged?.();
-      await new Promise<void>((resolve) => {
-        setImmediate(resolve);
-      });
-      expect(
-        client.request.mock.calls.filter(([method]) => method === NODE_PLUGIN_TOOLS_UPDATE_METHOD),
-      ).toHaveLength(2);
+      await settlePublications();
+      expect(getPublications(client)).toHaveLength(2);
     });
   });
 
@@ -343,10 +458,7 @@ describe("runNodeHost optional publications", () => {
         }
         return Promise.resolve({});
       });
-      options?.onHelloOk?.({
-        protocol: 3,
-        features: { methods: [], events: [] },
-      } as unknown as Parameters<NonNullable<GatewayClientOptions["onHelloOk"]>>[0]);
+      receiveHello(options, 3);
       await vi.waitFor(() => expect(rejectFirstPluginPublication).toBeDefined());
 
       mocks.nodePluginTools = [];
@@ -372,30 +484,19 @@ describe("runNodeHost optional publications", () => {
         }
         return Promise.resolve({});
       });
-      options?.onHelloOk?.({
-        protocol: 4,
-        features: { methods: [], events: [] },
-      } as unknown as Parameters<NonNullable<GatewayClientOptions["onHelloOk"]>>[0]);
+      receiveHello(options);
       await vi.waitFor(() => expect(resolveInitialPublication).toBeDefined());
 
       for (let index = 0; index < 10; index += 1) {
         mocks.availabilityChanged?.();
       }
       resolveInitialPublication?.();
-      await new Promise<void>((resolve) => {
-        setImmediate(resolve);
-      });
-      expect(
-        client.request.mock.calls.filter(([method]) => method === NODE_PLUGIN_TOOLS_UPDATE_METHOD),
-      ).toHaveLength(1);
+      await settlePublications();
+      expect(getPublications(client)).toHaveLength(1);
 
       mocks.availabilityChanged?.();
-      await new Promise<void>((resolve) => {
-        setImmediate(resolve);
-      });
-      expect(
-        client.request.mock.calls.filter(([method]) => method === NODE_PLUGIN_TOOLS_UPDATE_METHOD),
-      ).toHaveLength(1);
+      await settlePublications();
+      expect(getPublications(client)).toHaveLength(1);
     });
   });
 
@@ -411,10 +512,7 @@ describe("runNodeHost optional publications", () => {
         }
         return Promise.resolve({});
       });
-      options?.onHelloOk?.({
-        protocol: 4,
-        features: { methods: [], events: [] },
-      } as unknown as Parameters<NonNullable<GatewayClientOptions["onHelloOk"]>>[0]);
+      receiveHello(options);
       await vi.waitFor(() => expect(resolveInitialPublication).toBeDefined());
 
       mocks.nodePluginTools = [];
@@ -422,16 +520,10 @@ describe("runNodeHost optional publications", () => {
       mocks.nodePluginTools = initialPluginTools;
       mocks.availabilityChanged?.();
       resolveInitialPublication?.();
-      await new Promise<void>((resolve) => {
-        setImmediate(resolve);
-      });
-      await new Promise<void>((resolve) => {
-        setImmediate(resolve);
-      });
+      await settlePublications();
+      await settlePublications();
 
-      const pluginPublications = client.request.mock.calls.filter(
-        ([method]) => method === NODE_PLUGIN_TOOLS_UPDATE_METHOD,
-      );
+      const pluginPublications = getPublications(client);
       expect(pluginPublications).toHaveLength(1);
       expect(pluginPublications[0]?.[1]).toEqual({ tools: initialPluginTools });
     });
@@ -453,10 +545,7 @@ describe("runNodeHost optional publications", () => {
         }
         return Promise.resolve({});
       });
-      options?.onHelloOk?.({
-        protocol: 4,
-        features: { methods: [], events: [] },
-      } as unknown as Parameters<NonNullable<GatewayClientOptions["onHelloOk"]>>[0]);
+      receiveHello(options);
       await vi.waitFor(() => expect(rejectPublications[0]).toBeDefined());
 
       vi.useFakeTimers();
@@ -513,29 +602,20 @@ describe("runNodeHost optional publications", () => {
         }
         return Promise.resolve({});
       });
-      options?.onHelloOk?.({
-        protocol: 4,
-        features: { methods: [], events: [] },
-      } as unknown as Parameters<NonNullable<GatewayClientOptions["onHelloOk"]>>[0]);
+      receiveHello(options);
       await vi.waitFor(() => expect(pluginPublicationCount).toBe(1));
-      await new Promise<void>((resolve) => {
-        setImmediate(resolve);
-      });
+      await settlePublications();
 
       mocks.nodePluginTools = [];
       mocks.availabilityChanged?.();
       await vi.waitFor(() => expect(rejectChangedPublication).toBeDefined());
       rejectChangedPublication?.(new Error("publication outcome unknown"));
-      await new Promise<void>((resolve) => {
-        setImmediate(resolve);
-      });
+      await settlePublications();
 
       mocks.nodePluginTools = initialPluginTools;
       mocks.availabilityChanged?.();
       await vi.waitFor(() => {
-        const publications = client.request.mock.calls.filter(
-          ([method]) => method === NODE_PLUGIN_TOOLS_UPDATE_METHOD,
-        );
+        const publications = getPublications(client);
         expect(publications.length).toBeGreaterThanOrEqual(3);
         expect(publications.at(-1)?.[1]).toEqual({ tools: initialPluginTools });
       });
@@ -565,10 +645,7 @@ describe("runNodeHost optional publications", () => {
         }
         return Promise.resolve({});
       });
-      options?.onHelloOk?.({
-        protocol: 4,
-        features: { methods: [], events: [] },
-      } as unknown as Parameters<NonNullable<GatewayClientOptions["onHelloOk"]>>[0]);
+      receiveHello(options);
       await vi.waitFor(() => expect(rejectFirstPluginPublication).toBeDefined());
 
       mocks.nodePluginTools = [];
@@ -586,9 +663,7 @@ describe("runNodeHost optional publications", () => {
       resolveSecondPluginPublication?.();
 
       await vi.waitFor(() => {
-        const pluginPublications = client.request.mock.calls.filter(
-          ([method]) => method === NODE_PLUGIN_TOOLS_UPDATE_METHOD,
-        );
+        const pluginPublications = getPublications(client);
         expect(pluginPublications).toHaveLength(3);
         expect(pluginPublications.at(-1)?.[1]).toEqual({ tools: initialPluginTools });
       });
@@ -598,8 +673,7 @@ describe("runNodeHost optional publications", () => {
   it.each([true, false])("retires inventory before manifest reconnect", async (deferInitial) => {
     let resolveInitialPublication: (() => void) | undefined;
     await withReadyNodeHost(async ({ client, options }) => {
-      const pluginPublications = () =>
-        client.request.mock.calls.filter(([method]) => method === NODE_PLUGIN_TOOLS_UPDATE_METHOD);
+      const pluginPublications = () => getPublications(client);
       if (deferInitial) {
         client.request.mockImplementation((method: string) => {
           if (method === NODE_PLUGIN_TOOLS_UPDATE_METHOD && !resolveInitialPublication) {
@@ -610,30 +684,20 @@ describe("runNodeHost optional publications", () => {
           return Promise.resolve({});
         });
       }
-      options?.onHelloOk?.({
-        protocol: 3,
-        features: { methods: [], events: [] },
-      } as unknown as Parameters<NonNullable<GatewayClientOptions["onHelloOk"]>>[0]);
+      receiveHello(options, 3);
       if (deferInitial) {
         await vi.waitFor(() => expect(resolveInitialPublication).toBeDefined());
       }
-      await new Promise<void>((resolve) => {
-        setImmediate(resolve);
-      });
+      await settlePublications();
       expect(pluginPublications()).toHaveLength(1);
 
       Object.assign(mocks, { nodePluginTools: [], nodeHostCaps: ["canvas"] });
       mocks.availabilityChanged?.();
       resolveInitialPublication?.();
-      await new Promise<void>((resolve) => {
-        setImmediate(resolve);
-      });
+      await settlePublications();
       expect(pluginPublications()).toHaveLength(1);
 
-      options?.onHelloOk?.({
-        protocol: 3,
-        features: { methods: [], events: [] },
-      } as unknown as Parameters<NonNullable<GatewayClientOptions["onHelloOk"]>>[0]);
+      receiveHello(options, 3);
       await vi.waitFor(() => expect(pluginPublications()).toHaveLength(2));
       expect(client.request).toHaveBeenLastCalledWith(NODE_PLUGIN_TOOLS_UPDATE_METHOD, {
         tools: [],
@@ -654,10 +718,7 @@ describe("runNodeHost optional publications", () => {
       });
       const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
       try {
-        options?.onHelloOk?.({
-          protocol: 3,
-          features: { methods: [], events: [] },
-        } as unknown as Parameters<NonNullable<GatewayClientOptions["onHelloOk"]>>[0]);
+        receiveHello(options, 3);
         await vi.waitFor(() => expect(rejectInitialPublication).toBeDefined());
         stderr.mockClear();
 
@@ -665,9 +726,7 @@ describe("runNodeHost optional publications", () => {
         mocks.availabilityChanged?.();
         rejectInitialPublication?.(new Error("gateway closed (1012): node manifest changed"));
 
-        await new Promise<void>((resolve) => {
-          setImmediate(resolve);
-        });
+        await settlePublications();
         expect(stderr).not.toHaveBeenCalledWith(expect.stringContaining("publish failed"));
       } finally {
         stderr.mockRestore();

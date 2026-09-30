@@ -13,7 +13,7 @@ import type { MessageReceipt } from "./channel-outbound.js";
 import type { OpenClawConfig } from "./config-contracts.js";
 import {
   createLazyFacadeObjectValue,
-  loadBundledPluginPublicSurfaceModuleSync,
+  loadBundledPluginPublicSurfaceModuleSyncCore,
 } from "./facade-loader.js";
 import { getRuntimeConfig, getRuntimeConfigSnapshot } from "./runtime-config-snapshot.js";
 
@@ -138,7 +138,7 @@ type EditDiscordComponentMessage = (
 type RegisterBuiltDiscordComponentMessage = (params: {
   buildResult: DiscordComponentBuildResult;
   messageId: string;
-}) => void;
+}) => Promise<void>;
 
 type DiscordApiFacadeModule = {
   collectDiscordStatusIssues: (accounts: ChannelAccountSnapshot[]) => ChannelStatusIssue[];
@@ -198,14 +198,14 @@ type DiscordRuntimeFacadeModule = {
 };
 
 function loadDiscordApiFacadeModule(): DiscordApiFacadeModule {
-  return loadBundledPluginPublicSurfaceModuleSync<DiscordApiFacadeModule>({
+  return loadBundledPluginPublicSurfaceModuleSyncCore<DiscordApiFacadeModule>({
     dirName: "discord",
     artifactBasename: "api.js",
   });
 }
 
 function loadDiscordRuntimeFacadeModule(): DiscordRuntimeFacadeModule {
-  return loadBundledPluginPublicSurfaceModuleSync<DiscordRuntimeFacadeModule>({
+  return loadBundledPluginPublicSurfaceModuleSyncCore<DiscordRuntimeFacadeModule>({
     dirName: "discord",
     artifactBasename: "runtime-api.js",
   });
@@ -229,10 +229,7 @@ export function collectDiscordStatusIssues(
 
 /** Build Discord component payloads without sending them. */
 export const buildDiscordComponentMessage: DiscordApiFacadeModule["buildDiscordComponentMessage"] =
-  ((...args) =>
-    loadDiscordApiFacadeModule().buildDiscordComponentMessage(
-      ...args,
-    )) as DiscordApiFacadeModule["buildDiscordComponentMessage"];
+  (...args) => loadDiscordApiFacadeModule().buildDiscordComponentMessage(...args);
 
 /** Inspect one configured Discord account for setup/status output. */
 export function inspectDiscordAccount(params: {
@@ -311,17 +308,11 @@ export function collectDiscordAuditChannelIds(params: {
 
 /** Edit an already-sent Discord component message. */
 export const editDiscordComponentMessage: DiscordRuntimeFacadeModule["editDiscordComponentMessage"] =
-  ((...args) =>
-    loadDiscordRuntimeFacadeModule().editDiscordComponentMessage(
-      ...args,
-    )) as DiscordRuntimeFacadeModule["editDiscordComponentMessage"];
+  (...args) => loadDiscordRuntimeFacadeModule().editDiscordComponentMessage(...args);
 
-/** Register a built component message after Discord assigns its message id. */
+/** Await callback registration after Discord assigns the built component message its id. */
 export const registerBuiltDiscordComponentMessage: DiscordRuntimeFacadeModule["registerBuiltDiscordComponentMessage"] =
-  ((...args) =>
-    loadDiscordRuntimeFacadeModule().registerBuiltDiscordComponentMessage(
-      ...args,
-    )) as DiscordRuntimeFacadeModule["registerBuiltDiscordComponentMessage"];
+  (...args) => loadDiscordRuntimeFacadeModule().registerBuiltDiscordComponentMessage(...args);
 
 /** Bind a spawned subagent session to the current Discord thread when possible. */
 export async function autoBindSpawnedDiscordSubagent(params: {

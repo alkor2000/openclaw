@@ -1,18 +1,12 @@
-import { Value } from "typebox/value";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  SessionObserverDigestSchema,
-  type SessionObserverDigest,
-} from "../../packages/gateway-protocol/src/schema/sessions.js";
+import type { SessionObserverDigest } from "../../packages/gateway-protocol/src/schema/sessions.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { normalizeSessionObserverModelOutput } from "./session-observer-model.js";
 import {
   createHarness,
   declareObserverVisibility,
   event,
   flushObserver,
   modelMessage,
-  preparedModel,
   persistedLiveDigest,
   resetSessionObserverEventSequence,
   startAndAddToolNotes,
@@ -24,10 +18,14 @@ afterEach(() => {
   resetSessionObserverEventSequence();
 });
 
+function useFakeTime(now = 0): void {
+  vi.useFakeTimers();
+  vi.setSystemTime(now);
+}
+
 describe("session observer", () => {
   it("waits for four notes and twelve seconds", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    useFakeTime();
     const harness = createHarness();
     startAndAddToolNotes(harness.observer);
     expect(vi.getTimerCount()).toBe(1);
@@ -45,8 +43,7 @@ describe("session observer", () => {
   });
 
   it("publishes safe preambles immediately without a model call", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(1_000);
+    useFakeTime(1_000);
     const harness = createHarness();
     harness.observer.handleEvent(event({ stream: "lifecycle", data: { phase: "start" } }));
 
@@ -75,8 +72,7 @@ describe("session observer", () => {
   });
 
   it("publishes preambles to visible session-list subscribers without a utility model", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(1_000);
+    useFakeTime(1_000);
     const harness = createHarness({
       subscribe: false,
       broadSubscribe: true,
@@ -104,8 +100,7 @@ describe("session observer", () => {
   });
 
   it("keeps global observer streams scoped to their owning agents", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(1_000);
+    useFakeTime(1_000);
     const harness = createHarness({ subscribe: false });
     harness.subscribers.subscribe("conn-main", "agent:main:global")?.commit();
     harness.subscribers.subscribe("conn-legacy", "global")?.commit();
@@ -153,6 +148,50 @@ describe("session observer", () => {
     harness.observer.dispose();
   });
 
+  it("keeps the persisted fixed-store owner on the bare global observer stream", async () => {
+    useFakeTime(1_000);
+    const config = {
+      gateway: { controlUi: { sessionObserver: true } },
+      session: { scope: "global" as const, store: "/tmp/owned-shared.sqlite" },
+      agents: {
+        ownership: "explicit" as const,
+        defaults: {
+          utilityModel: "openai/gpt-test",
+          sessionStore: { agentId: "ops" },
+        },
+        entries: { ops: {}, research: {} },
+      },
+    } satisfies OpenClawConfig;
+    const harness = createHarness({ subscribe: false, config });
+    harness.subscribers.subscribe("conn-global", "global")?.commit();
+    harness.subscribers.subscribe("conn-scoped", "agent:ops:global")?.commit();
+    declareObserverVisibility(harness.observer, "conn-global");
+    declareObserverVisibility(harness.observer, "conn-scoped");
+
+    harness.observer.handleEvent(
+      event({
+        runId: "run-ops",
+        sessionKey: "global",
+        agentId: "ops",
+        stream: "item",
+        data: { kind: "preamble", phase: "update", progressText: "Ops agent work" },
+      }),
+    );
+    await flushObserver();
+
+    expect(harness.broadcastToConnIds).toHaveBeenCalledWith(
+      "session.observer",
+      expect.objectContaining({ agentId: "ops", sessionKey: "global" }),
+      new Set(["conn-scoped", "conn-global"]),
+      expect.objectContaining({
+        agentId: "ops",
+        dropIfSlow: true,
+        sessionKeys: ["agent:ops:global", "global"],
+      }),
+    );
+    harness.observer.dispose();
+  });
+
   it("resolves an explicit global alias to its agent-scoped companion snapshot", () => {
     const config = {
       gateway: { controlUi: { sessionObserver: true } },
@@ -193,8 +232,7 @@ describe("session observer", () => {
   });
 
   it("terminalizes a preamble-only digest without a utility model", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    useFakeTime();
     const harness = createHarness({
       subscribe: false,
       broadSubscribe: true,
@@ -243,8 +281,7 @@ describe("session observer", () => {
   });
 
   it("synthesizes terminal health when the final model request becomes stale", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    useFakeTime();
     let utilityModelRef: string | undefined = "openai/gpt-a";
     let resolveModel: ((value: ReturnType<typeof modelMessage>) => void) | undefined;
     const harness = createHarness({
@@ -284,8 +321,7 @@ describe("session observer", () => {
   });
 
   it("does not cap model-free preamble headlines at six sessions", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(1_000);
+    useFakeTime(1_000);
     const harness = createHarness({
       subscribe: false,
       broadSubscribe: true,
@@ -308,8 +344,7 @@ describe("session observer", () => {
   });
 
   it("coalesces incremental preamble snapshots behind a trailing update", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(1_000);
+    useFakeTime(1_000);
     const harness = createHarness();
     harness.observer.handleEvent(event({ stream: "lifecycle", data: { phase: "start" } }));
 
@@ -333,14 +368,13 @@ describe("session observer", () => {
   });
 
   it("aborts a live assessment when the run becomes terminal", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    useFakeTime();
     let firstCall = true;
-    const completeModel = vi.fn(async (params: { options: { signal: AbortSignal } }) => {
+    const completeModel = vi.fn(async (params: { abortSignal: AbortSignal }) => {
       if (firstCall) {
         firstCall = false;
         return await new Promise<ReturnType<typeof modelMessage>>((_resolve, reject) => {
-          params.options.signal.addEventListener("abort", () => reject(new Error("aborted")), {
+          params.abortSignal.addEventListener("abort", () => reject(new Error("aborted")), {
             once: true,
           });
         });
@@ -369,8 +403,7 @@ describe("session observer", () => {
   });
 
   it("retires a queued preamble when a richer digest is accepted", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    useFakeTime();
     let resolveModel: ((value: ReturnType<typeof modelMessage>) => void) | undefined;
     const completeModel = vi.fn(
       () =>
@@ -418,8 +451,7 @@ describe("session observer", () => {
   });
 
   it("never includes tool results or command output and redacts tool arguments", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    useFakeTime();
     const harness = createHarness();
     const runtimeDetail = "runtime-detail-that-must-not-leave";
     const commandOutput = "command-output-that-must-not-leave";
@@ -463,9 +495,7 @@ describe("session observer", () => {
 
     await vi.advanceTimersByTimeAsync(12_000);
     await flushObserver();
-    const prompt = String(
-      harness.completeModel.mock.calls[0]?.[0]?.context?.messages?.[0]?.content,
-    );
+    const prompt = String(harness.completeModel.mock.calls[0]?.[0]?.prompt);
     expect(prompt).not.toContain("test-token");
     expect(prompt).not.toContain(runtimeDetail);
     expect(prompt).not.toContain(commandOutput);
@@ -475,8 +505,7 @@ describe("session observer", () => {
   });
 
   it("coalesces a burst behind one in-flight completion", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    useFakeTime();
     let resolveFirst: ((value: ReturnType<typeof modelMessage>) => void) | undefined;
     const completeModel = vi.fn(
       () =>
@@ -512,52 +541,8 @@ describe("session observer", () => {
     harness.observer.dispose();
   });
 
-  it("does not start completion after observation ends during model preparation", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
-    let resolvePreparation: ((value: ReturnType<typeof preparedModel>) => void) | undefined;
-    const prepareModel = vi.fn(
-      () =>
-        new Promise<ReturnType<typeof preparedModel>>((resolve) => {
-          resolvePreparation = resolve;
-        }),
-    );
-    const harness = createHarness({ prepareModel });
-    startAndAddToolNotes(harness.observer);
-    await vi.advanceTimersByTimeAsync(12_000);
-    expect(prepareModel).toHaveBeenCalledOnce();
-
-    harness.subscribers.unsubscribe("conn-1", "agent:main:session-1");
-    resolvePreparation?.(preparedModel());
-    await flushObserver();
-
-    expect(harness.completeModel).not.toHaveBeenCalled();
-    harness.observer.dispose();
-  });
-
-  it("times out stalled model preparation", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
-    const prepareModel = vi.fn(
-      () =>
-        new Promise<never>(() => {
-          // Intentionally unresolved: the observer timeout owns this test path.
-        }),
-    );
-    const harness = createHarness({ prepareModel });
-    startAndAddToolNotes(harness.observer);
-
-    await vi.advanceTimersByTimeAsync(34_000);
-    await flushObserver();
-
-    expect(prepareModel).toHaveBeenCalledOnce();
-    expect(harness.completeModel).not.toHaveBeenCalled();
-    harness.observer.dispose();
-  });
-
   it("reserves the fortieth digest for the terminal status", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    useFakeTime();
     const harness = createHarness();
     harness.observer.handleEvent(event({ stream: "lifecycle", data: { phase: "start" } }));
 
@@ -595,8 +580,7 @@ describe("session observer", () => {
   });
 
   it("disables only model work after two consecutive failures", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    useFakeTime();
     const completeModel = vi.fn(async () => {
       throw new Error("model unavailable");
     });
@@ -627,8 +611,7 @@ describe("session observer", () => {
   });
 
   it("does not observe without subscribers and stops after unsubscribe", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    useFakeTime();
     const unsubscribed = createHarness({ subscribe: false });
     startAndAddToolNotes(unsubscribed.observer);
     await vi.advanceTimersByTimeAsync(12_000);
@@ -644,8 +627,7 @@ describe("session observer", () => {
   });
 
   it("does not observe for a subscribed connection that never declares visibility", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    useFakeTime();
     const harness = createHarness({ visible: false });
 
     startAndAddToolNotes(harness.observer);
@@ -657,8 +639,7 @@ describe("session observer", () => {
   });
 
   it("suspends when hidden and resumes on the next event after becoming visible", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    useFakeTime();
     const harness = createHarness();
     startAndAddToolNotes(harness.observer);
     await vi.advanceTimersByTimeAsync(12_000);
@@ -688,8 +669,7 @@ describe("session observer", () => {
   });
 
   it("widens only critical health transitions to hidden session-list subscribers", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    useFakeTime();
     const healths = ["stuck", "stuck", "on-track", "stuck", "done", "failed"] as const;
     const completeModel = vi.fn(async () => {
       const health = healths[completeModel.mock.calls.length - 1] ?? "on-track";
@@ -727,8 +707,7 @@ describe("session observer", () => {
   });
 
   it("suspends when the last visible connection is removed", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    useFakeTime();
     const harness = createHarness();
     startAndAddToolNotes(harness.observer);
 
@@ -741,8 +720,7 @@ describe("session observer", () => {
   });
 
   it("does not observe when the agent has no utility model", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    useFakeTime();
     const harness = createHarness({ utilityModelRef: null });
     startAndAddToolNotes(harness.observer);
     await vi.advanceTimersByTimeAsync(12_000);
@@ -753,8 +731,7 @@ describe("session observer", () => {
   });
 
   it("drops scheduled work when observation is disabled", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    useFakeTime();
     const runtimeCfg = {
       gateway: { controlUi: { sessionObserver: true as boolean } },
       agents: { defaults: { utilityModel: "openai/gpt-test" } },
@@ -771,8 +748,7 @@ describe("session observer", () => {
   });
 
   it("rejects an in-flight result after utility-model replacement", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    useFakeTime();
     let utilityModelRef: string | undefined = "openai/gpt-a";
     let resolveModel: ((value: ReturnType<typeof modelMessage>) => void) | undefined;
     const completeModel = vi.fn(
@@ -805,8 +781,7 @@ describe("session observer", () => {
   });
 
   it("drops scheduled work when the utility model is disabled", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    useFakeTime();
     let utilityModelRef: string | undefined = "openai/gpt-test";
     const resolveUtilityModelRef = vi.fn(() => utilityModelRef);
     const harness = createHarness({ resolveUtilityModelRef });
@@ -820,11 +795,10 @@ describe("session observer", () => {
   });
 
   it("retries one unparseable model response", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    useFakeTime();
     const completeModel = vi
       .fn()
-      .mockResolvedValueOnce({ stopReason: "stop", content: [{ type: "text", text: "nope" }] })
+      .mockResolvedValueOnce({ ...modelMessage({}), text: "nope" })
       .mockResolvedValueOnce(
         modelMessage({ headline: "Continuing after a retry", health: "on-track" }),
       );
@@ -839,8 +813,7 @@ describe("session observer", () => {
   });
 
   it("demotes the least recently active model while retaining preamble state", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    useFakeTime();
     const harness = createHarness();
     for (let index = 0; index < 7; index += 1) {
       const sessionKey = `agent:main:session-${index}`;
@@ -886,8 +859,7 @@ describe("session observer", () => {
   });
 
   it("preserves revision continuity when a run's model is demoted", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    useFakeTime();
     const harness = createHarness();
     startAndAddToolNotes(harness.observer);
     await vi.advanceTimersByTimeAsync(12_000);
@@ -932,8 +904,7 @@ describe("session observer", () => {
   });
 
   it("preserves revision continuity across run rollover", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    useFakeTime();
     const harness = createHarness();
     startAndAddToolNotes(harness.observer);
     await vi.advanceTimersByTimeAsync(12_000);
@@ -968,8 +939,7 @@ describe("session observer", () => {
   });
 
   it("retains the revision floor when a new run starts without subscribers", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    useFakeTime();
     const harness = createHarness();
     startAndAddToolNotes(harness.observer);
     await vi.advanceTimersByTimeAsync(12_000);
@@ -1007,8 +977,7 @@ describe("session observer", () => {
   });
 
   it("ignores late events from a superseded run", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    useFakeTime();
     const storedDigest = persistedLiveDigest();
     const readSession = vi.fn(() => ({
       sessionId: "session-id",
@@ -1047,44 +1016,5 @@ describe("session observer", () => {
     expect(digest?.revision).toBe(storedDigest.revision + 1);
     expect(harness.persistDigest).not.toHaveBeenCalled();
     harness.observer.dispose();
-  });
-});
-
-describe("session observer schema", () => {
-  it("validates protocol digests", () => {
-    expect(
-      Value.Check(SessionObserverDigestSchema, {
-        sessionKey: "agent:main:session-1",
-        agentId: "main",
-        runId: "run-1",
-        revision: 1,
-        updatedAt: 1,
-        headline: "Checking the implementation",
-        health: "on-track",
-        planProgress: { completed: 2, total: 4 },
-      }),
-    ).toBe(true);
-    expect(
-      Value.Check(SessionObserverDigestSchema, {
-        sessionKey: "agent:main:session-1",
-        revision: 1,
-        updatedAt: 1,
-        headline: "x".repeat(121),
-        health: "on-track",
-      }),
-    ).toBe(false);
-  });
-
-  it("rejects loose JSON and truncates accepted strings to hard caps", () => {
-    expect(normalizeSessionObserverModelOutput("```json\n{}\n```")).toBeNull();
-    const normalized = normalizeSessionObserverModelOutput(
-      JSON.stringify({
-        headline: "h".repeat(140),
-        assessment: "a".repeat(400),
-        health: "grinding",
-      }),
-    );
-    expect(normalized?.headline).toHaveLength(120);
-    expect(normalized?.assessment).toHaveLength(320);
   });
 });

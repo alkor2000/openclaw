@@ -1,24 +1,16 @@
-// Backup command registration for local state archive creation and verification.
 import type { Command } from "commander";
 import { formatDocsLink } from "../../../packages/terminal-core/src/links.js";
 import { theme } from "../../../packages/terminal-core/src/theme.js";
-import {
-  backupSqliteCreateCommand,
-  backupSqliteListCommand,
-  backupSqliteRestoreCommand,
-  backupSqliteVerifyCommand,
-} from "../../commands/backup-sqlite.js";
-import { backupVerifyCommand } from "../../commands/backup-verify.js";
-import { backupCreateCommand } from "../../commands/backup.js";
 import { defaultRuntime } from "../../runtime.js";
 import { runCommandWithRuntime } from "../cli-utils.js";
+import { addGatewayClientOptions } from "../gateway-rpc.js";
 import { formatHelpExamples } from "../help-format.js";
+import { collectOption, parseStrictPositiveIntOption } from "./helpers.js";
 
-/** Register backup create/verify subcommands. */
 export function registerBackupCommand(program: Command) {
   const backup = program
     .command("backup")
-    .description("Create and verify backup archives and SQLite snapshots")
+    .description("Create, verify, and restore backup archives and SQLite snapshots")
     .addHelpText(
       "after",
       () =>
@@ -60,14 +52,8 @@ export function registerBackupCommand(program: Command) {
     )
     .action(async (opts) => {
       await runCommandWithRuntime(defaultRuntime, async () => {
-        await backupCreateCommand(defaultRuntime, {
-          output: opts.output as string | undefined,
-          json: Boolean(opts.json),
-          dryRun: Boolean(opts.dryRun),
-          verify: Boolean(opts.verify),
-          onlyConfig: Boolean(opts.onlyConfig),
-          includeWorkspace: opts.includeWorkspace as boolean,
-        });
+        const { backupCreateCommand } = await import("../../commands/backup.js");
+        await backupCreateCommand(defaultRuntime, opts);
       });
     });
 
@@ -91,14 +77,167 @@ export function registerBackupCommand(program: Command) {
     )
     .action(async (archive, opts) => {
       await runCommandWithRuntime(defaultRuntime, async () => {
-        await backupVerifyCommand(defaultRuntime, {
-          archive: archive as string,
-          json: Boolean(opts.json),
-        });
+        const { backupVerifyCommand } = await import("../../commands/backup-verify.js");
+        await backupVerifyCommand(defaultRuntime, { ...opts, archive });
+      });
+    });
+
+  backup
+    .command("restore <archive>")
+    .description("Restore a verified backup archive to a fresh staging directory")
+    .requiredOption("--target <dir>", "Fresh target directory; non-empty directories are refused")
+    .option("--json", "Output JSON", false)
+    .addHelpText(
+      "after",
+      () =>
+        `\n${theme.heading("Examples:")}\n${formatHelpExamples([
+          [
+            "openclaw backup restore ~/Backups/latest.tar.gz --target ./restored-openclaw",
+            "Verify, then extract the whole archive into a fresh staging directory.",
+          ],
+          [
+            "openclaw backup restore ~/Backups/latest.tar.gz --target ./restored-openclaw --json",
+            "Emit machine-readable restore details and rollback warnings.",
+          ],
+        ])}`,
+    )
+    .action(async (archive, opts) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        const { backupRestoreCommand } = await import("../../commands/backup-restore.js");
+        await backupRestoreCommand(defaultRuntime, { ...opts, archive });
       });
     });
 
   registerBackupSqliteCommands(backup);
+  registerBackupGitCommands(backup);
+  registerBackupScheduleCommands(backup);
+}
+
+function registerBackupScheduleCommands(backup: Command): void {
+  addGatewayClientOptions(
+    backup
+      .command("enable")
+      .description("Provision a Gateway automation for scheduled Git backups")
+      .requiredOption("--repository <path>", "Git backup repository directory")
+      .option("--every <duration>", "Backup interval", "24h")
+      .option("--push", "Push the current branch to origin after each backup", false)
+      .option("--exclude-secrets", "Omit credential-bearing database tables", false)
+      .option(
+        "--include-secrets",
+        "Keep credential-bearing tables in pushed scheduled backups",
+        false,
+      )
+      .option("--global-only", "Back up only the shared state database", false)
+      .option("--agent <id>", "Back up only one agent database")
+      .action(async (opts) => {
+        await runCommandWithRuntime(defaultRuntime, async () => {
+          const { backupEnableCommand } = await import("../../commands/backup-schedule.js");
+          await backupEnableCommand(defaultRuntime, opts);
+        });
+      }),
+  );
+
+  addGatewayClientOptions(
+    backup
+      .command("disable")
+      .description("Remove the scheduled Git backup automation")
+      .action(async (opts) => {
+        await runCommandWithRuntime(defaultRuntime, async () => {
+          const { backupDisableCommand } = await import("../../commands/backup-schedule.js");
+          await backupDisableCommand(defaultRuntime, opts);
+        });
+      }),
+  );
+}
+
+function registerBackupGitCommands(backup: Command): void {
+  const git = backup
+    .command("git")
+    .description("Create and restore deterministic versioned SQLite dumps in Git")
+    .action(() => {
+      git.outputHelp();
+      process.exitCode = 1;
+    });
+
+  git
+    .command("init")
+    .description("Initialize or adopt an operator-owned Git backup repository")
+    .requiredOption("--repository <path>", "Git backup repository directory")
+    .option("--remote <url>", "Add the remote as origin")
+    .option("--json", "Output JSON", false)
+    .action(async (opts) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        const { backupGitInitCommand } = await import("../../commands/backup-git.js");
+        await backupGitInitCommand(defaultRuntime, opts);
+      });
+    });
+
+  git
+    .command("create")
+    .description("Dump selected OpenClaw databases and commit one Git revision")
+    .requiredOption("--repository <path>", "Git backup repository directory")
+    .option("--all", "Back up the shared database and every registered agent database", false)
+    .option("--global", "Back up the shared OpenClaw state database", false)
+    .option("--agent <id>", "Back up an agent database (repeatable)", collectOption, [])
+    .option("--push", "Push the current branch to origin", false)
+    .option("--exclude-secrets", "Omit credential-bearing database tables", false)
+    .option("--json", "Output JSON", false)
+    .action(async (opts) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        const { backupGitCreateCommand } = await import("../../commands/backup-git.js");
+        const { agent: agents, ...options } = opts;
+        await backupGitCreateCommand(defaultRuntime, { ...options, agents });
+      });
+    });
+
+  git
+    .command("log")
+    .description("Show Git backup commits")
+    .requiredOption("--repository <path>", "Git backup repository directory")
+    .option(
+      "--limit <n>",
+      "Maximum commits to show",
+      (value) => parseStrictPositiveIntOption(value, "--limit"),
+      20,
+    )
+    .option("--json", "Output JSON", false)
+    .action(async (opts) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        const { backupGitLogCommand } = await import("../../commands/backup-git.js");
+        await backupGitLogCommand(defaultRuntime, opts);
+      });
+    });
+
+  git
+    .command("verify")
+    .description("Restore and verify one database snapshot from a Git ref")
+    .requiredOption("--repository <path>", "Git backup repository directory")
+    .option("--ref <commit>", "Commit or ref to verify", "HEAD")
+    .option("--global", "Verify the shared state database", false)
+    .option("--agent <id>", "Verify one agent database")
+    .option("--json", "Output JSON", false)
+    .action(async (opts) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        const { backupGitVerifyCommand } = await import("../../commands/backup-git.js");
+        await backupGitVerifyCommand(defaultRuntime, opts);
+      });
+    });
+
+  git
+    .command("restore")
+    .description("Restore one database snapshot from a Git ref to a fresh SQLite file")
+    .requiredOption("--repository <path>", "Git backup repository directory")
+    .requiredOption("--target <path>", "Fresh target path; existing files and sidecars are refused")
+    .option("--ref <commit>", "Commit or ref to restore", "HEAD")
+    .option("--global", "Restore the shared state database", false)
+    .option("--agent <id>", "Restore one agent database")
+    .option("--json", "Output JSON", false)
+    .action(async (opts) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        const { backupGitRestoreCommand } = await import("../../commands/backup-git.js");
+        await backupGitRestoreCommand(defaultRuntime, opts);
+      });
+    });
 }
 
 function registerBackupSqliteCommands(backup: Command): void {
@@ -133,12 +272,8 @@ function registerBackupSqliteCommands(backup: Command): void {
     )
     .action(async (opts) => {
       await runCommandWithRuntime(defaultRuntime, async () => {
-        await backupSqliteCreateCommand(defaultRuntime, {
-          global: Boolean(opts.global),
-          agent: opts.agent as string | undefined,
-          repository: opts.repository as string,
-          json: Boolean(opts.json),
-        });
+        const { backupSqliteCreateCommand } = await import("../../commands/backup-sqlite.js");
+        await backupSqliteCreateCommand(defaultRuntime, opts);
       });
     });
 
@@ -149,10 +284,8 @@ function registerBackupSqliteCommands(backup: Command): void {
     .option("--json", "Output JSON", false)
     .action(async (opts) => {
       await runCommandWithRuntime(defaultRuntime, async () => {
-        await backupSqliteListCommand(defaultRuntime, {
-          repository: opts.repository as string,
-          json: Boolean(opts.json),
-        });
+        const { backupSqliteListCommand } = await import("../../commands/backup-sqlite.js");
+        await backupSqliteListCommand(defaultRuntime, opts);
       });
     });
 
@@ -163,10 +296,8 @@ function registerBackupSqliteCommands(backup: Command): void {
     .option("--json", "Output JSON", false)
     .action(async (snapshot, opts) => {
       await runCommandWithRuntime(defaultRuntime, async () => {
-        await backupSqliteVerifyCommand(defaultRuntime, snapshot as string, {
-          scratch: opts.scratch as string | undefined,
-          json: Boolean(opts.json),
-        });
+        const { backupSqliteVerifyCommand } = await import("../../commands/backup-sqlite.js");
+        await backupSqliteVerifyCommand(defaultRuntime, snapshot, opts);
       });
     });
 
@@ -177,10 +308,8 @@ function registerBackupSqliteCommands(backup: Command): void {
     .option("--json", "Output JSON", false)
     .action(async (snapshot, opts) => {
       await runCommandWithRuntime(defaultRuntime, async () => {
-        await backupSqliteRestoreCommand(defaultRuntime, snapshot as string, {
-          target: opts.target as string,
-          json: Boolean(opts.json),
-        });
+        const { backupSqliteRestoreCommand } = await import("../../commands/backup-sqlite.js");
+        await backupSqliteRestoreCommand(defaultRuntime, snapshot, opts);
       });
     });
 }

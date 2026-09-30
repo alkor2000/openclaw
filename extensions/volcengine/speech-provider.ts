@@ -1,18 +1,19 @@
-// Volcengine provider module implements model/runtime integration.
 import { normalizeResolvedSecretInputString } from "openclaw/plugin-sdk/secret-input";
 import type {
   SpeechDirectiveTokenParseContext,
+  SpeechDirectiveTokenParseResult,
   SpeechProviderConfig,
-  SpeechProviderOverrides,
   SpeechProviderPlugin,
 } from "openclaw/plugin-sdk/speech-core";
 import {
-  asObject,
   parseSpeechDirectiveNumberOverride,
   resolveSpeechProviderApiKey,
-  trimToUndefined,
-} from "openclaw/plugin-sdk/speech-core";
-import { asFiniteNumberInRange } from "openclaw/plugin-sdk/string-coerce-runtime";
+} from "openclaw/plugin-sdk/speech-provider";
+import {
+  asFiniteNumberInRange,
+  asOptionalRecord,
+  normalizeOptionalString as trimToUndefined,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 import { volcengineTTS, type VolcengineTtsEncoding } from "./tts.js";
 
 const DEFAULT_VOICE = "en_female_anna_mars_bigtts";
@@ -46,12 +47,6 @@ type VolcengineTtsProviderConfig = {
   emotion?: string;
 };
 
-type VolcengineTtsProviderOverrides = {
-  voice?: string;
-  speedRatio?: number;
-  emotion?: string;
-};
-
 function normalizeSpeedRatio(value: unknown): number | undefined {
   return asFiniteNumberInRange(value, { min: 0.2, max: 3 });
 }
@@ -59,8 +54,8 @@ function normalizeSpeedRatio(value: unknown): number | undefined {
 function normalizeVolcengineProviderConfig(
   rawConfig: Record<string, unknown>,
 ): VolcengineTtsProviderConfig {
-  const providers = asObject(rawConfig.providers);
-  const raw = asObject(providers?.volcengine) ?? asObject(rawConfig.volcengine);
+  const providers = asOptionalRecord(rawConfig.providers);
+  const raw = asOptionalRecord(providers?.volcengine) ?? asOptionalRecord(rawConfig.volcengine);
   return {
     apiKey: normalizeResolvedSecretInputString({
       value: raw?.apiKey,
@@ -112,43 +107,14 @@ function resolveLegacyVolcengineCredentials(config: {
 }
 
 function readProviderConfig(config: SpeechProviderConfig): VolcengineTtsProviderConfig {
-  const normalized = normalizeVolcengineProviderConfig({});
-  return {
-    apiKey:
-      normalizeResolvedSecretInputString({
-        value: config.apiKey,
-        path: "tts.providers.volcengine.apiKey",
-      }) ?? normalized.apiKey,
-    appId: trimToUndefined(config.appId) ?? normalized.appId,
-    token: trimToUndefined(config.token) ?? normalized.token,
-    voice: trimToUndefined(config.voice) ?? normalized.voice,
-    cluster: trimToUndefined(config.cluster) ?? normalized.cluster,
-    resourceId: trimToUndefined(config.resourceId) ?? normalized.resourceId,
-    appKey: trimToUndefined(config.appKey) ?? normalized.appKey,
-    baseUrl: trimToUndefined(config.baseUrl) ?? normalized.baseUrl,
-    speedRatio: normalizeSpeedRatio(config.speedRatio) ?? normalized.speedRatio,
-    emotion: trimToUndefined(config.emotion) ?? normalized.emotion,
-  };
+  return normalizeVolcengineProviderConfig({
+    volcengine: { ...config, token: trimToUndefined(config.token) },
+  });
 }
 
-function readVolcengineOverrides(
-  overrides: SpeechProviderOverrides | undefined,
-): VolcengineTtsProviderOverrides {
-  if (!overrides) {
-    return {};
-  }
-  return {
-    voice: trimToUndefined(overrides.voice),
-    speedRatio: normalizeSpeedRatio(overrides.speedRatio),
-    emotion: trimToUndefined(overrides.emotion),
-  };
-}
-
-function parseDirectiveToken(ctx: SpeechDirectiveTokenParseContext): {
-  handled: boolean;
-  overrides?: SpeechProviderOverrides;
-  warnings?: string[];
-} {
+function parseDirectiveToken(
+  ctx: SpeechDirectiveTokenParseContext,
+): SpeechDirectiveTokenParseResult {
   switch (ctx.key) {
     case "voice":
     case "volcengine_voice":
@@ -204,7 +170,7 @@ export function buildVolcengineSpeechProvider(): SpeechProviderPlugin {
 
     synthesize: async (req) => {
       const cfg = readProviderConfig(req.providerConfig);
-      const overrides = readVolcengineOverrides(req.providerOverrides);
+      const overrides = req.providerOverrides;
       const apiKey = resolveSeedSpeechApiKey(cfg.apiKey);
       const { appId, token } = resolveLegacyVolcengineCredentials(cfg);
 
@@ -223,13 +189,13 @@ export function buildVolcengineSpeechProvider(): SpeechProviderPlugin {
         apiKey,
         appId,
         token,
-        voice: overrides.voice ?? cfg.voice,
+        voice: trimToUndefined(overrides?.voice) ?? cfg.voice,
         cluster: cfg.cluster,
         resourceId: cfg.resourceId,
         appKey: cfg.appKey,
         baseUrl: cfg.baseUrl,
-        speedRatio: overrides.speedRatio ?? cfg.speedRatio,
-        emotion: overrides.emotion ?? cfg.emotion,
+        speedRatio: normalizeSpeedRatio(overrides?.speedRatio) ?? cfg.speedRatio,
+        emotion: trimToUndefined(overrides?.emotion) ?? cfg.emotion,
         encoding,
         timeoutMs: req.timeoutMs,
       });

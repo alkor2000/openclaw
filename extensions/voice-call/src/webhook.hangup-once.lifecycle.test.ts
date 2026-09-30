@@ -1,14 +1,23 @@
 // Voice Call tests cover webhook.hangup once.lifecycle plugin behavior.
-import type { OpenKeyedStoreOptions } from "openclaw/plugin-sdk/plugin-state-runtime";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import type { OpenAsyncKeyedStoreOptions } from "openclaw/plugin-sdk/plugin-state-runtime";
 import {
-  createPluginStateSyncKeyedStoreForTests,
+  createPluginStateKeyedStoreForTests,
   resetPluginStateStoreForTests,
 } from "openclaw/plugin-sdk/plugin-state-test-runtime";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { closeOpenClawStateDatabaseAsync } from "openclaw/plugin-sdk/sqlite-runtime-testing";
+import { postRawWebhook } from "openclaw/plugin-sdk/test-env";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { VoiceCallConfigSchema, type VoiceCallConfig } from "./config.js";
 import { CallManager } from "./manager.js";
-import { createTestStorePath, FakeProvider } from "./manager.test-harness.js";
-import { setVoiceCallStateRuntime } from "./runtime-state.js";
+import {
+  createTestStorePath,
+  FakeProvider,
+  finalizeTestManagerCalls,
+} from "./manager.test-harness.js";
+import { TwilioProvider } from "./providers/twilio.js";
+import { getOptionalVoiceCallStateRuntime, setVoiceCallStateRuntime } from "./runtime-state.js";
 import type { WebhookContext, WebhookParseOptions } from "./types.js";
 import { VoiceCallWebhookServer } from "./webhook.js";
 
@@ -16,11 +25,8 @@ function installStateRuntime(): void {
   setVoiceCallStateRuntime({
     state: {
       resolveStateDir: () => "",
-      openKeyedStore: (() => {
-        throw new Error("openKeyedStore is not used by voice-call webhook lifecycle tests");
-      }) as never,
-      openSyncKeyedStore: (options: OpenKeyedStoreOptions) =>
-        createPluginStateSyncKeyedStoreForTests("voice-call", options),
+      openKeyedStore: (options: OpenAsyncKeyedStoreOptions) =>
+        createPluginStateKeyedStoreForTests("voice-call", options),
       openChannelIngressQueue: (() => {
         throw new Error(
           "openChannelIngressQueue is not used by voice-call webhook lifecycle tests",
@@ -47,29 +53,11 @@ const createConfig = (overrides: Partial<VoiceCallConfig> = {}): VoiceCallConfig
   return {
     ...base,
     ...overrides,
-    serve: {
-      ...base.serve,
-      ...overrides.serve,
-    },
   };
 };
 
-async function postWebhookForm(server: VoiceCallWebhookServer, baseUrl: string, body: string) {
-  const address = (
-    server as unknown as { server?: { address?: () => unknown } }
-  ).server?.address?.();
-  const requestUrl = new URL(baseUrl);
-  if (
-    !address ||
-    typeof address !== "object" ||
-    !("port" in address) ||
-    (typeof address.port !== "number" && typeof address.port !== "string") ||
-    !address.port
-  ) {
-    throw new Error("voice webhook server did not expose a bound port");
-  }
-  requestUrl.port = String(address.port);
-  return await fetch(requestUrl.toString(), {
+async function postWebhookForm(baseUrl: string, body: string) {
+  return await fetch(baseUrl, {
     method: "POST",
     headers: {
       "content-type": "application/x-www-form-urlencoded",
@@ -88,8 +76,8 @@ async function runDuplicateInboundReplayLifecycleTest(provider: FakeProvider) {
 
   try {
     const baseUrl = await server.start();
-    const first = await postWebhookForm(server, baseUrl, "CallSid=CA123&From=%2B15552222222");
-    const second = await postWebhookForm(server, baseUrl, "CallSid=CA123&From=%2B15552222222");
+    const first = await postWebhookForm(baseUrl, "CallSid=CA123&From=%2B15552222222");
+    const second = await postWebhookForm(baseUrl, "CallSid=CA123&From=%2B15552222222");
     return { first, second, manager };
   } finally {
     await server.stop();
@@ -152,8 +140,120 @@ describe("Voice-call webhook hangup-once lifecycle", () => {
     installStateRuntime();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await closeOpenClawStateDatabaseAsync();
     resetPluginStateStoreForTests();
+    vi.restoreAllMocks();
+  });
+
+  it("preserves finalized identity through signed HTTP callbacks and retries failed history reads", async () => {
+    const authToken = "synthetic-terminal-webhook-token";
+    const config = createConfig({
+      provider: "twilio",
+      agentId: "default-agent",
+      twilio: { accountSid: "AC-fixture", authToken },
+    });
+    const provider = new TwilioProvider({ accountSid: "AC-fixture", authToken });
+    vi.spyOn(provider, "initiateCall").mockResolvedValue({
+      providerCallId: "CA-terminal-identity",
+      status: "initiated",
+    });
+    const playback = vi.spyOn(provider, "playTts").mockResolvedValue();
+    const hangup = vi.spyOn(provider, "hangupCall").mockResolvedValue();
+    const storePath = createTestStorePath();
+    const manager = new CallManager(config, storePath);
+    const processing = vi.spyOn(manager, "processEvent");
+    const server = new VoiceCallWebhookServer(config, manager, provider);
+    try {
+      const baseUrl = await server.start();
+      provider.setPublicUrl(baseUrl);
+      await manager.initialize(provider, baseUrl);
+      const started = await manager.initiateCall("+15550000001", "agent:sales:voice:http", {
+        agentId: "sales",
+      });
+      expect(started.success).toBe(true);
+      const url = new URL(baseUrl);
+      url.searchParams.set("callId", started.callId);
+      url.searchParams.set("type", "status");
+      const send = async (callStatus: string, sequence: string) => {
+        const form = new URLSearchParams({
+          CallSid: "CA-terminal-identity",
+          CallStatus: callStatus,
+          Direction: "outbound-api",
+          From: "+15550000000",
+          To: "+15550000001",
+          SequenceNumber: sequence,
+        });
+        form.sort();
+        const material = url.toString() + [...form].map(([key, value]) => key + value).join("");
+        const signature = crypto.createHmac("sha1", authToken).update(material).digest("base64");
+        const response = await fetch(url, {
+          method: "POST",
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            "x-twilio-signature": signature,
+          },
+          body: form.toString(),
+        });
+        await response.text();
+        return response.status;
+      };
+
+      expect(await send("in-progress", "1")).toBe(200);
+      await expect(manager.speak(started.callId, "Keep the original transcript.")).resolves.toEqual(
+        {
+          success: true,
+        },
+      );
+      await expect(manager.endCall(started.callId)).resolves.toEqual({ success: true });
+      const history = await manager.getCallHistory();
+      expect(history.at(-1)).toMatchObject({
+        callId: started.callId,
+        agentId: "sales",
+        sessionKey: "agent:sales:voice:http",
+        state: "hangup-bot",
+        transcript: [expect.objectContaining({ text: "Keep the original transcript." })],
+      });
+      expect(await send("completed", "2")).toBe(200);
+      const terminalCalls = processing.mock.calls.length;
+      expect(await send("completed", "2")).toBe(200);
+      expect(processing).toHaveBeenCalledTimes(terminalCalls);
+
+      const state = getOptionalVoiceCallStateRuntime()?.state;
+      if (!state) {
+        throw new Error("expected fixture SQLite runtime");
+      }
+      const openStore = state.openKeyedStore.bind(state);
+      const fault = vi
+        .spyOn(state, "openKeyedStore")
+        .mockImplementation(<T>(options: OpenAsyncKeyedStoreOptions) => {
+          const store = openStore<T>(options);
+          store.entries = async () => {
+            throw new Error("synthetic signed callback history failure");
+          };
+          return store;
+        });
+      try {
+        expect(await send("completed", "3")).toBe(500);
+      } finally {
+        fault.mockRestore();
+      }
+      expect(await send("completed", "3")).toBe(200);
+      expect(processing).toHaveBeenCalledTimes(terminalCalls + 2);
+      expect(await manager.getCallHistory()).toEqual(history);
+      expect(manager.getActiveCalls()).toEqual([]);
+      expect(playback).toHaveBeenCalledTimes(1);
+      expect(hangup).toHaveBeenCalledTimes(1);
+    } finally {
+      try {
+        await server.stop();
+      } finally {
+        await finalizeTestManagerCalls(manager);
+        await closeOpenClawStateDatabaseAsync();
+        resetPluginStateStoreForTests();
+        fs.rmSync(storePath, { recursive: true, force: true });
+      }
+    }
   });
 
   it("hangs up a rejected inbound replay only once across duplicate webhook delivery", async () => {
@@ -178,11 +278,7 @@ describe("Voice-call webhook hangup-once lifecycle", () => {
 
     try {
       const baseUrl = await firstServer.start();
-      const first = await postWebhookForm(
-        firstServer,
-        baseUrl,
-        "CallSid=CA123&From=%2B15552222222",
-      );
+      const first = await postWebhookForm(baseUrl, "CallSid=CA123&From=%2B15552222222");
       expect(first.status).toBe(200);
     } finally {
       await firstServer.stop();
@@ -196,11 +292,7 @@ describe("Voice-call webhook hangup-once lifecycle", () => {
 
     try {
       const baseUrl = await secondServer.start();
-      const replay = await postWebhookForm(
-        secondServer,
-        baseUrl,
-        "CallSid=CA123&From=%2B15552222222",
-      );
+      const replay = await postWebhookForm(baseUrl, "CallSid=CA123&From=%2B15552222222");
       expect(replay.status).toBe(200);
     } finally {
       await secondServer.stop();
@@ -208,5 +300,45 @@ describe("Voice-call webhook hangup-once lifecycle", () => {
 
     expect(secondProvider.hangupCalls).toHaveLength(0);
     expect(secondManager.getCallByProviderCallId("provider-inbound-1")).toBeUndefined();
+  });
+});
+
+describe("Voice-call webhook body limits", () => {
+  beforeEach(() => {
+    resetPluginStateStoreForTests();
+    installStateRuntime();
+  });
+
+  afterEach(async () => {
+    await closeOpenClawStateDatabaseAsync();
+    resetPluginStateStoreForTests();
+  });
+
+  it("answers an over-limit webhook with 413 and then closes the connection", async () => {
+    // Driven over a real socket: the server answers while the sender is still uploading
+    // and then closes, so a mocked response cannot show whether either half happened.
+    const provider = new FakeProvider();
+    const config = createConfig();
+    const manager = new CallManager(config, createTestStorePath());
+    await manager.initialize(provider, "https://example.com/voice/webhook");
+    const server = new VoiceCallWebhookServer(config, manager, provider);
+
+    try {
+      const baseUrl = await server.start();
+      const result = await postRawWebhook({
+        url: baseUrl,
+        body: `CallSid=CA123&From=%2B15552222222&Padding=${"x".repeat(2 * 1024 * 1024)}`,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          "x-plivo-signature-v2": "sig",
+          "x-plivo-signature-v2-nonce": "nonce",
+        },
+      });
+
+      expect(result.statusLine).toBe("HTTP/1.1 413 Payload Too Large");
+      expect(result.closedByServer).toBe(true);
+    } finally {
+      await server.stop();
+    }
   });
 });

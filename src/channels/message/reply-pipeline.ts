@@ -1,8 +1,3 @@
-/**
- * Channel reply pipeline builder.
- *
- * Resolves source delivery mode, reply prefixing, typing callbacks, and payload transforms.
- */
 import type { SourceReplyDeliveryMode } from "../../auto-reply/get-reply-options.types.js";
 import type { ReplyPayload } from "../../auto-reply/reply-payload.js";
 import { resolveResponsePrefixTemplate } from "../../auto-reply/reply/response-prefix-template.js";
@@ -24,6 +19,7 @@ import {
   type CreateTypingCallbacksParams,
   type TypingCallbacks,
 } from "../typing.js";
+import { applyChannelReplyTransform, bindChannelReplyTransformOwner } from "./reply-transform.js";
 
 export type ReplyPrefixContext = ReplyPrefixContextBundle["prefixContext"];
 export type { ReplyPrefixContextBundle, ReplyPrefixOptions };
@@ -81,27 +77,34 @@ export function createChannelReplyPipeline(
     ? (normalizeAnyChannelId(params.channel) ?? params.channel)
     : undefined;
   let plugin: ReturnType<typeof getLoadedChannelPluginForRead> | undefined;
-  let pluginTransformResolved = false;
-  const resolvePluginTransform = () => {
+  let pluginMessagingResolved = false;
+  const resolvePluginMessaging = () => {
     // Load the channel plugin lazily so reply-pipeline construction stays cheap for hot turn paths.
     // The resolved transform is process-stable for this pipeline; plugin registry
     // changes require a new pipeline rather than repeated hot-path lookups.
-    if (pluginTransformResolved) {
-      return plugin?.messaging?.transformReplyPayload;
+    if (pluginMessagingResolved) {
+      return plugin?.messaging;
     }
-    pluginTransformResolved = true;
+    pluginMessagingResolved = true;
     plugin = channelId ? getLoadedChannelPluginForRead(channelId) : undefined;
-    return plugin?.messaging?.transformReplyPayload;
+    return plugin?.messaging;
+  };
+  const transformPluginReply = (payload: ReplyPayload) => {
+    const messaging = resolvePluginMessaging();
+    if (messaging?.transformReplyPayload) {
+      bindChannelReplyTransformOwner(transformPluginReply, messaging, params.accountId);
+    }
+    return applyChannelReplyTransform({
+      messaging,
+      payload,
+      cfg: params.cfg,
+      accountId: params.accountId,
+    });
   };
   const transformReplyPayload = params.transformReplyPayload
     ? params.transformReplyPayload
     : channelId
-      ? (payload: ReplyPayload) =>
-          resolvePluginTransform()?.({
-            payload,
-            cfg: params.cfg,
-            accountId: params.accountId,
-          }) ?? payload
+      ? transformPluginReply
       : undefined;
   const prefixOptions = createReplyPrefixOptions({
     cfg: params.cfg,

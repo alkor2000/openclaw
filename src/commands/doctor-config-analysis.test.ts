@@ -1,11 +1,15 @@
 // Doctor config analysis tests cover schema analysis, model fallback values, and issue generation.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { resolveAgentModelFallbackValues } from "../config/model-input.js";
+import { resolveConfiguredModelFallbacks } from "../agents/model-selection-resolve.js";
+import { retainLegacyDefaultAgentId } from "../config/legacy.default-agent-owner.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { OpenClawSchema } from "../config/zod-schema.js";
 import {
-  formatConfigPath,
+  formatConfigKeyPath,
+  noteDoctorHookConfigWarnings,
   noteImplicitFallbackClobberWarnings,
+  noteMcpOriginWarning,
+  noteMissingDefaultAgentOwner,
   noteOpencodeProviderOverrides,
   noteSandboxOriginProxyWarning,
   resolveConfigPathTarget,
@@ -24,29 +28,48 @@ function collectImplicitFallbackClobberWarnings(cfg: OpenClawConfig): string[] {
 }
 
 describe("doctor config analysis helpers", () => {
-  it("describes OpenCode overrides against the plugin-provided catalog", () => {
+  it("warns when hooks transformsDir points outside the hook transforms root", () => {
     noteMock.mockClear();
-
-    noteOpencodeProviderOverrides(
+    noteDoctorHookConfigWarnings(
       {
-        models: {
-          providers: {
-            opencode: {
-              baseUrl: "https://opencode.ai/zen/v1",
-              api: "openai-completions",
-              models: [],
+        hooks: {
+          enabled: true,
+          token: "hook-secret",
+          transformsDir: "/virtual/.openclaw/workspace/skills/linear-webhook",
+          mappings: [
+            {
+              match: { path: "linear" },
+              action: "agent",
+              messageTemplate: "Linear event",
+              transform: { module: "./openclaw-linear-transform.js" },
             },
-          },
+          ],
         },
       },
-      { opencodePluginActive: true },
+      "/virtual/.openclaw/openclaw.json",
     );
 
-    expect(noteMock).toHaveBeenCalledWith(
-      expect.stringContaining("plugin-provided OpenCode Zen catalog"),
-      "OpenCode",
+    expect(noteMock).toHaveBeenCalledExactlyOnceWith(expect.any(String), "Doctor warnings");
+    const warning = String(noteMock.mock.calls[0]?.[0]);
+    expect(warning).toContain("hooks.transformsDir:");
+    expect(warning).toContain("/virtual/.openclaw/workspace/skills/linear-webhook");
+    expect(warning).toContain("/virtual/.openclaw/hooks/transforms");
+    expect(warning).toContain("move custom transforms there or remove hooks.transformsDir");
+  });
+
+  it("requires a durable default designation despite retained migration provenance", () => {
+    noteMock.mockClear();
+    const cfg = retainLegacyDefaultAgentId(
+      { agents: { ownership: "explicit", entries: { ops: {}, research: {} } } },
+      "ops",
     );
-    expect(noteMock.mock.calls.at(-1)?.[0]).not.toContain("built-in");
+
+    noteMissingDefaultAgentOwner(cfg);
+
+    expect(noteMock).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("openclaw config set agents.defaults.systemAgent.agentId <id>"),
+      "Agent ownership",
+    );
   });
 
   it("classifies external OpenCode overrides only while their plugins are active", () => {
@@ -85,8 +108,8 @@ describe("doctor config analysis helpers", () => {
   });
 
   it("formats config paths predictably", () => {
-    expect(formatConfigPath([])).toBe("<root>");
-    expect(formatConfigPath(["channels", "slack", "accounts", 0, "token"])).toBe(
+    expect(formatConfigKeyPath([])).toBe("<root>");
+    expect(formatConfigKeyPath(["channels", "slack", "accounts", 0, "token"])).toBe(
       "channels.slack.accounts[0].token",
     );
   });
@@ -98,16 +121,6 @@ describe("doctor config analysis helpers", () => {
     );
     expect(target).toEqual({ token: "x" });
     expect(resolveConfigPathTarget({ channels: null }, ["channels", "slack"])).toBeNull();
-  });
-
-  it("strips unknown config keys while keeping known values", () => {
-    const result = stripUnknownConfigKeys({
-      hooks: {},
-      unexpected: true,
-    } as never);
-    expect(result.removed).toContain("unexpected");
-    expect((result.config as Record<string, unknown>).unexpected).toBeUndefined();
-    expect((result.config as Record<string, unknown>).hooks).toStrictEqual({});
   });
 
   it("strips unknown root model metadata while preserving supported agent metadata", () => {
@@ -132,6 +145,8 @@ describe("doctor config analysis helpers", () => {
 
     expect(result.removed).toContain("unexpected");
     expect(result.removed).toContain("defaultModel");
+    expect(result.config).not.toHaveProperty("unexpected");
+    expect(result.config).not.toHaveProperty("defaultModel");
     expect(result.removed).not.toContain("agents.entries.main.description");
     expect(result.removed).not.toContain("agents.entries.stock-news.description");
     expect(OpenClawSchema.safeParse({ defaultModel: "minimax/MiniMax-M2.7" }).success).toBe(false);
@@ -204,7 +219,7 @@ describe("doctor config analysis helpers", () => {
     const result = stripUnknownConfigKeys(config as never);
 
     expect(result.removed).toContain("unexpected");
-    expect(result.removed).not.toContain(formatConfigPath([...path, "$include"]));
+    expect(result.removed).not.toContain(formatConfigKeyPath([...path, "$include"]));
     expect(resolveConfigPathTarget(result.config, path)).toMatchObject({
       $include: expect.any(String),
     });
@@ -240,14 +255,6 @@ describe("doctor config analysis helpers", () => {
       expect(result.config).toBe(input);
       expect(result.removed).toEqual([]);
     });
-
-    it("strips unknown keys normally when env is unset", () => {
-      const result = stripUnknownConfigKeys({
-        hooks: {},
-        unexpected: true,
-      } as never);
-      expect(result.removed).toContain("unexpected");
-    });
   });
 
   describe("plugins.installs whitelist", () => {
@@ -279,6 +286,25 @@ describe("doctor config analysis helpers", () => {
 });
 
 describe("collectImplicitFallbackClobberWarnings", () => {
+  it.each(["openai/gpt-5.3", { primary: "openai/gpt-5.3" }])(
+    "warns when canonical agent model %j suppresses default fallbacks",
+    (model) => {
+      const cfg: OpenClawConfig = {
+        agents: {
+          defaults: { model: { primary: "openai/gpt-5.5", fallbacks: ["openai/gpt-5.4"] } },
+          entries: { ops: { model } },
+        },
+      };
+
+      expect(resolveConfiguredModelFallbacks({ cfg, agentId: "ops" })).toEqual([]);
+      const warnings = collectImplicitFallbackClobberWarnings(cfg);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("agents.entries.ops.model");
+      expect(warnings[0]).toContain("leaving the agent with no fallbacks");
+      expect(warnings[0]).toContain('add "fallbacks": [...]');
+    },
+  );
+
   function buildConfig(overrides: { defaults?: unknown; list?: unknown[] }): OpenClawConfig {
     return {
       agents: {
@@ -292,36 +318,6 @@ describe("collectImplicitFallbackClobberWarnings", () => {
     const cfg = buildConfig({
       defaults: { primary: "openai/gpt-5.5" },
       list: [{ id: "ops", model: "openai/gpt-5.3" }],
-    });
-    expect(collectImplicitFallbackClobberWarnings(cfg)).toEqual([]);
-  });
-
-  it("returns empty when defaults fallbacks is an empty array", () => {
-    const cfg = buildConfig({
-      defaults: { primary: "openai/gpt-5.5", fallbacks: [] },
-      list: [{ id: "ops", model: "openai/gpt-5.3" }],
-    });
-    expect(collectImplicitFallbackClobberWarnings(cfg)).toEqual([]);
-  });
-
-  it("returns empty when all agents use fallbacks: [] explicitly", () => {
-    const cfg = buildConfig({
-      defaults: { primary: "openai/gpt-5.5", fallbacks: ["openai/gpt-5.4"] },
-      list: [
-        { id: "ops", model: { primary: "openai/gpt-5.3", fallbacks: [] } },
-        { id: "researcher", model: { primary: "openai/gpt-5.4", fallbacks: [] } },
-      ],
-    });
-    expect(collectImplicitFallbackClobberWarnings(cfg)).toEqual([]);
-  });
-
-  it('returns empty when all agents use fallbacks: ["x"] explicitly', () => {
-    const cfg = buildConfig({
-      defaults: { primary: "openai/gpt-5.5", fallbacks: ["openai/gpt-5.4"] },
-      list: [
-        { id: "ops", model: { primary: "openai/gpt-5.3", fallbacks: ["openai/gpt-5.2"] } },
-        { id: "researcher", model: { primary: "openai/gpt-5.4", fallbacks: ["openai/gpt-5.2"] } },
-      ],
     });
     expect(collectImplicitFallbackClobberWarnings(cfg)).toEqual([]);
   });
@@ -345,31 +341,6 @@ describe("collectImplicitFallbackClobberWarnings", () => {
     expect(collectImplicitFallbackClobberWarnings(cfg)).toEqual([]);
   });
 
-  it("warns for string-form model when defaults fallbacks is non-empty", () => {
-    const cfg = buildConfig({
-      defaults: { primary: "openai/gpt-5.5", fallbacks: ["openai/gpt-5.4", "openai/gpt-5.3"] },
-      list: [{ id: "ops", model: "openai/gpt-5.3" }],
-    });
-    const warnings = collectImplicitFallbackClobberWarnings(cfg);
-    expect(warnings).toStrictEqual([
-      [
-        '- agents.list[0].model (id=ops) is "openai/gpt-5.3", a bare string with no fallbacks. At runtime this clobbers agents.defaults.model.fallbacks (openai/gpt-5.4, openai/gpt-5.3), leaving the agent with no fallbacks.',
-        '  Fix: add "fallbacks": [...] to inherit or override, or "fallbacks": [] to explicitly disable.',
-      ].join("\n"),
-    ]);
-  });
-
-  it("matches runtime fallback resolution for warned string and partial-object shapes", () => {
-    expect(
-      resolveAgentModelFallbackValues({
-        primary: "openai/gpt-5.5",
-        fallbacks: ["openai/gpt-5.4"],
-      }),
-    ).toEqual(["openai/gpt-5.4"]);
-    expect(resolveAgentModelFallbackValues("openai/gpt-5.3" as never)).toEqual([]);
-    expect(resolveAgentModelFallbackValues({ primary: "openai/gpt-5.3" })).toEqual([]);
-  });
-
   it("does not warn for blank string-form model", () => {
     const cfg = buildConfig({
       defaults: { primary: "openai/gpt-5.5", fallbacks: ["openai/gpt-5.4"] },
@@ -379,20 +350,6 @@ describe("collectImplicitFallbackClobberWarnings", () => {
       ],
     });
     expect(collectImplicitFallbackClobberWarnings(cfg)).toEqual([]);
-  });
-
-  it('warns for object form { primary: "X" } with no fallbacks key', () => {
-    const cfg = buildConfig({
-      defaults: { primary: "openai/gpt-5.5", fallbacks: ["openai/gpt-5.4"] },
-      list: [{ id: "researcher", model: { primary: "openai/gpt-5.4" } }],
-    });
-    const warnings = collectImplicitFallbackClobberWarnings(cfg);
-    expect(warnings).toStrictEqual([
-      [
-        '- agents.list[0].model (id=researcher) is { primary: "openai/gpt-5.4" }, a object with no explicit "fallbacks" key. At runtime this clobbers agents.defaults.model.fallbacks (openai/gpt-5.4), leaving the agent with no fallbacks.',
-        '  Fix: add "fallbacks": [...] to inherit or override, or "fallbacks": [] to explicitly disable.',
-      ].join("\n"),
-    ]);
   });
 
   it("does not warn for object form with blank primary", () => {
@@ -495,5 +452,65 @@ describe("noteSandboxOriginProxyWarning", () => {
   it("stays silent for non-proxy auth modes", () => {
     expect(warningsFor({ gateway: { auth: { mode: "token" } } } as OpenClawConfig)).toHaveLength(0);
     expect(warningsFor({} as OpenClawConfig)).toHaveLength(0);
+  });
+});
+
+describe("noteMcpOriginWarning", () => {
+  function warningsFor(cfg: OpenClawConfig): string[] {
+    noteMock.mockClear();
+    noteMcpOriginWarning(cfg);
+    return noteMock.mock.calls.map((call) => String(call[0]));
+  }
+
+  it("warns for per-requester MCP OAuth without a public Gateway origin", () => {
+    const warnings = warningsFor({
+      mcp: {
+        servers: {
+          docs: {
+            url: "https://mcp.example.com",
+            auth: "oauth",
+            oauth: { identity: "per-requester" },
+          },
+        },
+      },
+    });
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("gateway.publicOrigin is not set");
+    expect(warnings[0]).toContain("senders can complete MCP sign-in");
+  });
+
+  it("stays silent when the public origin is configured", () => {
+    expect(
+      warningsFor({
+        gateway: { publicOrigin: "https://gateway.example.com" },
+        mcp: {
+          servers: {
+            docs: {
+              url: "https://mcp.example.com",
+              auth: "oauth",
+              oauth: { identity: "per-requester" },
+            },
+          },
+        },
+      }),
+    ).toHaveLength(0);
+  });
+
+  it("stays silent for shared or absent MCP OAuth identity", () => {
+    expect(
+      warningsFor({
+        mcp: {
+          servers: {
+            shared: {
+              url: "https://shared.example.com",
+              auth: "oauth",
+              oauth: { identity: "shared" },
+            },
+            implicit: { url: "https://implicit.example.com", auth: "oauth" },
+          },
+        },
+      }),
+    ).toHaveLength(0);
+    expect(warningsFor({})).toHaveLength(0);
   });
 });

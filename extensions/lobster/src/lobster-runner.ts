@@ -1,9 +1,13 @@
-// Lobster plugin module implements lobster runner behavior.
 import { stat } from "node:fs/promises";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
+import {
+  extractErrorCode,
+  toErrorObject as toLintErrorObject,
+} from "openclaw/plugin-sdk/error-runtime";
+import { isPathInside } from "openclaw/plugin-sdk/file-access-runtime";
 
-export type LobsterEnvelope =
+type LobsterEnvelope =
   | {
       ok: true;
       status: "ok" | "needs_approval" | "cancelled";
@@ -79,11 +83,6 @@ type EmbeddedToolRuntime = {
 
 const workflowExts = new Set([".lobster", ".yaml", ".yml", ".json"]);
 
-function normalizeForCwdSandbox(p: string): string {
-  const normalized = path.normalize(p);
-  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
-}
-
 export function resolveLobsterCwd(cwdRaw: unknown): string {
   if (typeof cwdRaw !== "string" || !cwdRaw.trim()) {
     return process.cwd();
@@ -95,11 +94,7 @@ export function resolveLobsterCwd(cwdRaw: unknown): string {
   const base = process.cwd();
   const resolved = path.resolve(base, cwd);
 
-  const rel = path.relative(normalizeForCwdSandbox(base), normalizeForCwdSandbox(resolved));
-  if (rel === "" || rel === ".") {
-    return resolved;
-  }
-  if (rel.startsWith("..") || path.isAbsolute(rel)) {
+  if (!isPathInside(base, resolved)) {
     throw new Error("cwd must stay within the gateway working directory");
   }
   return resolved;
@@ -119,14 +114,17 @@ function createLimitedSink(maxBytes: number, label: "stdout" | "stderr") {
   });
 }
 
-function normalizeEnvelope(envelope: EmbeddedToolEnvelope): Extract<LobsterEnvelope, { ok: true }> {
+function normalizeEnvelope(
+  envelope: EmbeddedToolEnvelope,
+  maxStdoutBytes: number,
+): Extract<LobsterEnvelope, { ok: true }> {
   if (!envelope.ok) {
     throw new Error(envelope.error?.message ?? "lobster runtime failed");
   }
   if (envelope.status === "needs_input") {
     throw new Error("Lobster input requests are not supported by the OpenClaw Lobster tool yet");
   }
-  return {
+  const normalized: Extract<LobsterEnvelope, { ok: true }> = {
     ok: true,
     status: envelope.status ?? "ok",
     output: Array.isArray(envelope.output) ? envelope.output : [],
@@ -144,15 +142,10 @@ function normalizeEnvelope(envelope: EmbeddedToolEnvelope): Extract<LobsterEnvel
         }
       : null,
   };
-}
-
-function isMissingPathError(error: unknown) {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    (error as { code?: unknown }).code === "ENOENT"
-  );
+  if (Buffer.byteLength(JSON.stringify(normalized, null, 2), "utf8") > maxStdoutBytes) {
+    throw new Error("lobster runtime result exceeded maxStdoutBytes");
+  }
+  return normalized;
 }
 
 async function detectWorkflowFile(candidate: string, cwd: string) {
@@ -167,27 +160,11 @@ async function detectWorkflowFile(candidate: string, cwd: string) {
     }
     return resolved;
   } catch (error) {
-    if (/\s/.test(trimmed) && isMissingPathError(error)) {
+    if (/\s/.test(trimmed) && extractErrorCode(error) === "ENOENT") {
       return null;
     }
     throw error;
   }
-}
-
-function createEmbeddedToolContext(
-  params: LobsterRunnerParams,
-  signal?: AbortSignal,
-): EmbeddedToolContext {
-  const env = { ...process.env } as Record<string, string | undefined>;
-  return {
-    cwd: params.cwd,
-    env,
-    mode: "tool",
-    stdin: Readable.from([]),
-    stdout: createLimitedSink(Math.max(1024, params.maxStdoutBytes), "stdout"),
-    stderr: createLimitedSink(Math.max(1024, params.maxStdoutBytes), "stderr"),
-    signal,
-  };
 }
 
 async function withTimeout<T>(
@@ -235,7 +212,17 @@ export function createEmbeddedLobsterRunner(options?: {
       runtimePromise ??= loadRuntime();
       const runtime = await runtimePromise;
       return await withTimeout(params.timeoutMs, async (signal) => {
-        const ctx = createEmbeddedToolContext(params, signal);
+        const maxStdoutBytes = Math.max(1024, params.maxStdoutBytes);
+        const ctx: EmbeddedToolContext = {
+          cwd: params.cwd,
+          env: { ...process.env },
+          mode: "tool",
+          stdin: Readable.from([]),
+          stdout: createLimitedSink(maxStdoutBytes, "stdout"),
+          stderr: createLimitedSink(maxStdoutBytes, "stderr"),
+          signal,
+        };
+        let envelope: EmbeddedToolEnvelope;
 
         if (params.action === "run") {
           const pipeline = params.pipeline?.trim() ?? "";
@@ -254,44 +241,28 @@ export function createEmbeddedLobsterRunner(options?: {
                 throw new Error("run --args-json must be valid JSON");
               }
             }
-            return normalizeEnvelope(await runtime.runToolRequest({ filePath, args, ctx }));
+            envelope = await runtime.runToolRequest({ filePath, args, ctx });
+          } else {
+            envelope = await runtime.runToolRequest({ pipeline, ctx });
           }
-
-          return normalizeEnvelope(await runtime.runToolRequest({ pipeline, ctx }));
-        }
-
-        const token = params.token?.trim() ?? "";
-        const approvalId = params.approvalId?.trim() ?? "";
-        if (!token && !approvalId) {
-          throw new Error("token or approvalId required");
-        }
-        if (typeof params.approve !== "boolean") {
-          throw new Error("approve required");
-        }
-
-        return normalizeEnvelope(
-          await runtime.resumeToolRequest({
+        } else {
+          const token = params.token?.trim() ?? "";
+          const approvalId = params.approvalId?.trim() ?? "";
+          if (!token && !approvalId) {
+            throw new Error("token or approvalId required");
+          }
+          if (typeof params.approve !== "boolean") {
+            throw new Error("approve required");
+          }
+          envelope = await runtime.resumeToolRequest({
             ...(token ? { token } : {}),
             ...(approvalId ? { approvalId } : {}),
             approved: params.approve,
             ctx,
-          }),
-        );
+          });
+        }
+        return normalizeEnvelope(envelope, maxStdoutBytes);
       });
     },
   };
-}
-
-function toLintErrorObject(value: unknown, fallbackMessage: string): Error {
-  if (value instanceof Error) {
-    return value;
-  }
-  if (typeof value === "string") {
-    return new Error(value);
-  }
-  const error = new Error(fallbackMessage, { cause: value });
-  if ((typeof value === "object" && value !== null) || typeof value === "function") {
-    Object.assign(error, value);
-  }
-  return error;
 }

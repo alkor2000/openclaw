@@ -56,7 +56,7 @@ const bindingMocks = vi.hoisted(() => ({
   listBySession: vi.fn(() => []),
 }));
 
-let resetSubagentRegistryForTests: typeof import("./subagent-registry.test-helpers.js").resetSubagentRegistryForTests;
+let resetSubagentRegistryForTests: typeof import("./subagents/registry/subagent-registry.test-helpers.js").resetSubagentRegistryForTests;
 let spawnSubagentDirect: typeof import("./subagents/spawn/subagent-spawn.js").spawnSubagentDirect;
 
 function getGatewayRequests(): GatewayRequest[] {
@@ -517,7 +517,10 @@ describe("sessions_spawn subagent lifecycle hooks", () => {
       context: "isolated",
     });
 
-    expectErrorResultMessage(result, /only available on channels that expose thread bindings/i);
+    expectErrorResultMessage(
+      result,
+      /only available on channels that open a separate thread for the worker/i,
+    );
     expect(hookRunnerMocks.runSubagentSpawned).not.toHaveBeenCalled();
     expectSessionsDeleteWithoutAgentStart();
   });

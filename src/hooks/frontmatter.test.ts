@@ -2,11 +2,10 @@
 import { expectDefined } from "@openclaw/normalization-core";
 import { describe, expect, it } from "vitest";
 import {
-  parseFrontmatter,
-  resolveOpenClawMetadata,
+  parseHookFrontmatter,
+  resolveHookManifestMetadata,
   resolveHookInvocationPolicy,
 } from "./frontmatter.js";
-import type { OpenClawHookMetadata } from "./types.js";
 
 function requireString(value: string | undefined, label: string): string {
   if (typeof value !== "string") {
@@ -15,155 +14,23 @@ function requireString(value: string | undefined, label: string): string {
   return value;
 }
 
-function requireOpenClawMetadata(metadata: OpenClawHookMetadata | undefined): OpenClawHookMetadata {
-  if (!metadata) {
-    throw new Error("expected openclaw metadata");
-  }
-  return metadata;
-}
-
-describe("parseFrontmatter", () => {
-  it("parses single-line key-value pairs", () => {
-    const content = `---
-name: test-hook
-description: "A test hook"
-homepage: https://example.com
----
-
-# Test Hook
-`;
-    const result = parseFrontmatter(content);
-    expect(result.name).toBe("test-hook");
-    expect(result.description).toBe("A test hook");
-    expect(result.homepage).toBe("https://example.com");
-  });
-
-  it("handles missing frontmatter", () => {
-    const content = "# Just a markdown file";
-    const result = parseFrontmatter(content);
-    expect(result).toStrictEqual({});
-  });
-
-  it("handles unclosed frontmatter", () => {
-    const content = `---
-name: broken
-    `;
-    const result = parseFrontmatter(content);
-    expect(result).toStrictEqual({});
-  });
-
-  it("parses multi-line metadata block with indented JSON", () => {
-    const content = `---
-name: session-memory
-description: "Save session context"
-metadata:
-  {
-    "openclaw": {
-      "emoji": "💾",
-      "events": ["command:new"]
-    }
-  }
----
-
-# Session Memory Hook
-`;
-    const result = parseFrontmatter(content);
-    expect(result.name).toBe("session-memory");
-    expect(result.description).toBe("Save session context");
-    const metadata = requireString(result.metadata, "session-memory metadata");
-
-    // Verify the metadata is valid JSON
-    const parsed = JSON.parse(metadata);
-    expect(parsed.openclaw.emoji).toBe("💾");
-    expect(parsed.openclaw.events).toEqual(["command:new"]);
-  });
-
-  it("parses multi-line metadata with complex nested structure", () => {
-    const content = `---
-name: command-logger
-description: "Log all command events"
-metadata:
-  {
-    "openclaw":
-      {
-        "emoji": "📝",
-        "events": ["command"],
-        "requires": { "config": ["workspace.dir"] },
-        "install": [{ "id": "bundled", "kind": "bundled", "label": "Bundled" }]
-      }
-  }
----
-`;
-    const result = parseFrontmatter(content);
-    expect(result.name).toBe("command-logger");
-
-    const parsed = JSON.parse(requireString(result.metadata, "command-logger metadata"));
-    expect(parsed.openclaw.emoji).toBe("📝");
-    expect(parsed.openclaw.events).toEqual(["command"]);
-    expect(parsed.openclaw.requires.config).toEqual(["workspace.dir"]);
-    expect(parsed.openclaw.install[0].kind).toBe("bundled");
-  });
-
-  it("handles single-line metadata (inline JSON)", () => {
-    const content = `---
-name: simple-hook
-metadata: {"openclaw": {"events": ["test"]}}
----
-`;
-    const result = parseFrontmatter(content);
-    expect(result.name).toBe("simple-hook");
-    expect(result.metadata).toBe('{"openclaw": {"events": ["test"]}}');
-  });
-
-  it("handles mixed single-line and multi-line values", () => {
-    const content = `---
-name: mixed-hook
-description: "A hook with mixed values"
-homepage: https://example.com
-metadata:
-  {
-    "openclaw": {
-      "events": ["command:new"]
-    }
-  }
-enabled: true
----
-`;
-    const result = parseFrontmatter(content);
-    expect(result.name).toBe("mixed-hook");
-    expect(result.description).toBe("A hook with mixed values");
-    expect(result.homepage).toBe("https://example.com");
-    expect(requireString(result.metadata, "mixed-hook metadata")).toContain('"command:new"');
-    expect(result.enabled).toBe("true");
-  });
-
-  it("strips surrounding quotes from values", () => {
-    const content = `---
-name: "quoted-name"
-description: 'single-quoted'
----
-`;
-    const result = parseFrontmatter(content);
-    expect(result.name).toBe("quoted-name");
-    expect(result.description).toBe("single-quoted");
-  });
-
+describe("parseHookFrontmatter", () => {
   it("handles CRLF line endings", () => {
     const content = "---\r\nname: test\r\ndescription: crlf\r\n---\r\n";
-    const result = parseFrontmatter(content);
+    const result = parseHookFrontmatter(content);
     expect(result.name).toBe("test");
     expect(result.description).toBe("crlf");
   });
 
   it("handles CR line endings", () => {
     const content = "---\rname: test\rdescription: cr\r---\r";
-    const result = parseFrontmatter(content);
+    const result = parseHookFrontmatter(content);
     expect(result.name).toBe("test");
     expect(result.description).toBe("cr");
   });
 });
 
-describe("resolveOpenClawMetadata", () => {
+describe("resolveHookManifestMetadata", () => {
   it("extracts openclaw metadata from parsed frontmatter", () => {
     const frontmatter = {
       name: "test-hook",
@@ -179,8 +46,8 @@ describe("resolveOpenClawMetadata", () => {
       }),
     };
 
-    const result = resolveOpenClawMetadata(frontmatter);
-    const openclaw = requireOpenClawMetadata(result);
+    const result = resolveHookManifestMetadata(frontmatter);
+    const openclaw = expectDefined(result, "hook metadata");
     expect(openclaw.emoji).toBe("🔥");
     expect(openclaw.events).toEqual(["command:new", "command:reset"]);
     expect(openclaw.requires?.config).toEqual(["workspace.dir"]);
@@ -189,23 +56,7 @@ describe("resolveOpenClawMetadata", () => {
 
   it("returns undefined when metadata is missing", () => {
     const frontmatter = { name: "no-metadata" };
-    const result = resolveOpenClawMetadata(frontmatter);
-    expect(result).toBeUndefined();
-  });
-
-  it("returns undefined when openclaw key is missing", () => {
-    const frontmatter = {
-      metadata: JSON.stringify({ other: "data" }),
-    };
-    const result = resolveOpenClawMetadata(frontmatter);
-    expect(result).toBeUndefined();
-  });
-
-  it("returns undefined for invalid JSON", () => {
-    const frontmatter = {
-      metadata: "not valid json {",
-    };
-    const result = resolveOpenClawMetadata(frontmatter);
+    const result = resolveHookManifestMetadata(frontmatter);
     expect(result).toBeUndefined();
   });
 
@@ -222,7 +73,7 @@ describe("resolveOpenClawMetadata", () => {
       }),
     };
 
-    const result = resolveOpenClawMetadata(frontmatter);
+    const result = resolveHookManifestMetadata(frontmatter);
     expect(result?.install).toHaveLength(2);
     expect(expectDefined(result?.install?.[0], "result?.install?.[0] test invariant").kind).toBe(
       "bundled",
@@ -245,7 +96,7 @@ describe("resolveOpenClawMetadata", () => {
       }),
     };
 
-    const result = resolveOpenClawMetadata(frontmatter);
+    const result = resolveHookManifestMetadata(frontmatter);
     expect(result?.os).toEqual(["darwin", "linux"]);
   });
 
@@ -270,13 +121,13 @@ metadata:
 # Session Memory Hook
 `;
 
-    const frontmatter = parseFrontmatter(content);
+    const frontmatter = parseHookFrontmatter(content);
     expect(frontmatter.name).toBe("session-memory");
     expect(requireString(frontmatter.metadata, "session-memory metadata")).toContain(
       '"command:reset"',
     );
 
-    const openclaw = requireOpenClawMetadata(resolveOpenClawMetadata(frontmatter));
+    const openclaw = expectDefined(resolveHookManifestMetadata(frontmatter), "hook metadata");
     expect(openclaw.emoji).toBe("💾");
     expect(openclaw.events).toEqual(["command:new", "command:reset", "session:auto-reset"]);
     expect(openclaw.requires?.config).toEqual(["workspace.dir"]);
@@ -295,8 +146,8 @@ metadata:
       - command:new
 ---
 `;
-    const frontmatter = parseFrontmatter(content);
-    const openclaw = resolveOpenClawMetadata(frontmatter);
+    const frontmatter = parseHookFrontmatter(content);
+    const openclaw = resolveHookManifestMetadata(frontmatter);
     expect(openclaw?.emoji).toBe("disk");
     expect(openclaw?.events).toEqual(["command:new"]);
   });

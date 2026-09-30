@@ -1,6 +1,5 @@
-// Control UI link builder for local, LAN, tailnet, and custom gateway binds.
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import { resolveAdvertisedLanHost } from "../infra/advertised-lan-host.js";
+import { resolveAdvertisedLanHostCore } from "../infra/advertised-lan-host.js";
 import {
   inspectBestEffortPrimaryTailnetIPv4,
   pickBestEffortPrimaryLanIPv4,
@@ -34,7 +33,7 @@ export function resolveControlUiLinks(
       return customBindHost;
     }
     if (bind === "tailnet" && tailnetIPv4) {
-      return tailnetIPv4 ?? "127.0.0.1";
+      return tailnetIPv4;
     }
     if (bind === "lan") {
       return advertisedLanHost ?? pickBestEffortPrimaryLanIPv4() ?? "127.0.0.1";
@@ -42,13 +41,11 @@ export function resolveControlUiLinks(
     return "127.0.0.1";
   })();
   const basePath = normalizeControlUiBasePath(params.basePath);
-  const uiPath = basePath ? `${basePath}/` : "/";
-  const wsPath = basePath ? basePath : "";
   const httpScheme = params.tlsEnabled === true ? "https" : "http";
   const wsScheme = params.tlsEnabled === true ? "wss" : "ws";
   return {
-    httpUrl: `${httpScheme}://${host}:${port}${uiPath}`,
-    wsUrl: `${wsScheme}://${host}:${port}${wsPath}`,
+    httpUrl: `${httpScheme}://${host}:${port}${basePath}/`,
+    wsUrl: `${wsScheme}://${host}:${port}${basePath}`,
   };
 }
 
@@ -57,7 +54,7 @@ export async function resolveAdvertisedControlUiLinks(
   params: ControlUiLinkParams,
 ): Promise<ControlUiLinks> {
   const advertisedLanHost =
-    params.bind === "lan" ? await resolveAdvertisedLanHost().catch(() => null) : null;
+    params.bind === "lan" ? await resolveAdvertisedLanHostCore().catch(() => null) : null;
   return resolveControlUiLinks({
     ...params,
     advertisedLanHost,

@@ -1,18 +1,18 @@
 // Policy plugin gateway exposure evidence.
-import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { asNonArrayRecord, isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { ocPathSegment } from "./policy-state-helpers.js";
 import type { PolicyGatewayExposureEvidence } from "./policy-state-types.js";
 
 export function scanPolicyGatewayExposure(
   cfg: Record<string, unknown>,
 ): readonly PolicyGatewayExposureEvidence[] {
-  const gateway = isRecord(cfg.gateway) ? cfg.gateway : {};
+  const gateway = asNonArrayRecord(cfg.gateway);
   const entries: PolicyGatewayExposureEvidence[] = [];
   const bind = typeof gateway.bind === "string" ? gateway.bind : undefined;
   const customBindHost =
     typeof gateway.customBindHost === "string" ? gateway.customBindHost : undefined;
   const hasCustomBindHost = customBindHost !== undefined && customBindHost.trim() !== "";
-  const tailscale = isRecord(gateway.tailscale) ? gateway.tailscale : {};
+  const tailscale = asNonArrayRecord(gateway.tailscale);
   const tailscaleForcesLoopback = tailscale.mode === "serve" || tailscale.mode === "funnel";
   entries.push({
     id: bind === undefined ? "gateway-bind-default" : "gateway-bind",
@@ -37,7 +37,7 @@ export function scanPolicyGatewayExposure(
     });
   }
 
-  const auth = isRecord(gateway.auth) ? gateway.auth : {};
+  const auth = asNonArrayRecord(gateway.auth);
   entries.push({
     id: "gateway-auth-mode",
     kind: "auth",
@@ -53,7 +53,7 @@ export function scanPolicyGatewayExposure(
     explicit: isRecord(auth.rateLimit),
   });
 
-  const controlUi = isRecord(gateway.controlUi) ? gateway.controlUi : {};
+  const controlUi = asNonArrayRecord(gateway.controlUi);
   pushGatewayBooleanEvidence(
     entries,
     "gateway-control-ui-enabled",
@@ -100,7 +100,7 @@ export function scanPolicyGatewayExposure(
     });
   }
 
-  const remote = isRecord(gateway.remote) ? gateway.remote : {};
+  const remote = asNonArrayRecord(gateway.remote);
   if (gateway.mode === "remote") {
     entries.push({
       id: "gateway-mode-remote",
@@ -118,11 +118,11 @@ export function scanPolicyGatewayExposure(
     }
   }
 
-  const http = isRecord(gateway.http) ? gateway.http : {};
-  const endpoints = isRecord(http.endpoints) ? http.endpoints : {};
+  const http = asNonArrayRecord(gateway.http);
+  const endpoints = asNonArrayRecord(http.endpoints);
   pushGatewayHttpEndpointEvidence(entries, endpoints, "chatCompletions");
   pushGatewayHttpEndpointEvidence(entries, endpoints, "responses");
-  const nodes = isRecord(gateway.nodes) ? gateway.nodes : {};
+  const nodes = asNonArrayRecord(gateway.nodes);
   pushGatewayNodeCommandEvidence(entries, nodes);
   return entries.toSorted((a, b) => a.source.localeCompare(b.source));
 }
@@ -202,52 +202,35 @@ function pushGatewayNodeCommandEvidence(
   nodes: Record<string, unknown>,
 ): void {
   const commands = isRecord(nodes.commands) ? nodes.commands : null;
-  const denyCommands = commands?.deny;
-  const deniedCommands = new Set(
-    Array.isArray(denyCommands)
-      ? denyCommands
-          .filter((command): command is string => typeof command === "string")
-          .map((command) => command.trim())
-      : [],
-  );
-  if (Array.isArray(denyCommands)) {
-    denyCommands.forEach((command, index) => {
+  const deniedCommands = new Set<string>();
+  for (const [list, kind, idPrefix] of [
+    ["deny", "nodeDenyCommand", "gateway-node-deny-command"],
+    ["allow", "nodeCommand", "gateway-node-command"],
+  ] as const) {
+    const values = commands?.[list];
+    if (!Array.isArray(values)) {
+      continue;
+    }
+    values.forEach((command, index) => {
       if (typeof command !== "string") {
         return;
       }
       const normalized = command.trim();
-      if (normalized === "") {
+      if (normalized === "" || (list === "allow" && deniedCommands.has(normalized))) {
         return;
       }
+      if (list === "deny") {
+        deniedCommands.add(normalized);
+      }
       entries.push({
-        id: `gateway-node-deny-command-${normalized}`,
-        kind: "nodeDenyCommand",
-        source: `oc://openclaw.config/gateway/nodes/commands/deny/#${index}`,
+        id: `${idPrefix}-${normalized}`,
+        kind,
+        source: `oc://openclaw.config/gateway/nodes/commands/${list}/#${index}`,
         value: normalized,
         command: normalized,
       });
     });
   }
-  const allowCommands = commands?.allow;
-  if (!Array.isArray(allowCommands)) {
-    return;
-  }
-  allowCommands.forEach((command, index) => {
-    if (typeof command !== "string") {
-      return;
-    }
-    const normalized = command.trim();
-    if (normalized === "" || deniedCommands.has(normalized)) {
-      return;
-    }
-    entries.push({
-      id: `gateway-node-command-${normalized}`,
-      kind: "nodeCommand",
-      source: `oc://openclaw.config/gateway/nodes/commands/allow/#${index}`,
-      value: normalized,
-      command: normalized,
-    });
-  });
 }
 
 function isEffectiveGatewayUrlAllowlistEntry(value: unknown): boolean {

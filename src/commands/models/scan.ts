@@ -1,21 +1,20 @@
-/** OpenRouter free-model scanner and fallback updater for model commands. */
-import { cancel, multiselect as clackMultiselect, isCancel } from "@clack/prompts";
+import { cancel, type CANCEL_SYMBOL, multiselect as clackMultiselect } from "@clack/prompts";
 import { getEnvApiKey } from "@openclaw/ai/internal/runtime";
+import {
+  parseStrictFiniteNumber,
+  parseStrictPositiveInteger,
+} from "@openclaw/normalization-core/number-coercion";
 import { styleSelectParams } from "../../../packages/terminal-core/src/prompt-select-styled-params.js";
 import { stylePromptTitle } from "../../../packages/terminal-core/src/prompt-style.js";
 import { sanitizeTerminalText } from "../../../packages/terminal-core/src/safe-text.js";
-import { resolveApiKeyForProvider } from "../../agents/model-auth.js";
+import { resolveApiKeyForProviderCore } from "../../agents/model-auth.js";
 import { type ModelScanResult, scanOpenRouterModels } from "../../agents/model-scan.js";
 import { formatCliCommand } from "../../cli/command-format.js";
 import { withProgressTotals } from "../../cli/progress.js";
 import { logConfigUpdated } from "../../config/logging.js";
 import { toAgentModelListLike } from "../../config/model-input.js";
-import {
-  parseStrictFiniteNumber,
-  parseStrictPositiveInteger,
-} from "../../infra/parse-finite-number.js";
 import { type RuntimeEnv, writeRuntimeJson } from "../../runtime.js";
-import { pad, truncate } from "./list.format.js";
+import { padTerminalCell, truncate } from "./list.format.js";
 import { loadModelsConfig } from "./load-config.js";
 import { formatMs, formatTokenK, updateConfig } from "./shared.js";
 
@@ -25,8 +24,8 @@ const CTX_PAD = 8;
 const multiselect = <T>(params: Parameters<typeof clackMultiselect<T>>[0]) =>
   clackMultiselect(styleSelectParams(params));
 
-function guardPromptCancel<T>(value: T | symbol, runtime: RuntimeEnv): T {
-  if (isCancel(value)) {
+function guardPromptCancel<T>(value: T | typeof CANCEL_SYMBOL, runtime: RuntimeEnv): T {
+  if (typeof value === "symbol") {
     cancel(stylePromptTitle("Model scan cancelled.") ?? "Model scan cancelled.");
     runtime.exit(0);
     throw new Error("unreachable");
@@ -35,7 +34,7 @@ function guardPromptCancel<T>(value: T | symbol, runtime: RuntimeEnv): T {
 }
 
 function sortScanResults(results: ModelScanResult[]): ModelScanResult[] {
-  return results.slice().toSorted((a, b) => {
+  return results.toSorted((a, b) => {
     const aImage = a.image.ok ? 1 : 0;
     const bImage = b.image.ok ? 1 : 0;
     if (aImage !== bImage) {
@@ -53,7 +52,7 @@ function sortScanResults(results: ModelScanResult[]): ModelScanResult[] {
 }
 
 function sortImageResults(results: ModelScanResult[]): ModelScanResult[] {
-  return results.slice().toSorted((a, b) => {
+  return results.toSorted((a, b) => {
     const aLatency = a.image.latencyMs ?? Number.POSITIVE_INFINITY;
     const bLatency = b.image.latencyMs ?? Number.POSITIVE_INFINITY;
     if (aLatency !== bLatency) {
@@ -123,27 +122,27 @@ function printMetadataOnlyNotice(params: {
 
 function printScanTable(results: ModelScanResult[], runtime: RuntimeEnv) {
   const header = [
-    pad("Model", MODEL_PAD),
-    pad("Tool", 10),
-    pad("Image", 10),
-    pad("Ctx", CTX_PAD),
-    pad("Params", 8),
+    padTerminalCell("Model", MODEL_PAD),
+    padTerminalCell("Tool", 10),
+    padTerminalCell("Image", 10),
+    padTerminalCell("Ctx", CTX_PAD),
+    padTerminalCell("Params", 8),
     "Notes",
   ].join(" ");
   runtime.log(header);
 
   for (const entry of results) {
-    const modelLabel = pad(truncate(entry.modelRef, MODEL_PAD), MODEL_PAD);
-    const toolLabel = pad(
+    const modelLabel = padTerminalCell(truncate(entry.modelRef, MODEL_PAD), MODEL_PAD);
+    const toolLabel = padTerminalCell(
       entry.tool.skipped ? "skip" : entry.tool.ok ? formatMs(entry.tool.latencyMs) : "fail",
       10,
     );
-    const imageLabel = pad(
+    const imageLabel = padTerminalCell(
       entry.image.ok ? formatMs(entry.image.latencyMs) : entry.image.skipped ? "skip" : "fail",
       10,
     );
-    const ctxLabel = pad(formatTokenK(entry.contextLength), CTX_PAD);
-    const paramsLabel = pad(entry.inferredParamB ? `${entry.inferredParamB}b` : "-", 8);
+    const ctxLabel = padTerminalCell(formatTokenK(entry.contextLength), CTX_PAD);
+    const paramsLabel = padTerminalCell(entry.inferredParamB ? `${entry.inferredParamB}b` : "-", 8);
     const notes = entry.modality ? `modality:${sanitizeTerminalText(entry.modality)}` : "";
 
     runtime.log([modelLabel, toolLabel, imageLabel, ctxLabel, paramsLabel, notes].join(" "));
@@ -151,7 +150,7 @@ function printScanTable(results: ModelScanResult[], runtime: RuntimeEnv) {
 }
 
 function parseOptionalNonNegativeFiniteOption(raw: unknown, label: string): number | undefined {
-  if (raw === undefined || raw === null || raw === "") {
+  if (raw === undefined || raw === null) {
     return undefined;
   }
   const parsed = parseStrictFiniteNumber(raw);
@@ -162,7 +161,7 @@ function parseOptionalNonNegativeFiniteOption(raw: unknown, label: string): numb
 }
 
 function parseOptionalPositiveFiniteOption(raw: unknown, label: string): number | undefined {
-  if (raw === undefined || raw === null || raw === "") {
+  if (raw === undefined || raw === null) {
     return undefined;
   }
   const parsed = parseStrictFiniteNumber(raw);
@@ -173,7 +172,7 @@ function parseOptionalPositiveFiniteOption(raw: unknown, label: string): number 
 }
 
 function parsePositiveIntegerOption(raw: unknown, label: string, fallback: number): number {
-  if (raw === undefined || raw === null || raw === "") {
+  if (raw === undefined || raw === null) {
     return fallback;
   }
   const parsed = parseStrictPositiveInteger(raw);
@@ -183,7 +182,6 @@ function parsePositiveIntegerOption(raw: unknown, label: string, fallback: numbe
   return parsed;
 }
 
-/** Scans OpenRouter candidates, optionally probes them, then writes fallback defaults. */
 export async function modelsScanCommand(
   opts: {
     minParams?: string;
@@ -223,7 +221,7 @@ export async function modelsScanCommand(
     if (!storedKey) {
       try {
         const cfg = await loadModelsConfig({ commandName: "models scan" });
-        const resolved = await resolveApiKeyForProvider({
+        const resolved = await resolveApiKeyForProviderCore({
           provider: "openrouter",
           cfg,
         });
@@ -354,12 +352,7 @@ export async function modelsScanCommand(
 
   await updateConfig((cfg) => {
     const nextModels = { ...cfg.agents?.defaults?.models };
-    for (const entry of selected) {
-      if (!nextModels[entry]) {
-        nextModels[entry] = {};
-      }
-    }
-    for (const entry of selectedImages) {
+    for (const entry of [...selected, ...selectedImages]) {
       if (!nextModels[entry]) {
         nextModels[entry] = {};
       }

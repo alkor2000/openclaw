@@ -55,8 +55,8 @@ export async function deliverClientVoiceMutationDigest(
   if (!target.channel || target.channel === "webchat" || !target.to) {
     return;
   }
-  const { sendDurableMessageBatch } = await import("../channels/message/runtime.js");
-  const send = await sendDurableMessageBatch({
+  const { sendDurableMessageBatchCore } = await import("../channels/message/runtime.js");
+  const send = await sendDurableMessageBatchCore({
     cfg: config,
     channel: target.channel,
     to: target.to,
@@ -88,6 +88,7 @@ export async function deliverClientVoiceMutationDigest(
       writeVoiceSessionRecordInTransaction(database, current);
     },
     { agentId: record.agentId },
+    { operationLabel: "voice.mutation-digest.delivered" },
   );
 }
 

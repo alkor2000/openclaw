@@ -2,6 +2,7 @@ import { AGENT_MODEL_CONFIG_KEYS } from "@openclaw/model-catalog-core/configured
 import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
 import { asOptionalRecord as asMutableRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalLowercaseString as normalizeString } from "@openclaw/normalization-core/string-coerce";
+import { normalizeOptionalAgentRuntimeId } from "../../../agents/agent-runtime-id.js";
 import { resolveModelRuntimePolicy } from "../../../agents/model-runtime-policy.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import { normalizeAgentId } from "../../../routing/session-key.js";
@@ -10,8 +11,7 @@ import {
   canonicalOpenAIModelUsesCodexRuntime,
   isBlockedLegacyCodexModelRef,
   isOpenAICodexModelRef,
-  normalizeRuntimeString,
-  parseModelRef,
+  parseCodexRouteModelRef,
   toCanonicalOpenAIModelRef,
   type LegacyCodexModelIdentity,
 } from "./codex-route-model-ref.js";
@@ -48,11 +48,11 @@ function resolveCurrentRuntimeIdForCanonicalModel(params: {
   agentId: string;
   env?: NodeJS.ProcessEnv;
 }): string {
-  const parsed = parseModelRef(params.modelRef);
+  const parsed = parseCodexRouteModelRef(params.modelRef);
   if (!parsed) {
     return "auto";
   }
-  const configured = normalizeRuntimeString(
+  const configured = normalizeOptionalAgentRuntimeId(
     resolveModelRuntimePolicy({
       config: params.cfg,
       provider: parsed.provider,
@@ -213,7 +213,7 @@ function providerModelExplicitNonDefaultRuntimeId(params: {
       ) {
         continue;
       }
-      const runtimeId = normalizeRuntimeString(asMutableRecord(record?.agentRuntime)?.id);
+      const runtimeId = normalizeOptionalAgentRuntimeId(asMutableRecord(record?.agentRuntime)?.id);
       if (runtimeId && runtimeId !== "auto" && runtimeId !== "default" && runtimeId !== "codex") {
         return runtimeId;
       }
@@ -227,7 +227,7 @@ function agentModelMapExactRuntimeIdForLegacyRef(params: {
   legacyModelRef: string;
   agentId?: string;
 }): string | undefined {
-  const parsed = parseModelRef(params.legacyModelRef);
+  const parsed = parseCodexRouteModelRef(params.legacyModelRef);
   if (!parsed) {
     return undefined;
   }
@@ -251,7 +251,7 @@ function agentModelMapExactRuntimeIdForLegacyRef(params: {
       ) {
         continue;
       }
-      const runtimeId = normalizeRuntimeString(
+      const runtimeId = normalizeOptionalAgentRuntimeId(
         asMutableRecord(asMutableRecord(entry)?.agentRuntime)?.id,
       );
       if (runtimeId && runtimeId !== "auto" && runtimeId !== "default") {
@@ -270,7 +270,7 @@ function preRepairLegacyModelPolicyExplicitNonDefaultRuntimePin(params: {
   if (!params.legacyModelRef || !isOpenAICodexModelRef(params.legacyModelRef)) {
     return undefined;
   }
-  const parsed = parseModelRef(params.legacyModelRef);
+  const parsed = parseCodexRouteModelRef(params.legacyModelRef);
   if (!parsed) {
     return undefined;
   }
@@ -280,7 +280,7 @@ function preRepairLegacyModelPolicyExplicitNonDefaultRuntimePin(params: {
     modelId: parsed.modelId,
     agentId: params.agentId,
   });
-  const runtimeId = normalizeRuntimeString(resolved.policy?.id);
+  const runtimeId = normalizeOptionalAgentRuntimeId(resolved.policy?.id);
   if (!runtimeId || runtimeId === "auto" || runtimeId === "default" || runtimeId === "codex") {
     return undefined;
   }
@@ -482,10 +482,6 @@ function clearLegacyAgentRuntimePolicy(
 ): void {
   if (!container) {
     return;
-  }
-  if (asMutableRecord(container.embeddedHarness)) {
-    delete container.embeddedHarness;
-    changes.push(`Removed ${pathLabel}.embeddedHarness; runtime is now provider/model scoped.`);
   }
   if (asMutableRecord(container.agentRuntime)) {
     delete container.agentRuntime;

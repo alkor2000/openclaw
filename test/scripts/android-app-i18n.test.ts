@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
-import { describe, expect, it } from "vitest";
+import path from "node:path";
+import { describe, expect, it, vi } from "vitest";
 import {
   buildAndroidAppI18nCatalog,
   checkAndroidAppI18n,
@@ -9,10 +10,24 @@ import {
   findUnlocalizedAndroidUiLiterals,
   renderAndroidResourceValue,
   selectDeterministicTranslation,
-  selectExactArtifactTranslation,
   selectGeneratedTranslation,
 } from "../../scripts/android-app-i18n.ts";
-import { NATIVE_I18N_LOCALES } from "../../scripts/native-app-i18n.ts";
+import { NATIVE_I18N_LOCALES } from "../../scripts/native-i18n-locales.ts";
+
+const { generatedOverrides } = vi.hoisted(() => ({
+  generatedOverrides: new Map<string, string>(),
+}));
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    readFile: (...args: Parameters<typeof actual.readFile>) => {
+      const override =
+        typeof args[0] === "string" ? generatedOverrides.get(path.resolve(args[0])) : undefined;
+      return override === undefined ? actual.readFile(...args) : Promise.resolve(override);
+    },
+  };
+});
 
 describe("Android app i18n resources", () => {
   it("keeps generated resources, runtime coverage, and every locale aligned", async () => {
@@ -28,12 +43,97 @@ describe("Android app i18n resources", () => {
     expect(wearBase).toContain('<string name="current_session">Current session</string>');
   });
 
+  it("warns only when obsolete generated rows are the entire localization drift", async () => {
+    const kotlinPath = path.resolve(
+      "apps/android/app/src/main/java/ai/openclaw/app/i18n/NativeStringResources.kt",
+    );
+    const catalog = await buildAndroidAppI18nCatalog();
+    const currentKotlin = catalog.kotlin;
+    const obsoleteKotlin = '    "Talk stopped" to R.string.native_c38a575f77e9b336,\n';
+    const obsoleteString =
+      '    <string name="native_c38a575f77e9b336" formatted="false" tools:ignore="Typos,TypographyDashes,TypographyEllipsis">"Talk stopped"</string>\n';
+    const warnings: string[] = [];
+    const options = { reportObsolete: (message: string) => warnings.push(message) };
+    const basePath = path.resolve("apps/android/app/src/main/res/values/strings.xml");
+    try {
+      generatedOverrides.set(kotlinPath, currentKotlin.replace("  )\n", `${obsoleteKotlin}  )\n`));
+      // Source changes may await locale refresh; the fixture needs only obsolete drift.
+      for (const [filePath, current] of catalog.resources) {
+        const appStrings =
+          filePath.includes("/app/src/main/res/") && filePath.endsWith("/strings.xml");
+        generatedOverrides.set(
+          filePath,
+          appStrings
+            ? current.replace("</resources>\n", `${obsoleteString}</resources>\n`)
+            : current,
+        );
+      }
+      await expect(checkAndroidAppI18n()).rejects.toThrow("Android generated localization drift");
+      await expect(checkAndroidAppI18n(options)).resolves.toBeUndefined();
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("Android obsolete generated localization rows:");
+
+      for (const fixture of [
+        {
+          filePath: "apps/android/app/src/play/java/ai/openclaw/app/SensitiveFeatureConfig.kt",
+          reference: (source: string) =>
+            `${source}\nprivate val retainedLabel = R.string.native_c38a575f77e9b336\n`,
+        },
+        {
+          filePath: "apps/android/app/src/thirdParty/AndroidManifest.xml",
+          reference: (source: string) =>
+            source.replace(
+              "<application>",
+              '<application><meta-data android:name="openclaw.test.retainedLabel" android:resource="@string/native_c38a575f77e9b336" />',
+            ),
+        },
+      ]) {
+        const filePath = path.resolve(fixture.filePath);
+        generatedOverrides.set(filePath, fixture.reference(await readFile(filePath, "utf8")));
+        await expect(checkAndroidAppI18n(options)).rejects.toThrow(
+          "Android generated localization drift",
+        );
+        generatedOverrides.delete(filePath);
+      }
+
+      const obsoleteBase = await readFile(basePath, "utf8");
+      const currentBase = obsoleteBase.replace(obsoleteString, "");
+      for (const invalidBase of [
+        obsoleteBase.replace(obsoleteString, `${obsoleteString}${obsoleteString}`),
+        obsoleteBase.replace('>"Talk stopped"</string>', '>"Talk & stopped"</string>'),
+        obsoleteBase.replace(/ {4}<string name="native_[a-f0-9]+"[^\n]*\n/u, ""),
+        `${obsoleteBase}malformed\n`,
+        `${obsoleteString}${currentBase}`,
+        `${currentBase}${obsoleteString}`,
+      ]) {
+        generatedOverrides.set(basePath, invalidBase);
+        await expect(checkAndroidAppI18n(options)).rejects.toThrow(
+          "Android generated localization drift",
+        );
+      }
+      generatedOverrides.set(basePath, obsoleteBase);
+      for (const invalidKotlin of [
+        `${currentKotlin}malformed\n${obsoleteKotlin}`,
+        `${obsoleteKotlin}${currentKotlin}`,
+        `${currentKotlin}${obsoleteKotlin}`,
+      ]) {
+        generatedOverrides.set(kotlinPath, invalidKotlin);
+        await expect(checkAndroidAppI18n(options)).rejects.toThrow(
+          "Android generated localization drift",
+        );
+      }
+    } finally {
+      generatedOverrides.clear();
+    }
+  });
+
   it("routes compact token suffixes through generated resources", async () => {
     const inventory = JSON.parse(await readFile("apps/.i18n/native-source.json", "utf8")) as {
-      entries: Array<{ kind: string; path: string; source: string }>;
+      entries: Array<{ sites: Array<{ kind: string; path: string }>; source: string }>;
     };
     const sources = new Set(["${decimal(count / 1_000_000.0)}M", "${thousands}k"]);
     const entries = inventory.entries
+      .flatMap((entry) => entry.sites.map((site) => ({ ...site, source: entry.source })))
       .filter(
         (entry) => entry.path.endsWith("/ui/chat/ChatTurnRecap.kt") && sources.has(entry.source),
       )
@@ -46,7 +146,7 @@ describe("Android app i18n resources", () => {
     ]);
   });
 
-  it("builds complete Wear resources for every native locale", async () => {
+  it("builds complete Wear and third-party resources for every native locale", async () => {
     const catalog = await buildAndroidAppI18nCatalog();
     const wearResources = [...catalog.resources].filter(
       ([filePath]) =>
@@ -90,11 +190,8 @@ describe("Android app i18n resources", () => {
         'name="show_new_messages" tools:ignore="MissingTranslation,Typos,TypographyDashes,TypographyEllipsis"',
       );
     }
-  });
 
-  it("builds complete third-party flavor resources for every native locale", async () => {
-    const catalog = await buildAndroidAppI18nCatalog();
-    const base = await readFile(
+    const thirdPartyBase = await readFile(
       "apps/android/app/src/thirdParty/res/values/accessibility_strings.xml",
       "utf8",
     );
@@ -104,7 +201,7 @@ describe("Android app i18n resources", () => {
         filePath.endsWith("/accessibility_strings.xml"),
     );
 
-    expect(base).toContain('tools:ignore="MissingTranslation"');
+    expect(thirdPartyBase).toContain('tools:ignore="MissingTranslation"');
     expect(resources).toHaveLength(NATIVE_I18N_LOCALES.length);
     for (const [, content] of resources) {
       expect(content).toContain('name="accessibility_service_label"');
@@ -204,20 +301,6 @@ describe("Android app i18n resources", () => {
     expect(selectGeneratedTranslation("Sessions", ["Sesiones"], existing)).toBe("Sesiones");
   });
 
-  it("selects Wear translations by inventory ID instead of shared English source", () => {
-    const artifacts = new Map([
-      ["native.android.phone", { source: "Connected", translated: "Phone translation" }],
-      ["native.android.wear", { source: "Connected", translated: "Wear translation" }],
-    ]);
-
-    expect(selectExactArtifactTranslation("Connected", "native.android.wear", artifacts)).toBe(
-      "Wear translation",
-    );
-    expect(selectExactArtifactTranslation("Connected", "native.android.missing", artifacts)).toBe(
-      "Connected",
-    );
-  });
-
   it("does not reuse a localized resource after its English source changes", () => {
     const existing = { source: "Sessions", translation: "Sitzungen" };
     expect(selectGeneratedTranslation("Threads", [], existing)).toBe("");
@@ -309,12 +392,6 @@ describe("Android app i18n resources", () => {
       expect.objectContaining({ source: "Second sentence." }),
       expect.objectContaining({ source: "Ready" }),
     ]);
-    expect(
-      findUnlocalizedAndroidUiLiterals(
-        source,
-        "apps/android/app/src/main/java/ai/openclaw/app/ui/Example.kt",
-      ).map((finding) => finding.source),
-    ).not.toEqual(expect.arrayContaining(["Connected", "Waiting"]));
   });
 
   it("maps typed model fields across generic types and named argument omissions", () => {
@@ -373,6 +450,19 @@ describe("Android app i18n resources", () => {
     );
   });
 
+  it("decodes Kotlin Unicode escapes without collapsing escaped backslashes", () => {
+    const source = String.raw`
+      Text("Progress \u00b7 ready")
+      Text("Literal \\u00b7 marker")
+    `;
+    const findings = findUnlocalizedAndroidUiLiterals(
+      source,
+      "apps/android/app/src/main/java/ai/openclaw/app/ui/Example.kt",
+    ).map((finding) => finding.source);
+
+    expect(findings).toEqual(["Progress · ready", String.raw`Literal \u00b7 marker`]);
+  });
+
   it("inventories command, attention, and overview model display literals", () => {
     const source = `
       data class CommandItem(
@@ -413,26 +503,14 @@ describe("Android app i18n resources", () => {
       "apps/android/app/src/main/java/ai/openclaw/app/ui/Example.kt",
     ).map((finding) => finding.source);
 
-    expect(findings).toEqual(
-      expect.arrayContaining([
-        "Open Chat",
-        "Start a conversation",
-        "Gateway",
-        "Connect before chat, voice, and live status.",
-        "Online",
-        "All systems nominal",
-      ]),
-    );
-    expect(findings).not.toEqual(
-      expect.arrayContaining([
-        "chat",
-        "voice",
-        "Start Voice",
-        "Talk with OpenClaw",
-        "Offline",
-        "gateway",
-      ]),
-    );
+    expect(findings).toEqual([
+      "Open Chat",
+      "Start a conversation",
+      "Gateway",
+      "Connect before chat, voice, and live status.",
+      "Online",
+      "All systems nominal",
+    ]);
   });
 
   it("requires exact String fields and scans multiline helper expressions", () => {
@@ -458,8 +536,7 @@ describe("Android app i18n resources", () => {
       "apps/android/app/src/main/java/ai/openclaw/app/ui/Example.kt",
     ).map((finding) => finding.source);
 
-    expect(findings).toEqual(expect.arrayContaining(["Failure", "Fallback"]));
-    expect(findings).not.toEqual(expect.arrayContaining(["resource_key", "Ready"]));
+    expect(findings).toEqual(["Failure", "Fallback"]);
   });
 
   it("ignores preview fixtures", () => {
@@ -497,5 +574,94 @@ describe("Android app i18n resources", () => {
         "apps/android/app/src/thirdParty/java/ai/openclaw/app/accessibility/AccessibilityDevActivity.kt",
       ).map((finding) => finding.source),
     ).toEqual(["Developer surface"]);
+  });
+
+  it.each([
+    {
+      name: "a quoted closing parenthesis",
+      source: 'fun statusText(token: String = ")"): String = "Ready"',
+      expected: [
+        {
+          line: 1,
+          source: "Ready",
+        },
+      ],
+    },
+    {
+      name: "an escaped quote before a closing delimiter",
+      source: 'fun statusText(token: String = "\\")"): String = "Ready"',
+      expected: [
+        {
+          line: 1,
+          source: "Ready",
+        },
+      ],
+    },
+    {
+      name: "a doubled backslash before the closing quote",
+      source: 'fun statusText(token: String = "\\\\"): String = "Ready"',
+      expected: [
+        {
+          line: 1,
+          source: "Ready",
+        },
+      ],
+    },
+    {
+      name: "a quoted closing brace in a helper body",
+      source: 'fun statusText(): String { val marker = "}"; return "Ready" }',
+      expected: [
+        {
+          line: 1,
+          source: "Ready",
+        },
+      ],
+    },
+    {
+      name: "quoted commas and delimiters in positional model arguments",
+      source:
+        'data class State(val metadata: List<String>, val statusText: String)\nState(listOf("a,b", ")").map { it }, "🦊 Ready, ) ] }")',
+      expected: [
+        {
+          line: 2,
+          source: "🦊 Ready, ) ] }",
+        },
+      ],
+    },
+    {
+      name: "a default comparison after nested generic types",
+      source:
+        'data class State(val metadata: Map<String, List<Int>>, val enabled: Boolean = 1 < 2, val statusText: String)\nState(emptyMap(), true, "Ready")',
+      expected: [
+        {
+          line: 2,
+          source: "Ready",
+        },
+      ],
+    },
+    {
+      name: "quoted newlines before the next helper declaration",
+      source: 'fun statusText(): String = """First\nsecond"""\nfun helperText(): String = "Next"',
+      expected: [
+        {
+          line: 1,
+          source: "First\nsecond",
+        },
+        {
+          line: 3,
+          source: "Next",
+        },
+      ],
+    },
+    {
+      name: "an unclosed quoted parameter",
+      source: 'fun statusText(token: String = "unterminated): String = "Ready"',
+      expected: [],
+    },
+  ])("keeps scanner boundaries for $name", ({ source, expected }) => {
+    const repoPath = "apps/android/app/src/main/java/ai/openclaw/app/ui/Scanner.kt";
+    expect(findUnlocalizedAndroidUiLiterals(source, repoPath)).toEqual(
+      expected.map((finding) => ({ ...finding, path: repoPath })),
+    );
   });
 });

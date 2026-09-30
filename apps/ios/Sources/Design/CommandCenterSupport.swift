@@ -1,42 +1,6 @@
 import OpenClawChatUI
 import SwiftUI
 
-struct CommandPanel<Content: View>: View {
-    var tint: Color?
-    var isProminent = false
-    var padding: CGFloat = 13
-    @ViewBuilder var content: Content
-
-    init(
-        tint: Color? = nil,
-        isProminent: Bool = false,
-        padding: CGFloat = 13,
-        @ViewBuilder content: () -> Content)
-    {
-        self.tint = tint
-        self.isProminent = isProminent
-        self.padding = padding
-        self.content = content()
-    }
-
-    var body: some View {
-        ProCard(
-            tint: self.tint,
-            isProminent: self.isProminent,
-            padding: self.padding,
-            radius: OpenClawProMetric.cardRadius)
-        {
-            self.content
-        }
-    }
-}
-
-struct CommandControlBackground: View {
-    var body: some View {
-        OpenClawProBackground()
-    }
-}
-
 struct CommandSessionRow: View {
     let item: CommandCenterTab.WorkItem
 
@@ -79,11 +43,7 @@ struct CommandSessionRow: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                     Spacer(minLength: 6)
-                    if let progress = self.item.progress {
-                        ProProgressBar(progress: progress, color: self.item.color)
-                            .frame(width: 68)
-                    }
-                    Text(self.progressLabel)
+                    Text(self.stateLabel)
                         .font(OpenClawType.captionSemiBold)
                         .foregroundStyle(self.item.color)
                         .lineLimit(1)
@@ -93,36 +53,78 @@ struct CommandSessionRow: View {
         }
         .padding(.horizontal, 4)
         .padding(.vertical, 6)
+        .overlay(alignment: .leading) {
+            OpenClawSessionColorStripe(color: self.item.sessionColor)
+        }
         .contentShape(Rectangle())
     }
 
-    private var progressLabel: String {
-        guard let progress = item.progress else {
-            switch self.item.state {
-            case "offline": return String(localized: "offline")
-            case "off": return String(localized: "off")
-            case "idle": return String(localized: "idle")
-            case "open": return String(localized: "open")
-            case "default": return String(localized: "default")
-            case "recent": return String(localized: "recent")
-            default: return self.item.state
-            }
+    private var stateLabel: String {
+        switch self.item.state {
+        case "offline": String(localized: "offline")
+        case "off": String(localized: "off")
+        case "idle": String(localized: "idle")
+        case "open": String(localized: "open")
+        case "default": String(localized: "default")
+        case "recent": String(localized: "recent")
+        default: self.item.state
         }
-        if self.item.state == "offline" || self.item.state == "off" || self.item.state == "idle" {
-            return self.item.state
-        }
-        return "\(Int((progress * 100).rounded()))%"
     }
 }
 
 struct CommandSessionActions {
+    typealias Mutation = (any OpenClawChatTransport) async throws -> Void
+
     let rename: (String?) -> Void
     let moveToGroup: (String?) -> Void
+    let setColor: (String?) -> Void
     let togglePinned: () -> Void
     let toggleUnread: () -> Void
     let fork: () -> Void
     let toggleArchived: () -> Void
     let delete: () -> Void
+
+    static func gateway(
+        session: OpenClawChatSessionEntry,
+        archivesSession: @escaping () -> Bool = { true },
+        performMutation: @escaping (String?, @escaping Mutation) -> Void,
+        fork: @escaping () -> Void) -> Self
+    {
+        func patch(
+            label: String?? = nil,
+            category: String?? = nil,
+            color: String?? = nil,
+            pinned: Bool? = nil,
+            archived: Bool? = nil,
+            unread: Bool? = nil)
+        {
+            performMutation(archived == true ? session.key : nil) { transport in
+                try await transport.patchSession(
+                    key: session.key,
+                    expectedSessionID: archived == nil ? nil : session.sessionId,
+                    label: label,
+                    category: category,
+                    color: color,
+                    pinned: pinned,
+                    archived: archived,
+                    unread: unread)
+            }
+        }
+
+        return Self(
+            rename: { patch(label: .some($0)) },
+            moveToGroup: { patch(category: .some($0)) },
+            setColor: { patch(color: .some($0)) },
+            togglePinned: { patch(pinned: session.pinned != true) },
+            toggleUnread: { patch(unread: session.unread != true) },
+            fork: fork,
+            toggleArchived: { patch(archived: archivesSession()) },
+            delete: {
+                performMutation(session.key) { transport in
+                    try await transport.deleteSession(key: session.key)
+                }
+            })
+    }
 }
 
 struct CommandSessionActionsModifier: ViewModifier {
@@ -154,14 +156,8 @@ struct CommandSessionActionsModifier: ViewModifier {
     private func managedContent(_ content: Content) -> some View {
         content
             .contextMenu {
-                if self.isArchived {
-                    self.actionButton("Unarchive", systemImage: "archivebox") {
-                        self.actions.toggleArchived()
-                    }
-                    if self.canDelete {
-                        self.deleteButton
-                    }
-                } else {
+                OpenClawSessionColorMenu(color: self.session.color, onSelect: self.actions.setColor)
+                if !self.isArchived {
                     self.actionButton(
                         self.session.pinned == true
                             ? OpenClawTextValue.localized("Unpin")
@@ -181,18 +177,26 @@ struct CommandSessionActionsModifier: ViewModifier {
                     self.actionButton("Rename…", systemImage: "pencil") {
                         self.beginRename()
                     }
-                    self.actionButton("Fork", systemImage: "arrow.triangle.branch") {
+                    self.actionButton(
+                        self.session.hasActiveRun == true
+                            ? OpenClawTextValue.localized("Fork from last completed message")
+                            : OpenClawTextValue.localized("Fork"),
+                        systemImage: "arrow.triangle.branch")
+                    {
                         self.actions.fork()
                     }
                     self.groupMenu
-                    if self.canArchive {
-                        self.actionButton("Archive", systemImage: "archivebox") {
-                            self.actions.toggleArchived()
-                        }
+                }
+                if self.canArchive {
+                    self.actionButton(
+                        self.isArchived ? .localized("Unarchive") : .localized("Archive"),
+                        systemImage: "archivebox")
+                    {
+                        self.actions.toggleArchived()
                     }
-                    if self.canDelete {
-                        self.deleteButton
-                    }
+                }
+                if self.canDelete {
+                    self.deleteButton
                 }
             }
             .alert(self.editorTitle, isPresented: self.editorBinding) {

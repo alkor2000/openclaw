@@ -1,4 +1,6 @@
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { dispatchWidgetPrompt } from "../../components/mcp-app-security.ts";
+import { openExternalUrlSafe } from "../open-external-url.ts";
 
 type BoardWidgetBridgeRequest = {
   type: "openclaw:widget-bridge-request";
@@ -11,8 +13,6 @@ type BoardWidgetBridgeRequest = {
 export type BoardWidgetBridgeGatewayClient = {
   request: (method: string, params: Record<string, unknown>) => Promise<unknown>;
 };
-
-type PromptDispatcher = typeof dispatchWidgetPrompt;
 
 const STATE_PAYLOAD_MAX_BYTES = 8 * 1024;
 const STATE_COALESCE_WINDOW_MS = 5_000;
@@ -34,11 +34,11 @@ export function isBoardWidgetBridgeRequest(value: unknown): value is BoardWidget
   );
 }
 
-function asRecord(value: unknown): Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
+function assertWidgetRequestRecord(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) {
     throw new Error("widget host request params are invalid");
   }
-  return value as Record<string, unknown>;
+  return value;
 }
 
 function requiredString(params: Record<string, unknown>, key: string): string {
@@ -55,8 +55,9 @@ export class BoardWidgetBridgeController {
   private readonly client: BoardWidgetBridgeGatewayClient;
   private readonly rateKey: string;
   private readonly confirmPrompt: (text: string) => boolean;
-  private readonly dispatchPrompt: PromptDispatcher;
+  private readonly dispatchPrompt: typeof dispatchWidgetPrompt;
   private readonly now: () => number;
+  private readonly openUrl: (url: string) => boolean;
   private readonly recentStatePayloads = new Map<string, number>();
   private readonly pendingStates = new Map<string, Promise<unknown>>();
   private stateAttemptTimes: number[] = [];
@@ -67,8 +68,9 @@ export class BoardWidgetBridgeController {
     client: BoardWidgetBridgeGatewayClient;
     rateKey: string;
     confirmPrompt: (text: string) => boolean;
-    dispatchPrompt?: PromptDispatcher;
+    dispatchPrompt?: typeof dispatchWidgetPrompt;
     now?: () => number;
+    openUrl?: (url: string) => boolean;
   }) {
     this.frame = options.frame;
     this.ticket = options.ticket;
@@ -77,6 +79,7 @@ export class BoardWidgetBridgeController {
     this.confirmPrompt = options.confirmPrompt;
     this.dispatchPrompt = options.dispatchPrompt ?? dispatchWidgetPrompt;
     this.now = options.now ?? Date.now;
+    this.openUrl = options.openUrl ?? ((url) => openExternalUrlSafe(url) !== null);
   }
 
   updateIdentity(frame: HTMLIFrameElement, ticket: string): void {
@@ -133,8 +136,24 @@ export class BoardWidgetBridgeController {
     if (request.ticket !== this.ticket) {
       throw new Error("widget view ticket does not match the active frame");
     }
-    const params = asRecord(request.params);
+    const params = assertWidgetRequestRecord(request.params);
     switch (request.method) {
+      // Opening a link the user clicked is navigation, not a granted capability,
+      // so this stays outside the tool-grant checks. Opening goes through the
+      // Control UI's openExternalUrlSafe owner, which applies noopener/noreferrer
+      // regardless of the `rel` a widget wrote. The absolute-http(s) gate here is
+      // deliberately narrower than that shared policy: widget-supplied links must
+      // not reach `blob:`, which the general external-link path allows.
+      case "host.open": {
+        const url = requiredString(params, "url");
+        if (!/^https?:\/\//i.test(url)) {
+          throw new Error("widget link url is invalid");
+        }
+        if (!this.openUrl(url)) {
+          throw new Error("widget link could not be opened");
+        }
+        return { ok: true };
+      }
       case "prompt.send": {
         if (options.promptUserActivated !== true) {
           throw new Error("widget prompt requires active user interaction");
@@ -162,16 +181,25 @@ export class BoardWidgetBridgeController {
       case "data.read": {
         const bindingId = requiredString(params, "bindingId");
         const bindingParams = params.params;
-        if (
-          bindingParams !== undefined &&
-          (!bindingParams || typeof bindingParams !== "object" || Array.isArray(bindingParams))
-        ) {
+        if (bindingParams !== undefined && !isRecord(bindingParams)) {
           throw new Error("widget data binding params are invalid");
         }
         return await this.client.request("board.data.read", {
           ticket: this.ticket,
           bindingId,
-          ...(bindingParams ? { params: bindingParams as Record<string, unknown> } : {}),
+          ...(bindingParams ? { params: bindingParams } : {}),
+        });
+      }
+      case "action.run": {
+        const action = requiredString(params, "action");
+        const actionParams = params.params;
+        if (actionParams !== undefined && !isRecord(actionParams)) {
+          throw new Error("widget action params are invalid");
+        }
+        return await this.client.request("board.action", {
+          ticket: this.ticket,
+          action,
+          params: actionParams ?? {},
         });
       }
       case "cron.trigger":

@@ -61,13 +61,13 @@ export async function runDoctorStateSqliteCompact(
   if (!stat.isFile()) {
     throw new Error(`Canonical OpenClaw state database is not a regular file: ${sqlitePath}`);
   }
-  assertOpenClawStateWriteAllowed({ databasePath: sqlitePath, env });
   const withMaintenanceLock = deps.withMaintenanceLock ?? withDoctorSqliteMaintenanceLock;
   return await withMaintenanceLock({
     env,
     operation: "state SQLite compaction",
     protectedPaths: resolveSqliteDatabaseFilePaths(sqlitePath),
-    run: () => {
+    run: (authority) => {
+      authority.assertCurrent();
       if (isOpenClawStateDatabaseOpen()) {
         throw new Error(
           "The shared OpenClaw state database is already open in this process. Stop OpenClaw and retry.",
@@ -87,6 +87,7 @@ export async function runDoctorStateSqliteCompact(
         ...(deps.busyTimeoutMs !== undefined ? { busyTimeoutMs: deps.busyTimeoutMs } : {}),
         sqlitePath,
         validateBeforeMutation: (database) => {
+          authority.assertCurrent();
           assertOpenClawStateWriteAllowed({ database, databasePath: sqlitePath, env });
           assertOpenClawStateDatabaseForMaintenance(database, { pathname: sqlitePath });
         },

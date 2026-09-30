@@ -4,9 +4,12 @@
 import { normalizeProviderIdForAuth } from "@openclaw/model-catalog-core/provider-id";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { getShellEnvAppliedKeys } from "../infra/shell-env.js";
-import { resolvePluginSetupProvider } from "../plugins/setup-registry.js";
+import { resolvePluginSetupProviderCore } from "../plugins/setup-registry.js";
 import { resolveLocalProviderAuthEvidence } from "../secrets/provider-auth-evidence.js";
-import type { ProviderAuthEvidence } from "../secrets/provider-env-vars.js";
+import type {
+  ProviderAuthEvidence,
+  ProviderEnvVarLookupParams,
+} from "../secrets/provider-env-vars.js";
 import { normalizeOptionalSecretInput } from "../utils/normalize-secret-input.js";
 import { resolveProviderEnvAuthLookupMaps } from "./model-auth-env-vars.js";
 import { GCP_VERTEX_CREDENTIALS_MARKER } from "./model-auth-markers.js";
@@ -41,14 +44,6 @@ export type EnvApiKeyLookupOptions = {
   setupProviderFallbackRefs?: readonly string[];
   skipSetupProviderFallback?: boolean;
 };
-
-function resolveAuthEvidence(
-  evidence: readonly ProviderAuthEvidence[] | undefined,
-  env: NodeJS.ProcessEnv,
-): EnvApiKeyResult | null {
-  const resolved = resolveLocalProviderAuthEvidence(evidence, env);
-  return resolved ? { apiKey: resolved.credentialMarker, source: resolved.source } : null;
-}
 
 /** Reports env/local auth presence without returning or resolving credential material. */
 export function resolveProviderEnvAuthEvidence(
@@ -104,7 +99,7 @@ export function resolveProviderEnvAuthEvidence(
 export function resolveProviderDirectAuthPlanningEvidence(
   provider: string,
   env: NodeJS.ProcessEnv = process.env,
-  options: EnvApiKeyLookupOptions = {},
+  options: EnvApiKeyLookupOptions & Pick<ProviderEnvVarLookupParams, "metadataSnapshot"> = {},
 ): ProviderDirectAuthPlanningEvidence | null {
   const lookupMaps =
     !options.aliasMap ||
@@ -115,6 +110,7 @@ export function resolveProviderDirectAuthPlanningEvidence(
           config: options.config,
           workspaceDir: options.workspaceDir,
           env,
+          metadataSnapshot: options.metadataSnapshot,
         })
       : undefined;
   const aliasMap = options.aliasMap ?? lookupMaps?.aliasMap ?? {};
@@ -145,35 +141,25 @@ export function resolveEnvApiKey(
   options: EnvApiKeyLookupOptions = {},
 ): EnvApiKeyResult | null {
   const normalizedProvider = normalizeProviderIdForAuth(provider);
-  const lookupParams = {
-    config: options.config,
-    workspaceDir: options.workspaceDir,
-    env,
-  };
   const lookupMaps =
     !options.aliasMap || !options.candidateMap || !options.authEvidenceMap
-      ? resolveProviderEnvAuthLookupMaps(lookupParams)
+      ? resolveProviderEnvAuthLookupMaps({
+          config: options.config,
+          workspaceDir: options.workspaceDir,
+          env,
+        })
       : undefined;
   const aliasMap = options.aliasMap ?? lookupMaps?.aliasMap ?? {};
   const normalized = aliasMap[normalizedProvider] ?? normalizedProvider;
   const candidateMap = options.candidateMap ?? lookupMaps?.envCandidateMap ?? {};
   const authEvidenceMap = options.authEvidenceMap ?? lookupMaps?.authEvidenceMap ?? {};
   const applied = new Set(getShellEnvAppliedKeys());
-  const pick = (envVar: string): EnvApiKeyResult | null => {
-    const value = normalizeOptionalSecretInput(env[envVar]);
-    if (!value) {
-      return null;
-    }
-    const source = applied.has(envVar) ? `shell env: ${envVar}` : `env: ${envVar}`;
-    return { apiKey: value, source };
-  };
-
   const candidates = Object.hasOwn(candidateMap, normalized) ? candidateMap[normalized] : undefined;
   if (Array.isArray(candidates)) {
     for (const envVar of candidates) {
-      const resolved = pick(envVar);
-      if (resolved) {
-        return resolved;
+      const apiKey = normalizeOptionalSecretInput(env[envVar]);
+      if (apiKey) {
+        return { apiKey, source: applied.has(envVar) ? `shell env: ${envVar}` : `env: ${envVar}` };
       }
     }
   }
@@ -181,35 +167,27 @@ export function resolveEnvApiKey(
   const evidence = Object.hasOwn(authEvidenceMap, normalized)
     ? authEvidenceMap[normalized]
     : undefined;
-  const authEvidence = resolveAuthEvidence(evidence, env);
+  const authEvidence = resolveLocalProviderAuthEvidence(evidence, env);
   if (authEvidence) {
-    return authEvidence;
+    return { apiKey: authEvidence.credentialMarker, source: authEvidence.source };
   }
 
-  if (Array.isArray(candidates)) {
-    return null;
-  }
-  if (options.skipSetupProviderFallback === true) {
+  if (Array.isArray(candidates) || options.skipSetupProviderFallback === true) {
     return null;
   }
 
-  const setupProvider = resolvePluginSetupProvider({
+  const setupProvider = resolvePluginSetupProviderCore({
     provider: normalized,
     config: options.config,
     workspaceDir: options.workspaceDir,
     env,
   });
-  if (setupProvider?.resolveConfigApiKey) {
-    const resolved = setupProvider.resolveConfigApiKey({
-      provider: normalized,
-      env,
-    });
-    if (resolved?.trim()) {
-      return {
-        apiKey: resolved,
-        source: resolved === GCP_VERTEX_CREDENTIALS_MARKER ? "gcloud adc" : "env",
-      };
-    }
+  const resolved = setupProvider?.resolveConfigApiKey?.({ provider: normalized, env });
+  if (resolved?.trim()) {
+    return {
+      apiKey: resolved,
+      source: resolved === GCP_VERTEX_CREDENTIALS_MARKER ? "gcloud adc" : "env",
+    };
   }
 
   return null;

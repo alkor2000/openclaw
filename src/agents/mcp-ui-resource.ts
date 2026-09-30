@@ -3,10 +3,18 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { asOptionalRecord as asRecord } from "@openclaw/normalization-core/record-coerce";
 import { formatErrorMessage } from "../infra/errors.js";
 import { logWarn } from "../logger.js";
-import { completeDeferredSessionMcpRuntimeRetirement } from "./agent-bundle-mcp-runtime.js";
+import { normalizeAgentId, parseAgentSessionKey } from "../routing/session-key.js";
+import { resolveGlobalMap } from "../shared/global-singleton.js";
+import { createLazyRuntimeMethod } from "../shared/lazy-runtime.js";
+import { getSessionMcpRequestSignal } from "./agent-bundle-mcp-request-context.js";
 import type { SessionMcpRuntime } from "./agent-bundle-mcp-types.js";
 import { clearMcpAppModelContextForView } from "./mcp-app-model-context.js";
 import { type McpAppCsp, normalizeMcpAppCsp } from "./mcp-app-sandbox.js";
+
+const completeDeferredSessionMcpRuntimeRetirement = createLazyRuntimeMethod(
+  () => import("./agent-bundle-mcp-manager-api.js"),
+  (runtime) => runtime.completeDeferredSessionMcpRuntimeRetirement,
+);
 
 const MCP_APP_RESOURCE_MIME_TYPE = "text/html;profile=mcp-app";
 const MCP_APP_RESOURCE_MAX_BYTES = 2 * 1024 * 1024;
@@ -23,6 +31,7 @@ type McpAppPermissions = Partial<
 export type McpAppViewLease = {
   viewId: string;
   runtime: SessionMcpRuntime;
+  agentId: string;
   sessionId: string;
   serverName: string;
   toolName: string;
@@ -36,7 +45,6 @@ export type McpAppViewLease = {
   readOnly?: true;
   toolInput: unknown;
   toolResult: CallToolResult;
-  requestTimeoutMs?: number;
   expiresAtMs: number;
   requestWindowStartedAtMs: number;
   requestCount: number;
@@ -65,17 +73,8 @@ export function readMcpAppChannelView(result: unknown): McpAppChannelView | unde
   return { viewId };
 }
 
-type McpAppViewStore = Map<string, McpAppViewLease>;
-
-function getViewStore(): McpAppViewStore {
-  const globalStore = globalThis as Record<PropertyKey, unknown>;
-  const existing = globalStore[MCP_APP_VIEW_STORE_KEY] as McpAppViewStore | undefined;
-  if (existing) {
-    return existing;
-  }
-  const store = new Map<string, McpAppViewLease>();
-  globalStore[MCP_APP_VIEW_STORE_KEY] = store;
-  return store;
+function getViewStore(): Map<string, McpAppViewLease> {
+  return resolveGlobalMap(MCP_APP_VIEW_STORE_KEY);
 }
 
 function deleteView(viewId: string, expected?: McpAppViewLease): void {
@@ -213,6 +212,7 @@ async function resolveListingUiMeta(
 
 export async function fetchMcpAppView(params: {
   runtime: SessionMcpRuntime;
+  agentId?: string;
   serverName: string;
   toolName: string;
   uiResourceUri: string;
@@ -237,7 +237,13 @@ export async function fetchMcpAppView(params: {
   let releaseRuntimeLease: (() => void) | undefined;
   try {
     assertBoundedViewDescriptor(params);
-    if (!params.runtime.readResource || !params.uiResourceUri.startsWith("ui://")) {
+    const agentId = params.agentId
+      ? normalizeAgentId(params.agentId)
+      : parseAgentSessionKey(params.runtime.sessionKey)?.agentId;
+    if (!agentId) {
+      throw new Error("MCP App view requires a resolved session owner");
+    }
+    if (!params.runtime.readResource) {
       return undefined;
     }
     const result = asRecord(
@@ -260,20 +266,19 @@ export async function fetchMcpAppView(params: {
     const listingUiMeta = contentUiMeta
       ? undefined
       : await resolveListingUiMeta(params.runtime, params.serverName, params.uiResourceUri);
+    getSessionMcpRequestSignal()?.throwIfAborted();
     const uiMeta = contentUiMeta ?? listingUiMeta;
     const csp = normalizeMcpAppCsp(uiMeta?.csp);
     const permissions = normalizePermissions(uiMeta?.permissions);
     const title = `${params.toolName} UI`;
     const viewId = params.viewId ?? `mcp-app-${randomUUID()}`;
-    // resources/read established the authoritative server session above. Carry
-    // its deadline into the view so catalog invalidation cannot change it later.
-    const requestTimeoutMs = params.runtime.getServerRequestTimeoutMs?.(params.serverName);
     releaseRuntimeLease = params.runtime.acquireLease?.();
     deleteView(viewId);
     pruneViewStore(byteSize, { reserveEntry: true });
     const view: McpAppViewLease = {
       viewId,
       runtime: params.runtime,
+      agentId,
       sessionId: params.runtime.sessionId,
       serverName: params.serverName,
       toolName: params.toolName,
@@ -291,7 +296,6 @@ export async function fetchMcpAppView(params: {
       ...(params.readOnly ? { readOnly: true as const } : {}),
       toolInput: params.toolInput,
       toolResult: params.toolResult,
-      ...(requestTimeoutMs !== undefined ? { requestTimeoutMs } : {}),
       expiresAtMs: Date.now() + MCP_APP_VIEW_TTL_MS,
       requestWindowStartedAtMs: Date.now(),
       requestCount: 0,
@@ -316,6 +320,7 @@ export async function fetchMcpAppView(params: {
     };
   } catch (error) {
     releaseRuntimeLease?.();
+    getSessionMcpRequestSignal()?.throwIfAborted();
     logWarn(
       `mcp-app: failed to prepare ${params.uiResourceUri} from "${params.serverName}": ${formatErrorMessage(error)}`,
     );
@@ -336,10 +341,13 @@ export function getMcpAppViewLease(
 export function getMcpAppViewLeaseForSession(
   viewId: string,
   sessionKey: string,
+  agentId: string,
 ): McpAppViewLease | undefined {
   pruneViewStore();
   const view = getViewStore().get(viewId);
-  return view?.runtime.sessionKey === sessionKey ? view : undefined;
+  return view?.runtime.sessionKey === sessionKey && view.agentId === normalizeAgentId(agentId)
+    ? view
+    : undefined;
 }
 
 export function acquireMcpAppViewRequest(

@@ -1,24 +1,25 @@
-import { GatewayRequestError, type GatewayBrowserClient } from "../../api/gateway.ts";
-
-type SessionEventSubscriptionScope = {
-  client: GatewayBrowserClient;
-  epoch: number;
-};
+import {
+  DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS,
+  GatewayProtocolRequestTimeoutError,
+} from "@openclaw/gateway-client/browser";
+import { GatewayRequestError } from "../../api/gateway.ts";
+import { formatUiError } from "../format-error.ts";
+import type { SessionConnectionScope } from "./session-capability.ts";
 
 type SessionEventSubscriptionOwner = {
-  ensure: (scope: SessionEventSubscriptionScope) => Promise<void>;
+  ensure: (scope: SessionConnectionScope) => Promise<void>;
   reset: () => void;
   dispose: () => void;
 };
 
 /** Keeps one acknowledged broad session observer alive for its connection generation. */
 export function createSessionEventSubscriptionOwner(params: {
-  isCurrent: (scope: SessionEventSubscriptionScope) => boolean;
-  onError: (scope: SessionEventSubscriptionScope, error: string | null) => void;
+  isCurrent: (scope: SessionConnectionScope) => boolean;
+  onError: (scope: SessionConnectionScope, error: string | null) => void;
   retryDelayMs: (error: unknown) => number | null;
 }): SessionEventSubscriptionOwner {
   let generation = 0;
-  let confirmed: SessionEventSubscriptionScope | null = null;
+  let confirmed: SessionConnectionScope | null = null;
   let pending: { generation: number; promise: Promise<void> } | null = null;
   let retryTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
 
@@ -29,10 +30,10 @@ export function createSessionEventSubscriptionOwner(params: {
     }
   };
 
-  const isCurrent = (scope: SessionEventSubscriptionScope, expectedGeneration: number): boolean =>
+  const isCurrent = (scope: SessionConnectionScope, expectedGeneration: number): boolean =>
     generation === expectedGeneration && params.isCurrent(scope);
 
-  const ensure = (scope: SessionEventSubscriptionScope): Promise<void> => {
+  const ensure = (scope: SessionConnectionScope): Promise<void> => {
     if (confirmed?.client === scope.client && confirmed.epoch === scope.epoch) {
       return Promise.resolve();
     }
@@ -43,10 +44,9 @@ export function createSessionEventSubscriptionOwner(params: {
     const expectedGeneration = generation;
     const request = (async () => {
       try {
-        const response = await scope.client.request<{ subscribed?: boolean }>(
-          "sessions.subscribe",
-          {},
-        );
+        const response = await scope.client.request<{
+          subscribed?: boolean;
+        }>("sessions.subscribe", {}, { timeoutMs: DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS });
         if (!isCurrent(scope, expectedGeneration)) {
           return;
         }
@@ -63,8 +63,18 @@ export function createSessionEventSubscriptionOwner(params: {
         if (!isCurrent(scope, expectedGeneration)) {
           return;
         }
-        params.onError(scope, String(error));
-        const delayMs = params.retryDelayMs(error);
+        // A connected transport can outlive an application acknowledgement.
+        // Only this idempotent observer turns its typed deadline into a retry.
+        const failure =
+          error instanceof GatewayProtocolRequestTimeoutError
+            ? new GatewayRequestError({
+                code: error.code,
+                message: error.message,
+                retryable: true,
+              })
+            : error;
+        params.onError(scope, formatUiError(failure));
+        const delayMs = params.retryDelayMs(failure);
         if (delayMs === null || !isCurrent(scope, expectedGeneration)) {
           return;
         }

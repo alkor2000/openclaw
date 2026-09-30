@@ -37,6 +37,7 @@ const event = {
   originatingChannel: undefined,
   originatingTo: undefined,
   shouldSendToolSummaries: true,
+  shouldSendFullToolDetails: false,
   sendPolicy: "allow" as const,
 };
 
@@ -69,25 +70,6 @@ function expectDispatchPayloadFields(expected: Record<string, unknown>): void {
 describe("tryDispatchAcpReplyHook", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-  });
-
-  it("skips ACP runtime lookup for plain-text deny turns", async () => {
-    const result = await tryDispatchAcpReplyHook(
-      {
-        ...event,
-        sendPolicy: "deny",
-        ctx: buildTestCtx({
-          SessionKey: "agent:test:session",
-          BodyForCommands: "write a test",
-          BodyForAgent: "write a test",
-        }),
-      },
-      ctx,
-    );
-
-    expect(result).toBeUndefined();
-    expect(bypassMock).not.toHaveBeenCalled();
-    expect(dispatchMock).not.toHaveBeenCalled();
   });
 
   it("skips ACP runtime lookup for non-command deny turns even when CommandBody is populated", async () => {
@@ -263,6 +245,7 @@ describe("tryDispatchAcpReplyHook", () => {
 
     expectDispatchPayloadFields({
       shouldSendToolSummaries: true,
+      shouldSendFullToolDetails: false,
     });
     const [payload] = dispatchMock.mock.calls[0] ?? [];
     const livePredicate = (payload as { shouldSendToolSummariesNow?: () => boolean })

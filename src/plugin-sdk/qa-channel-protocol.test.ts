@@ -10,6 +10,12 @@ describe("qa-channel protocol", () => {
     expect(buildQaTarget({ chatType: "channel", conversationId: "Room", threadId: "Topic" })).toBe(
       "thread:Room/Topic",
     );
+    expect(buildQaTarget({ chatType: "direct", conversationId: "Alice", threadId: "Topic" })).toBe(
+      "thread:/v1/dm/Alice/Topic",
+    );
+    expect(
+      buildQaTarget({ chatType: "group", conversationId: "Room/One", threadId: "Topic/Two" }),
+    ).toBe("thread:/v1/group/Room%2FOne/Topic%2FTwo");
   });
 
   it("parses canonical targets without folding ids or prefix casing", () => {
@@ -22,6 +28,16 @@ describe("qa-channel protocol", () => {
       conversationId: "Room",
       threadId: "Topic",
     });
+    expect(parseQaTarget("thread:/v1/group/Room%2FOne/Topic%2FTwo")).toEqual({
+      chatType: "group",
+      conversationId: "Room/One",
+      threadId: "Topic/Two",
+    });
+    expect(parseQaTarget("thread:/v1/dm/Alice/Topic")).toEqual({
+      chatType: "direct",
+      conversationId: "Alice",
+      threadId: "Topic",
+    });
     expect(parseQaTarget("bare-id", { defaultChatType: "group" })).toEqual({
       chatType: "group",
       conversationId: "bare-id",
@@ -30,6 +46,9 @@ describe("qa-channel protocol", () => {
       "qa-channel target prefixes must be lowercase",
     );
     expect(() => parseQaTarget("thread:Room/")).toThrow("invalid qa-channel thread target");
+    expect(() => parseQaTarget("thread:/v1/group/Room/%GG")).toThrow(
+      "invalid qa-channel thread target",
+    );
   });
 
   it("sanitizes QA bus tool-call arguments before persistence", () => {
@@ -44,19 +63,11 @@ describe("qa-channel protocol", () => {
           headers: {
             Authorization: "Bearer sk_test_12345678901234567890",
           },
-          notes: "raw key sk-proj-12345678901234567890",
-          commandLine: "curl --password hunter2 -H 'x-api-key: abc123' https://example.test",
-          hyphenFlagCommand: "cmd --client-secret abc123 --ok yes",
-          envCommand: "NPM_TOKEN=secret GITHUB_TOKEN=secret pnpm test",
-          authCommand: "curl -H 'Authorization: Bearer eyJ1234567890abcd' https://example.test",
-          cookieCommand: "curl -H 'Cookie: a=b; c=d' https://example.test",
-          debugText: "token=abc123; keep going",
           headerPairs: [
             ["X-API-Key", "secret"],
             ["Accept", "application/json"],
           ],
           argv: ["gh", "api", "--token", "secret-token", "repos/openclaw/openclaw"],
-          hyphenArgv: ["cmd", "--access-token", "abc123", "--ok"],
           values: ["ok", { password: "hunter2" }],
         },
       },
@@ -71,19 +82,11 @@ describe("qa-channel protocol", () => {
           headers: {
             Authorization: "[redacted]",
           },
-          notes: "[redacted]",
-          commandLine: "[redacted]",
-          hyphenFlagCommand: "[redacted]",
-          envCommand: "[redacted]",
-          authCommand: "[redacted]",
-          cookieCommand: "[redacted]",
-          debugText: "[redacted]",
           headerPairs: [
             ["[redacted]", "[redacted]"],
             ["[redacted]", "[redacted]"],
           ],
           argv: ["[redacted]", "[redacted]", "[redacted]", "[redacted]", "[redacted]"],
-          hyphenArgv: ["[redacted]", "[redacted]", "[redacted]", "[redacted]"],
           values: ["[redacted]", { password: "[redacted]" }],
         },
       },

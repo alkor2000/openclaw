@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../../test/helpers/promise.js";
 import { sessionsFilesHandlers } from "./sessions-files.js";
 import {
   assistantToolCall,
@@ -19,10 +20,11 @@ const hoisted = vi.hoisted(() => ({
   loadSessionEntry: vi.fn(),
   resolveAgentWorkspaceDir: vi.fn(),
   resolveDefaultAgentId: vi.fn(),
-  readSessionTranscriptVisibleMessageDelta: vi.fn(),
+  readSessionTranscriptVisibleMessageDeltaCore: vi.fn(),
 }));
 
-vi.mock("../../agents/agent-scope.js", () => ({
+vi.mock("../../agents/agent-scope.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../agents/agent-scope.js")>()),
   resolveAgentWorkspaceDir: hoisted.resolveAgentWorkspaceDir,
   resolveDefaultAgentId: hoisted.resolveDefaultAgentId,
 }));
@@ -32,7 +34,7 @@ vi.mock("../session-utils.js", async () => {
   return {
     ...actual,
     loadSessionEntry: hoisted.loadSessionEntry,
-    loadSessionEntryReadOnly: hoisted.loadSessionEntry,
+    loadGatewaySessionEntryReadOnly: hoisted.loadSessionEntry,
   };
 });
 
@@ -42,13 +44,14 @@ vi.mock("../session-transcript-readers.js", async () => {
   );
   return {
     ...actual,
-    readSessionTranscriptVisibleMessageDelta: hoisted.readSessionTranscriptVisibleMessageDelta,
+    readSessionTranscriptVisibleMessageDeltaCore:
+      hoisted.readSessionTranscriptVisibleMessageDeltaCore,
   };
 });
 
 const invokeSessionFilesHandler = createSessionFilesHandlerInvoker(sessionsFilesHandlers);
 const mockVisibleMessages = createVisibleMessagesMock(
-  hoisted.readSessionTranscriptVisibleMessageDelta,
+  hoisted.readSessionTranscriptVisibleMessageDeltaCore,
 );
 
 describe("sessions.files touched-file folds", () => {
@@ -56,7 +59,7 @@ describe("sessions.files touched-file folds", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    hoisted.readSessionTranscriptVisibleMessageDelta.mockReset();
+    hoisted.readSessionTranscriptVisibleMessageDeltaCore.mockReset();
     workspaceRoot = createWorkspaceFixture("openclaw-session-touched-files-test-");
     hoisted.resolveDefaultAgentId.mockReturnValue("main");
     hoisted.resolveAgentWorkspaceDir.mockReturnValue(workspaceRoot);
@@ -110,7 +113,7 @@ describe("sessions.files touched-file folds", () => {
 
   it("folds only appended SQLite messages after the cached cursor", async () => {
     useSqliteSession(hoisted.loadSessionEntry, workspaceRoot, "sess-touched-incremental");
-    hoisted.readSessionTranscriptVisibleMessageDelta.mockImplementation((_scope, limits) => {
+    hoisted.readSessionTranscriptVisibleMessageDeltaCore.mockImplementation((_scope, limits) => {
       if (limits.cursor === undefined) {
         return {
           kind: "page",
@@ -147,22 +150,59 @@ describe("sessions.files touched-file folds", () => {
     expect(second.files).toEqual([
       expect.objectContaining({ path: "ui/chat.ts", kind: "modified" }),
     ]);
-    expect(hoisted.readSessionTranscriptVisibleMessageDelta).toHaveBeenCalledTimes(2);
-    expect(hoisted.readSessionTranscriptVisibleMessageDelta.mock.calls[1]?.[1]).toMatchObject({
+    expect(hoisted.readSessionTranscriptVisibleMessageDeltaCore).toHaveBeenCalledTimes(2);
+    expect(hoisted.readSessionTranscriptVisibleMessageDeltaCore.mock.calls[1]?.[1]).toMatchObject({
       cursor: "cursor-1",
+    });
+  });
+
+  it("retains incremental cursors across more than 16 concurrently viewed sessions", async () => {
+    hoisted.resolveAgentWorkspaceDir.mockReturnValue(undefined);
+    const storePath = path.join(workspaceRoot, "visible-sessions.sqlite");
+    hoisted.loadSessionEntry.mockImplementation((sessionKey: string) => {
+      const sessionId = sessionKey.split(":").at(-1)!;
+      return {
+        agentId: "main",
+        canonicalKey: sessionKey,
+        cfg: {},
+        storePath,
+        entry: { sessionId, sessionFile: `sqlite:main:${sessionId}:${storePath}` },
+      };
+    });
+    hoisted.readSessionTranscriptVisibleMessageDeltaCore.mockImplementation((scope) => ({
+      kind: "page",
+      cursor: `${scope.sessionId}-cursor`,
+      events: [],
+      hasMore: false,
+      serializedBytes: 100,
+    }));
+
+    const sessionKeys = Array.from({ length: 24 }, (_, index) => `agent:main:visible-${index}`);
+    for (const sessionKey of sessionKeys) {
+      expectOkPayload(await invokeSessionFilesHandler("sessions.files.list", { sessionKey }));
+    }
+    expectOkPayload(
+      await invokeSessionFilesHandler("sessions.files.list", { sessionKey: sessionKeys[0] }),
+    );
+
+    expect(hoisted.readSessionTranscriptVisibleMessageDeltaCore.mock.lastCall?.[1]).toMatchObject({
+      cursor: "visible-0-cursor",
     });
   });
 
   it("yields between SQLite pages and shares one concurrent fold per session", async () => {
     useSqliteSession(hoisted.loadSessionEntry, workspaceRoot, "sess-touched-singleflight");
+    const firstPageRead = createDeferred();
     let otherWorkRan = false;
     setImmediate(() => {
       otherWorkRan = true;
     });
-    hoisted.readSessionTranscriptVisibleMessageDelta.mockImplementation((_scope, limits) => {
+    hoisted.readSessionTranscriptVisibleMessageDeltaCore.mockImplementation((_scope, limits) => {
       if (limits.cursor !== undefined) {
         expect(limits.cursor).toBe("singleflight-page-1");
         expect(otherWorkRan).toBe(true);
+      } else {
+        firstPageRead.resolve();
       }
       return {
         kind: "page",
@@ -177,11 +217,12 @@ describe("sessions.files touched-file folds", () => {
     const first = invokeSessionFilesHandler("sessions.files.list", params);
     const second = invokeSessionFilesHandler("sessions.files.list", params);
 
-    expect(hoisted.readSessionTranscriptVisibleMessageDelta).toHaveBeenCalledTimes(1);
+    await firstPageRead.promise;
+    expect(hoisted.readSessionTranscriptVisibleMessageDeltaCore).toHaveBeenCalledTimes(1);
     for (const result of await Promise.all([first, second])) {
       expectOkPayload(result);
     }
-    expect(hoisted.readSessionTranscriptVisibleMessageDelta).toHaveBeenCalledTimes(2);
+    expect(hoisted.readSessionTranscriptVisibleMessageDeltaCore).toHaveBeenCalledTimes(2);
   });
 
   it("lets a different session finish while a multi-page fold is yielded", async () => {
@@ -190,13 +231,14 @@ describe("sessions.files touched-file folds", () => {
       const sessionId = sessionKey.endsWith(":slow") ? "sess-touched-slow" : "sess-touched-fast";
       const storePath = path.join(workspaceRoot, `${sessionId}.sqlite`);
       return {
+        agentId: "main",
         canonicalKey: sessionKey,
         cfg: {},
         storePath,
         entry: { sessionId, sessionFile: `sqlite:main:${sessionId}:${storePath}` },
       };
     });
-    hoisted.readSessionTranscriptVisibleMessageDelta.mockImplementation((scope, limits) => {
+    hoisted.readSessionTranscriptVisibleMessageDeltaCore.mockImplementation((scope, limits) => {
       const isSlow = scope.sessionId === "sess-touched-slow";
       return {
         kind: "page",
@@ -220,13 +262,18 @@ describe("sessions.files touched-file folds", () => {
 
     expect(slowFinished).toBe(false);
     expectOkPayload(await slow);
+    expect(
+      hoisted.readSessionTranscriptVisibleMessageDeltaCore.mock.calls.map(
+        ([scope]) => scope.sessionId,
+      ),
+    ).toEqual(["sess-touched-slow", "sess-touched-fast", "sess-touched-slow"]);
   });
 
   it("isolates touched-file folds for the same session across stores", async () => {
     const sessionId = "sess-touched-multi-store";
     const firstStorePath = path.join(workspaceRoot, "store-a.sqlite");
     const secondStorePath = path.join(workspaceRoot, "store-b.sqlite");
-    hoisted.readSessionTranscriptVisibleMessageDelta.mockImplementation((scope, limits) => {
+    hoisted.readSessionTranscriptVisibleMessageDeltaCore.mockImplementation((scope, limits) => {
       expect(limits.cursor).toBeUndefined();
       const message =
         scope.storePath === firstStorePath
@@ -262,7 +309,7 @@ describe("sessions.files touched-file folds", () => {
 
   it("rebuilds the SQLite fold from the bootstrap cursor after a reset", async () => {
     useSqliteSession(hoisted.loadSessionEntry, workspaceRoot, "sess-touched-reset");
-    hoisted.readSessionTranscriptVisibleMessageDelta.mockImplementation((_scope, limits) => {
+    hoisted.readSessionTranscriptVisibleMessageDeltaCore.mockImplementation((_scope, limits) => {
       if (limits.cursor === undefined) {
         return {
           kind: "page",
@@ -308,38 +355,7 @@ describe("sessions.files touched-file folds", () => {
     expect(afterReset.files).toEqual([
       expect.objectContaining({ path: "ui/chat.ts", kind: "modified" }),
     ]);
-    expect(hoisted.readSessionTranscriptVisibleMessageDelta).toHaveBeenCalledTimes(3);
-  });
-
-  it("collects the expected files and kinds from the SQLite fold", async () => {
-    const messages = [
-      assistantToolCall("read", { path: "ui/chat.ts" }),
-      assistantToolCall("edit", { path: "ui/chat.ts" }),
-      assistantToolCall("read", { path: "src/readme.md" }),
-      assistantToolCall("apply_patch", {
-        input: "*** Begin Patch\n*** Update File: package.json\n*** End Patch\n",
-      }),
-    ];
-    useSqliteSession(hoisted.loadSessionEntry, workspaceRoot, "sess-touched-parity");
-    hoisted.readSessionTranscriptVisibleMessageDelta.mockReturnValue({
-      kind: "page",
-      cursor: "parity-final",
-      events: messages.map(visibleMessageEvent),
-      hasMore: false,
-      serializedBytes: 400,
-    });
-
-    const payload = expectOkPayload(
-      await invokeSessionFilesHandler("sessions.files.list", {
-        sessionKey: "agent:main:main",
-      }),
-    );
-
-    expect(payload.files.map((file: Record<string, unknown>) => [file.path, file.kind])).toEqual([
-      ["package.json", "modified"],
-      ["ui/chat.ts", "modified"],
-      ["src/readme.md", "read"],
-    ]);
+    expect(hoisted.readSessionTranscriptVisibleMessageDeltaCore).toHaveBeenCalledTimes(3);
   });
 
   it("collects touched files from existing transcript tool-call spellings", async () => {

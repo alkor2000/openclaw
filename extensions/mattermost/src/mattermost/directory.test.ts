@@ -32,6 +32,15 @@ vi.mock("./client.js", () => {
 let listMattermostDirectoryGroups: typeof import("./directory.js").listMattermostDirectoryGroups;
 let listMattermostDirectoryPeers: typeof import("./directory.js").listMattermostDirectoryPeers;
 
+function mockDefaultAccount() {
+  listMattermostAccountIdsMock.mockReturnValue(["default"]);
+  resolveMattermostAccountMock.mockReturnValue({
+    enabled: true,
+    botToken: "token-default",
+    baseUrl: "https://chat.example.com",
+  });
+}
+
 describe("mattermost directory", () => {
   beforeAll(async () => {
     ({ listMattermostDirectoryGroups, listMattermostDirectoryPeers } =
@@ -60,6 +69,31 @@ describe("mattermost directory", () => {
       listMattermostDirectoryGroups({ cfg: {} as never, runtime: {} as never }),
     ).resolves.toEqual([]);
     expect(createMattermostClientMock).toHaveBeenCalledOnce();
+  });
+
+  it("uses only the requested account for scoped directory discovery", async () => {
+    const personalClient = { token: "token-personal", request: vi.fn().mockResolvedValue([]) };
+    listMattermostAccountIdsMock.mockReturnValue(["personal", "finance"]);
+    resolveMattermostAccountMock.mockImplementation(({ accountId }) => ({
+      enabled: true,
+      botToken: `token-${accountId}`,
+      baseUrl: "https://chat.example.com",
+    }));
+    createMattermostClientMock.mockReturnValue(personalClient);
+    fetchMattermostMeMock.mockResolvedValue({ id: "me-1" });
+
+    await expect(
+      listMattermostDirectoryGroups({
+        cfg: {} as never,
+        accountId: "personal",
+        runtime: {} as never,
+      }),
+    ).resolves.toEqual([]);
+    expect(resolveMattermostAccountMock).toHaveBeenCalledOnce();
+    expect(resolveMattermostAccountMock).toHaveBeenCalledWith({
+      cfg: {},
+      accountId: "personal",
+    });
   });
 
   it("deduplicates channels across enabled accounts and skips failing accounts", async () => {
@@ -117,12 +151,7 @@ describe("mattermost directory", () => {
       ]),
     };
 
-    listMattermostAccountIdsMock.mockReturnValue(["default"]);
-    resolveMattermostAccountMock.mockReturnValue({
-      enabled: true,
-      botToken: "token-default",
-      baseUrl: "https://chat.example.com",
-    });
+    mockDefaultAccount();
     createMattermostClientMock.mockReturnValueOnce(client);
     fetchMattermostMeMock.mockResolvedValue({ id: "me-1" });
 
@@ -160,12 +189,7 @@ describe("mattermost directory", () => {
         ]),
     };
 
-    listMattermostAccountIdsMock.mockReturnValue(["default"]);
-    resolveMattermostAccountMock.mockReturnValue({
-      enabled: true,
-      botToken: "token-default",
-      baseUrl: "https://chat.example.com",
-    });
+    mockDefaultAccount();
     createMattermostClientMock.mockReturnValue(client);
     fetchMattermostMeMock.mockResolvedValue({ id: "me-1" });
 
@@ -198,12 +222,7 @@ describe("mattermost directory", () => {
         ]),
     };
 
-    listMattermostAccountIdsMock.mockReturnValue(["default"]);
-    resolveMattermostAccountMock.mockReturnValue({
-      enabled: true,
-      botToken: "token-default",
-      baseUrl: "https://chat.example.com",
-    });
+    mockDefaultAccount();
     createMattermostClientMock.mockReturnValue(client);
     fetchMattermostMeMock.mockResolvedValue({ id: "me-1" });
 
@@ -240,12 +259,7 @@ describe("mattermost directory", () => {
         .mockResolvedValueOnce([{ id: "user-2", username: "bob" }]),
     };
 
-    listMattermostAccountIdsMock.mockReturnValue(["default"]);
-    resolveMattermostAccountMock.mockReturnValue({
-      enabled: true,
-      botToken: "token-default",
-      baseUrl: "https://chat.example.com",
-    });
+    mockDefaultAccount();
     createMattermostClientMock.mockReturnValue(client);
     fetchMattermostMeMock.mockResolvedValue({ id: "me-1" });
 
@@ -276,12 +290,7 @@ describe("mattermost directory", () => {
         ]),
     };
 
-    listMattermostAccountIdsMock.mockReturnValue(["default"]);
-    resolveMattermostAccountMock.mockReturnValue({
-      enabled: true,
-      botToken: "token-default",
-      baseUrl: "https://chat.example.com",
-    });
+    mockDefaultAccount();
     createMattermostClientMock.mockReturnValue(client);
     fetchMattermostMeMock.mockResolvedValue({ id: "me-1" });
 

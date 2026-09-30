@@ -1,9 +1,25 @@
-// Store entry shape normalization rejects unsafe persisted metadata before runtime use.
+import { asNonNegativeFiniteNumber } from "@openclaw/normalization-core/number-coercion";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import {
+  normalizeSessionColorValue,
+  normalizeSessionIconValue,
+} from "../../../packages/gateway-protocol/src/session-agent-status.js";
 import { parseAgentSessionKey } from "../../routing/session-key.js";
 import { validateSessionId } from "./paths.js";
 import type { PendingTranscriptRepairState, SessionEntry } from "./types.js";
+
+function normalizeSessionEntryArchiveReason(
+  value: unknown,
+): SessionEntry["archiveReason"] | undefined {
+  return value === "manual" ||
+    value === "active-session-cap" ||
+    value === "age-retention" ||
+    value === "stale-dashboard" ||
+    value === "restart-recovery"
+    ? value
+    : undefined;
+}
 
 // Persisted stores may contain old or malformed ids; reject path-like ids before use.
 function isSafeSessionId(value: unknown): value is string {
@@ -11,13 +27,10 @@ function isSafeSessionId(value: unknown): value is string {
     return false;
   }
   const trimmed = value.trim();
-  if (!trimmed || trimmed.length > 255) {
+  if (!trimmed || trimmed.length > 255 || trimmed !== trimmed.normalize("NFC")) {
     return false;
   }
-  if (trimmed.includes("/") || trimmed.includes("\\") || trimmed === "." || trimmed === "..") {
-    return false;
-  }
-  return /^[A-Za-z0-9][A-Za-z0-9._:@-]*$/.test(trimmed);
+  return /^[\p{L}\p{N}][\p{L}\p{N}\p{M}._:@-]*$/u.test(trimmed);
 }
 
 function normalizeTranscriptSessionId(value: string): string | undefined {
@@ -29,17 +42,12 @@ function normalizeTranscriptSessionId(value: string): string | undefined {
 }
 
 function normalizeOptionalTimestamp(value: unknown): number | undefined {
-  return value === undefined
-    ? undefined
-    : typeof value === "number" && Number.isFinite(value) && value >= 0
-      ? value
-      : 0;
+  return value === undefined ? undefined : (asNonNegativeFiniteNumber(value) ?? 0);
 }
 
 /** Removes retired runtime locator fields before a session entry is persisted or returned. */
 export function projectCanonicalSessionEntryShape(value: Record<string, unknown>): SessionEntry {
   const {
-    icon: _retiredIcon,
     sessionFile: _retiredSessionFile,
     transcriptPath: _retiredTranscriptPath,
     pendingFinalDeliveryCreatedAt,
@@ -58,8 +66,26 @@ export function projectCanonicalSessionEntryShape(value: Record<string, unknown>
     memoryFlushFailureCount,
     memoryFlushLastFailedAt: _memoryFlushLastFailedAt,
     memoryFlushLastFailureError: _memoryFlushLastFailureError,
+    owner: _projectedOwner,
+    participants: _projectedParticipants,
+    participantCount: _projectedParticipantCount,
     ...canonicalValue
   } = value;
+  const setOptionalField = (key: keyof SessionEntry, normalized: unknown) => {
+    if (normalized) {
+      canonicalValue[key] = normalized;
+    } else {
+      delete canonicalValue[key];
+    }
+  };
+  const icon =
+    typeof canonicalValue.icon === "string" ? normalizeSessionIconValue(canonicalValue.icon) : null;
+  setOptionalField("icon", icon);
+  const color =
+    typeof canonicalValue.color === "string"
+      ? normalizeSessionColorValue(canonicalValue.color)
+      : null;
+  setOptionalField("color", color);
   const legacyPendingText = normalizeOptionalString(pendingFinalDeliveryText);
   const legacySelectedModel = normalizeOptionalString(fallbackNoticeSelectedModel);
   const legacyActiveModel = normalizeOptionalString(fallbackNoticeActiveModel);
@@ -83,19 +109,15 @@ export function projectCanonicalSessionEntryShape(value: Record<string, unknown>
           ...(intentId ? { intentId } : {}),
         }
       : undefined);
-  if (pendingFinalDelivery) {
-    canonicalValue.pendingFinalDelivery = pendingFinalDelivery;
-  } else {
-    delete canonicalValue.pendingFinalDelivery;
-  }
-  const pendingTranscriptRepair = normalizePendingTranscriptRepair(
-    canonicalValue.pendingTranscriptRepair,
+  setOptionalField("pendingFinalDelivery", pendingFinalDelivery);
+  setOptionalField(
+    "pendingDeliveryNotice",
+    normalizePendingDeliveryNotice(canonicalValue.pendingDeliveryNotice),
   );
-  if (pendingTranscriptRepair) {
-    canonicalValue.pendingTranscriptRepair = pendingTranscriptRepair;
-  } else {
-    delete canonicalValue.pendingTranscriptRepair;
-  }
+  setOptionalField(
+    "pendingTranscriptRepair",
+    normalizePendingTranscriptRepair(canonicalValue.pendingTranscriptRepair),
+  );
   const reason = normalizeOptionalString(fallbackNoticeReason);
   const fallbackNotice =
     normalizeFallbackNotice(canonicalValue.fallbackNotice) ??
@@ -107,11 +129,7 @@ export function projectCanonicalSessionEntryShape(value: Record<string, unknown>
           ...(reason ? { reason } : {}),
         }
       : undefined);
-  if (fallbackNotice) {
-    canonicalValue.fallbackNotice = fallbackNotice;
-  } else {
-    delete canonicalValue.fallbackNotice;
-  }
+  setOptionalField("fallbackNotice", fallbackNotice);
   const memoryFlush =
     normalizeMemoryFlush(canonicalValue.memoryFlush) ??
     (legacyFlushFailureCount && legacyFlushFailureCount > 0
@@ -125,12 +143,25 @@ export function projectCanonicalSessionEntryShape(value: Record<string, unknown>
       : legacyFlushCompactionCount !== undefined
         ? { kind: "succeeded" as const, compactionCount: legacyFlushCompactionCount }
         : undefined);
-  if (memoryFlush) {
-    canonicalValue.memoryFlush = memoryFlush;
+  setOptionalField("memoryFlush", memoryFlush);
+  const archiveReason = normalizeSessionEntryArchiveReason(canonicalValue.archiveReason);
+  if (canonicalValue.archivedAt !== undefined) {
+    setOptionalField("archiveReason", archiveReason);
   } else {
-    delete canonicalValue.memoryFlush;
+    delete canonicalValue.archivedBy;
+    delete canonicalValue.archiveReason;
   }
   return canonicalValue as unknown as SessionEntry;
+}
+
+/** Removes the runtime-only skill catalog without mutating the live session snapshot. */
+export function stripRuntimeOnlySessionSkillsFields(entry: SessionEntry): SessionEntry {
+  const snapshot = entry.skillsSnapshot;
+  if (snapshot?.resolvedSkills === undefined) {
+    return entry;
+  }
+  const { resolvedSkills: _drop, ...skillsSnapshot } = snapshot;
+  return { ...entry, skillsSnapshot };
 }
 
 function normalizePendingFinalDelivery(
@@ -144,16 +175,55 @@ function normalizePendingFinalDelivery(
     return undefined;
   }
   const intentId = normalizeOptionalString(value.intentId);
+  const deliveries = normalizePendingFinalDeliveries(value.deliveries);
   const base = {
     createdAt,
     ...(isRecord(value.context) ? { context: value.context } : {}),
     ...(intentId ? { intentId } : {}),
+    ...(deliveries ? { deliveries } : {}),
   };
   if (value.kind === "transport-only") {
     return { kind: "transport-only", ...base };
   }
   const text = normalizeOptionalString(value.text);
   return value.kind === "replayable" && text ? { kind: "replayable", text, ...base } : undefined;
+}
+
+function normalizePendingFinalDeliveries(
+  value: unknown,
+): NonNullable<NonNullable<SessionEntry["pendingFinalDelivery"]>["deliveries"]> | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const deliveries: NonNullable<NonNullable<SessionEntry["pendingFinalDelivery"]>["deliveries"]> =
+    value.flatMap((item) => {
+      const id = isRecord(item) ? normalizeOptionalString(item.id) : undefined;
+      const state = isRecord(item) ? item.state : undefined;
+      return id &&
+        (state === "prepared" ||
+          state === "queued" ||
+          state === "delivered" ||
+          state === "suppressed" ||
+          state === "unknown")
+        ? [{ id, state }]
+        : [];
+    });
+  return deliveries.length > 0 ? deliveries : undefined;
+}
+
+function normalizePendingDeliveryNotice(
+  value: unknown,
+): SessionEntry["pendingDeliveryNotice"] | undefined {
+  if (!isRecord(value) || !isRecord(value.context)) {
+    return undefined;
+  }
+  const createdAt = normalizeOptionalTimestamp(value.createdAt);
+  const intentId = normalizeOptionalString(value.intentId);
+  return createdAt !== undefined &&
+    intentId &&
+    (value.state === "owed" || value.state === "unresolved" || value.state === "acknowledged")
+    ? { createdAt, context: value.context, intentId, state: value.state }
+    : undefined;
 }
 
 function normalizePendingTranscriptRepair(
@@ -227,9 +297,8 @@ function normalizeMemoryFlush(value: unknown): SessionEntry["memoryFlush"] | und
 }
 
 function normalizeCount(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0
-    ? Math.floor(value)
-    : undefined;
+  const number = asNonNegativeFiniteNumber(value);
+  return number === undefined ? undefined : Math.floor(number);
 }
 
 /** Normalizes persisted session store entries before they reach runtime callers. */

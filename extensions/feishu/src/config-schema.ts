@@ -1,32 +1,68 @@
-// Feishu helper module supports config schema behavior.
 import { normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 import {
+  ContextVisibilityModeSchema,
   DmPolicySchema,
   GroupPolicySchema,
+  ReplyToModeSchema,
   buildChannelConfigSchema,
   buildGroupEntrySchema,
   buildMultiAccountChannelSchema,
 } from "openclaw/plugin-sdk/channel-config-schema";
+import { buildSecretInputSchema, hasConfiguredSecretInput } from "openclaw/plugin-sdk/secret-input";
 import { z } from "zod";
-export { z };
-import { buildSecretInputSchema, hasConfiguredSecretInput } from "./secret-input.js";
+import { FEISHU_EXTERNAL_KEY_PATTERN } from "./external-keys.js";
 import { DEFAULT_FEISHU_WEBHOOK_PATH, normalizeFeishuWebhookPath } from "./webhook-path.js";
+export { z };
 
 const ChannelActionsSchema = z
   .object({
     reactions: z.boolean().optional(),
+    sticker: z.boolean().optional(),
   })
   .strict()
   .optional();
+
+const MAX_STICKER_SETS = 32;
+const MAX_STICKERS_PER_SET = 256;
+
+function canonicalTextPattern(maxLength: number): RegExp {
+  // Quantifiers enforce the same scalar bound in Zod and exported JSON Schema;
+  // maxLength alone differs between their UTF-16 and grapheme counting rules.
+  return new RegExp(`^(?!\\s)(?![\\s\\S]*\\s$)[^\\p{Cs}]{1,${maxLength}}$`, "u");
+}
+
+const FeishuStickerSetSchema = z
+  .record(
+    z.string().regex(FEISHU_EXTERNAL_KEY_PATTERN),
+    z
+      .array(z.string().regex(canonicalTextPattern(64)))
+      .min(1)
+      .max(8),
+  )
+  .refine((set) => Object.keys(set).length <= MAX_STICKERS_PER_SET, {
+    message: `At most ${MAX_STICKERS_PER_SET} stickers per bot set are allowed`,
+  })
+  .meta({ maxProperties: MAX_STICKERS_PER_SET });
+
+const FeishuStickerSetsSchema = z
+  .record(z.string().regex(canonicalTextPattern(128)), FeishuStickerSetSchema)
+  .refine((sets) => Object.keys(sets).length <= MAX_STICKER_SETS, {
+    message: `At most ${MAX_STICKER_SETS} bot sticker sets are allowed`,
+  })
+  .meta({ maxProperties: MAX_STICKER_SETS });
 
 const FeishuGroupPolicySchema = z.union([
   GroupPolicySchema,
   // Preserve the shipped Feishu alias while the canonical value remains "open".
   z.literal("allowall").transform(() => "open" as const),
 ]);
-const FeishuDomainSchema = z.union([
+export const FeishuDomainSchema = z.union([
   z.enum(["feishu", "lark"]),
-  z.string().url().startsWith("https://"),
+  // Keep URL last for its JSON Schema format; regex flags are not exported.
+  z
+    .string()
+    .regex(/^[Hh][Tt][Tt][Pp][Ss]:\/\//)
+    .url(),
 ]);
 const FeishuConnectionModeSchema = z.enum(["websocket", "webhook"]);
 const FeishuWebhookPathSchema = z
@@ -124,7 +160,7 @@ const ChannelHeartbeatVisibilitySchema = z
  * Dynamic agent creation configuration.
  * When enabled, a new agent is created for each unique DM user.
  */
-const DynamicAgentCreationSchema = z
+export const DynamicAgentCreationSchema = z
   .object({
     enabled: z.boolean().optional(),
     workspaceTemplate: z.string().optional(),
@@ -142,7 +178,7 @@ const DynamicAgentCreationSchema = z
  * - wiki requires doc (wiki content is edited via doc tools)
  * - perm can work independently but is typically used with drive
  */
-const FeishuToolsConfigSchema = z
+export const FeishuToolsConfigSchema = z
   .object({
     doc: z.boolean().optional(), // Document operations (default: true)
     chat: z.boolean().optional(), // Chat info + member query operations (default: true)
@@ -190,26 +226,40 @@ const ReactionNotificationModeSchema = z.enum(["off", "own", "all"]).optional();
  * causing the reply to appear as a topic (话题) under the original message.
  */
 const ReplyInThreadSchema = z.enum(["disabled", "enabled"]).optional();
+const RequireMentionInBotThreadsSchema = z
+  .boolean()
+  .optional()
+  .describe(
+    "Require mentions in threads started by this bot. False permits unmentioned messages; true requires a mention. Omit to preserve existing mention behavior.",
+  );
 
 const FeishuGroupSchema = buildGroupEntrySchema({
   tools: ToolPolicySchema,
+  requireMentionInBotThreads: RequireMentionInBotThreadsSchema,
   groupSessionScope: GroupSessionScopeSchema,
   topicSessionMode: TopicSessionModeSchema,
   replyInThread: ReplyInThreadSchema,
 }).omit({ toolsBySender: true });
 
 const FeishuSharedConfigShape = {
-  webhookHost: z.string().optional(),
-  webhookPort: z.number().int().positive().optional(),
+  legacyWebhook: z
+    .object({ port: z.number().int().min(1).max(65535), host: z.string().optional() })
+    .strict()
+    .or(z.literal(false))
+    .optional(),
   capabilities: z.array(z.string()).optional(),
   markdown: MarkdownConfigSchema,
   configWrites: z.boolean().optional(),
+  contextVisibility: ContextVisibilityModeSchema.optional(),
+  replyToMode: ReplyToModeSchema.optional(),
+  responsePrefix: z.string().optional(),
   dmPolicy: DmPolicySchema.optional(),
   allowFrom: z.array(z.union([z.string(), z.number()])).optional(),
   groupPolicy: FeishuGroupPolicySchema.optional(),
   groupAllowFrom: z.array(z.union([z.string(), z.number()])).optional(),
   groupSenderAllowFrom: z.array(z.union([z.string(), z.number()])).optional(),
   requireMention: z.boolean().optional(),
+  requireMentionInBotThreads: RequireMentionInBotThreadsSchema,
   groups: z.record(z.string(), FeishuGroupSchema.optional()).optional(),
   historyLimit: z.number().int().min(0).optional(),
   dmHistoryLimit: z.number().int().min(0).optional(),
@@ -256,6 +306,7 @@ const FeishuConfigSchemaBase = z
   .object({
     enabled: z.boolean().optional(),
     defaultAccount: z.string().optional(),
+    stickerSets: FeishuStickerSetsSchema.optional(),
     // Top-level credentials (backward compatible for single-account mode)
     appId: z.string().optional(),
     appSecret: buildSecretInputSchema().optional(),

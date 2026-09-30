@@ -2,7 +2,6 @@
 // best-effort transcript delivery.
 import fs from "node:fs/promises";
 import path from "node:path";
-import { expectDefined } from "@openclaw/normalization-core";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MsgContext } from "../auto-reply/templating.js";
 import type { OpenClawConfig } from "../config/types.js";
@@ -10,13 +9,10 @@ import { resolvePreferredOpenClawTmpDir } from "../infra/tmp-openclaw-dir.js";
 import { createSafeAudioFixtureBuffer } from "./runner.test-utils.js";
 import type { MediaUnderstandingProvider } from "./types.js";
 
-// ---------------------------------------------------------------------------
-// Module mocks
-// ---------------------------------------------------------------------------
+type ResolveApiKeyForProvider =
+  typeof import("../agents/model-auth.js").resolveApiKeyForProviderCore;
 
-type ResolveApiKeyForProvider = typeof import("../agents/model-auth.js").resolveApiKeyForProvider;
-
-const resolveApiKeyForProviderMock = vi.hoisted(() =>
+const resolveApiKeyForProviderCoreMock = vi.hoisted(() =>
   vi.fn<ResolveApiKeyForProvider>(async () => ({
     apiKey: "test-key", // pragma: allowlist secret
     source: "test",
@@ -25,7 +21,7 @@ const resolveApiKeyForProviderMock = vi.hoisted(() =>
 );
 const hasAvailableAuthForProviderMock = vi.hoisted(() =>
   vi.fn(async (...args: Parameters<ResolveApiKeyForProvider>) => {
-    const resolved = await resolveApiKeyForProviderMock(...args);
+    const resolved = await resolveApiKeyForProviderCoreMock(...args);
     return Boolean(resolved?.apiKey);
   }),
 );
@@ -49,10 +45,6 @@ const { MediaFetchErrorMock } = vi.hoisted(() => {
   return { MediaFetchErrorMock: MediaFetchErrorMockLocal };
 });
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 let applyMediaUnderstanding: typeof import("./apply.js").applyMediaUnderstanding;
 
 const TEMP_MEDIA_PREFIX = "openclaw-echo-transcript-test-";
@@ -65,25 +57,17 @@ async function createTempAudioFile(): Promise<string> {
   return filePath;
 }
 
-function createAudioCtxWithProvider(mediaPath: string, extra?: Partial<MsgContext>): MsgContext {
+function createAudioCtxWithProvider(mediaPath: string): MsgContext {
   return {
     Body: "<media:audio>",
     media: [{ path: mediaPath, contentType: "audio/ogg" }],
     Provider: "voicechat",
     From: "+10000000001",
     AccountId: "acc1",
-    ...extra,
   };
 }
 
-function createAudioConfigWithEcho(opts?: {
-  echoTranscript?: boolean;
-  echoFormat?: string;
-  transcribedText?: string;
-}): {
-  cfg: OpenClawConfig;
-  providers: Record<string, { id: string; transcribeAudio: () => Promise<{ text: string }> }>;
-} {
+function createAudioConfigWithEcho(echoTranscript: boolean | undefined) {
   const cfg: OpenClawConfig = {
     tools: {
       media: {
@@ -91,8 +75,7 @@ function createAudioConfigWithEcho(opts?: {
         audio: {
           enabled: true,
           maxBytes: 1024 * 1024,
-          echoTranscript: opts?.echoTranscript ?? true,
-          ...(opts?.echoFormat !== undefined ? { echoFormat: opts.echoFormat } : {}),
+          ...(echoTranscript === undefined ? {} : { echoTranscript }),
         },
       },
     },
@@ -100,7 +83,7 @@ function createAudioConfigWithEcho(opts?: {
   const providers = {
     groq: {
       id: "groq",
-      transcribeAudio: async () => ({ text: opts?.transcribedText ?? "hello world" }),
+      transcribeAudio: async () => ({ text: "hello world" }),
     },
   };
   return { cfg, providers };
@@ -111,33 +94,6 @@ function disableImageUnderstanding(cfg: OpenClawConfig): void {
     throw new Error("Expected media tool config");
   }
   cfg.tools.media.image = { enabled: false };
-}
-
-function expectSingleEchoDeliveryCall() {
-  expect(mockDeliverOutboundPayloads).toHaveBeenCalledOnce();
-  const firstCall = mockDeliverOutboundPayloads.mock.calls[0];
-  if (!firstCall) {
-    throw new Error("Expected echo transcript delivery call");
-  }
-  const callArgs = firstCall[0];
-  if (!callArgs) {
-    throw new Error("Expected one echo transcript delivery call");
-  }
-  return callArgs as {
-    to?: string;
-    channel?: string;
-    accountId?: string;
-    payloads: Array<{ text?: string }>;
-  };
-}
-
-function createAudioConfigWithoutEchoFlag() {
-  const { cfg, providers } = createAudioConfigWithEcho();
-  const audio = cfg.tools?.media?.audio as { echoTranscript?: boolean } | undefined;
-  if (audio && "echoTranscript" in audio) {
-    delete audio.echoTranscript;
-  }
-  return { cfg, providers };
 }
 
 function createRegistryMediaProviders(): Record<string, MediaUnderstandingProvider> {
@@ -152,15 +108,11 @@ function createRegistryMediaProviders(): Record<string, MediaUnderstandingProvid
   };
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 describe("applyMediaUnderstanding – echo transcript", () => {
   beforeAll(async () => {
     vi.resetModules();
     vi.doMock("../agents/model-auth.js", () => ({
-      resolveApiKeyForProvider: resolveApiKeyForProviderMock,
+      resolveApiKeyForProviderCore: resolveApiKeyForProviderCoreMock,
       hasAvailableAuthForProvider: hasAvailableAuthForProviderMock,
       isProviderAuthError: (err: unknown, code?: string) =>
         err instanceof Error &&
@@ -180,7 +132,7 @@ describe("applyMediaUnderstanding – echo transcript", () => {
       resolveAwsSdkEnvVarName: vi.fn(() => undefined),
       resolveEnvApiKey: vi.fn(() => null),
       resolveModelAuthMode: vi.fn(() => "api-key"),
-      getApiKeyForModel: getApiKeyForModelMock,
+      getApiKeyForModelCore: getApiKeyForModelMock,
       getCustomProviderApiKey: vi.fn(() => undefined),
       ensureAuthProfileStore: vi.fn(async () => ({})),
       resolveAuthProfileOrder: vi.fn(() => []),
@@ -194,7 +146,7 @@ describe("applyMediaUnderstanding – echo transcript", () => {
       runCommandWithTimeout: runCommandWithTimeoutMock,
     }));
     vi.doMock("../channels/message/runtime.js", () => ({
-      sendDurableMessageBatch: (...args: unknown[]) => mockDeliverOutboundPayloads(...args),
+      sendDurableMessageBatchCore: (...args: unknown[]) => mockDeliverOutboundPayloads(...args),
     }));
     vi.doMock("../utils/message-channel.js", () => ({
       isDeliverableMessageChannel: (channel: string) => channel === "voicechat",
@@ -238,7 +190,7 @@ describe("applyMediaUnderstanding – echo transcript", () => {
   });
 
   beforeEach(() => {
-    resolveApiKeyForProviderMock.mockClear();
+    resolveApiKeyForProviderCoreMock.mockClear();
     hasAvailableAuthForProviderMock.mockClear();
     getApiKeyForModelMock.mockClear();
     readRemoteMediaBufferMock.mockClear();
@@ -263,7 +215,7 @@ describe("applyMediaUnderstanding – echo transcript", () => {
   it("does NOT echo when echoTranscript is false (default)", async () => {
     const mediaPath = await createTempAudioFile();
     const ctx = createAudioCtxWithProvider(mediaPath);
-    const { cfg, providers } = createAudioConfigWithEcho({ echoTranscript: false });
+    const { cfg, providers } = createAudioConfigWithEcho(false);
 
     await applyMediaUnderstanding({ ctx, cfg, providers });
 
@@ -273,7 +225,7 @@ describe("applyMediaUnderstanding – echo transcript", () => {
   it("does NOT echo when echoTranscript is absent (default)", async () => {
     const mediaPath = await createTempAudioFile();
     const ctx = createAudioCtxWithProvider(mediaPath);
-    const { cfg, providers } = createAudioConfigWithoutEchoFlag();
+    const { cfg, providers } = createAudioConfigWithEcho(undefined);
 
     await applyMediaUnderstanding({ ctx, cfg, providers });
 
@@ -283,20 +235,17 @@ describe("applyMediaUnderstanding – echo transcript", () => {
   it("echoes transcript with default format when echoTranscript is true", async () => {
     const mediaPath = await createTempAudioFile();
     const ctx = createAudioCtxWithProvider(mediaPath);
-    const { cfg, providers } = createAudioConfigWithEcho({
-      echoTranscript: true,
-      transcribedText: "hello world",
-    });
+    const { cfg, providers } = createAudioConfigWithEcho(true);
 
     await applyMediaUnderstanding({ ctx, cfg, providers });
 
-    const callArgs = expectSingleEchoDeliveryCall();
-    expect(callArgs.channel).toBe("voicechat");
-    expect(callArgs.to).toBe("+10000000001");
-    expect(callArgs.accountId).toBe("acc1");
-    expect(callArgs.payloads).toHaveLength(1);
-    expect(expectDefined(callArgs.payloads[0], "callArgs.payloads[0] test invariant").text).toBe(
-      '📝 "hello world"',
+    expect(mockDeliverOutboundPayloads).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        channel: "voicechat",
+        to: "+10000000001",
+        accountId: "acc1",
+        payloads: [{ text: '📝 "hello world"' }],
+      }),
     );
   });
 
@@ -313,10 +262,7 @@ describe("applyMediaUnderstanding – echo transcript", () => {
       From: "+10000000001",
     };
 
-    const { cfg, providers } = createAudioConfigWithEcho({
-      echoTranscript: true,
-      transcribedText: "should not appear",
-    });
+    const { cfg, providers } = createAudioConfigWithEcho(true);
     disableImageUnderstanding(cfg);
 
     await applyMediaUnderstanding({ ctx, cfg, providers });
@@ -329,8 +275,8 @@ describe("applyMediaUnderstanding – echo transcript", () => {
   it("does NOT echo when transcription fails", async () => {
     const mediaPath = await createTempAudioFile();
     const ctx = createAudioCtxWithProvider(mediaPath);
-    const { cfg, providers } = createAudioConfigWithEcho({ echoTranscript: true });
-    expectDefined(providers.groq, "providers.groq test invariant").transcribeAudio = async () => {
+    const { cfg, providers } = createAudioConfigWithEcho(true);
+    providers.groq.transcribeAudio = async () => {
       throw new Error("transcription provider failure");
     };
 

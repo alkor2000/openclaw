@@ -1,4 +1,3 @@
-// Shared doctor dispatcher for channel plugin repair, warning, and compatibility adapters.
 import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
 import {
   getBundledChannelPlugin,
@@ -14,6 +13,8 @@ import type {
 } from "../../../channels/plugins/types.adapters.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import { isUnresolvedSecretInputError } from "../../../config/types.secrets.js";
+import { findUninspectedPluginDiagnostic } from "../../../plugins/discovery-availability.js";
+import { loadManifestMetadataSnapshot } from "../../../plugins/manifest-contract-eligibility.js";
 import { listDoctorConfiguredChannelIds } from "./configured-channel-ids.js";
 
 type ChannelDoctorEntry = {
@@ -89,25 +90,9 @@ function isChannelDoctorBlockedByConfig(channelId: string, cfg: OpenClawConfig):
   );
 }
 
-function safeGetLoadedChannelPlugin(id: string) {
+function safelyResolveChannelPlugin<T>(id: string, resolve: (id: string) => T): T | undefined {
   try {
-    return getLoadedChannelPlugin(id);
-  } catch {
-    return undefined;
-  }
-}
-
-function safeGetBundledChannelSetupPlugin(id: string) {
-  try {
-    return getBundledChannelSetupPlugin(id);
-  } catch {
-    return undefined;
-  }
-}
-
-function safeGetBundledChannelPlugin(id: string) {
-  try {
-    return getBundledChannelPlugin(id);
+    return resolve(id);
   } catch {
     return undefined;
   }
@@ -143,13 +128,9 @@ function mergeDoctorAdapters(
       [keyof ChannelDoctorAdapter, unknown]
     >) {
       // Earlier adapters win so read-only installed plugins can override bundled fallbacks.
-      if (merged[key] !== undefined) {
-        continue;
+      if (merged[key] === undefined && isValidChannelDoctorAdapterValue(key, value)) {
+        merged[key] = value;
       }
-      if (!isValidChannelDoctorAdapterValue(key, value)) {
-        continue;
-      }
-      merged[key] = value;
     }
   }
   return Object.keys(merged).length > 0 ? (merged as ChannelDoctorAdapter) : undefined;
@@ -159,9 +140,6 @@ function isValidChannelDoctorAdapterValue(
   key: keyof ChannelDoctorAdapter,
   value: unknown,
 ): boolean {
-  if (value == null) {
-    return false;
-  }
   if (channelDoctorFunctionKeys.has(key)) {
     return typeof value === "function";
   }
@@ -185,9 +163,6 @@ function listChannelDoctorEntries(
     readOnlyPluginsById?: ReadonlyMap<string, ChannelDoctorPluginCandidate>;
   } = {},
 ): ChannelDoctorEntry[] {
-  if (channelIds.length === 0) {
-    return [];
-  }
   const selectedIds = new Set(
     channelIds.filter((id) => !isChannelDoctorBlockedByConfig(id, context.cfg)),
   );
@@ -201,9 +176,9 @@ function listChannelDoctorEntries(
   for (const id of selectedIds) {
     const doctor = mergeDoctorAdapters([
       readOnlyPluginsById.get(id)?.doctor,
-      safeGetLoadedChannelPlugin(id)?.doctor,
-      safeGetBundledChannelSetupPlugin(id)?.doctor,
-      safeGetBundledChannelPlugin(id)?.doctor,
+      safelyResolveChannelPlugin(id, getLoadedChannelPlugin)?.doctor,
+      safelyResolveChannelPlugin(id, getBundledChannelSetupPlugin)?.doctor,
+      safelyResolveChannelPlugin(id, getBundledChannelPlugin)?.doctor,
     ]);
     if (!doctor) {
       continue;
@@ -220,21 +195,6 @@ function toPluginEmptyAllowlistContext({
   return params;
 }
 
-function collectEmptyAllowlistExtraWarningsForEntries(
-  entries: readonly ChannelDoctorEntry[],
-  params: ChannelDoctorEmptyAllowlistLookupParams,
-): string[] {
-  const warnings: string[] = [];
-  const pluginParams = toPluginEmptyAllowlistContext(params);
-  for (const entry of entries) {
-    const lines = entry.doctor.collectEmptyAllowlistExtraWarnings?.(pluginParams);
-    if (lines?.length) {
-      warnings.push(...lines);
-    }
-  }
-  return warnings;
-}
-
 function shouldSkipDefaultEmptyGroupAllowlistWarningForEntries(
   entries: readonly ChannelDoctorEntry[],
   params: ChannelDoctorEmptyAllowlistLookupParams,
@@ -243,6 +203,33 @@ function shouldSkipDefaultEmptyGroupAllowlistWarningForEntries(
   return entries.some(
     (entry) => entry.doctor.shouldSkipDefaultEmptyGroupAllowlistWarning?.(pluginParams) === true,
   );
+}
+
+function appendChannelDoctorMutation(
+  mutations: ChannelDoctorConfigMutation[],
+  currentCfg: OpenClawConfig,
+  mutation: ChannelDoctorConfigMutation | undefined,
+): OpenClawConfig {
+  if (mutation?.changes.length) {
+    mutations.push(mutation);
+    return mutation.config;
+  }
+  if (mutation?.warnings?.length) {
+    mutations.push({ config: currentCfg, changes: [], warnings: mutation.warnings });
+  }
+  return currentCfg;
+}
+
+function preserveUnavailableChannelConfig(
+  context: ChannelDoctorLookupContext,
+): ChannelDoctorConfigMutation | undefined {
+  if (!context.cfg.plugins?.load?.paths?.length) {
+    return undefined;
+  }
+  const warning = findUninspectedPluginDiagnostic(
+    loadManifestMetadataSnapshot({ config: context.cfg, env: context.env }).diagnostics,
+  );
+  return warning ? { config: context.cfg, changes: [], warnings: [warning.message] } : undefined;
 }
 
 /** Build cached empty-allowlist hooks backed by channel doctor adapters. */
@@ -261,8 +248,15 @@ export function createChannelDoctorEmptyAllowlistPolicyHooks(
     return entries;
   };
   return {
-    extraWarningsForAccount: (params) =>
-      collectEmptyAllowlistExtraWarningsForEntries(entriesForChannel(params.channelName), params),
+    extraWarningsForAccount: (params) => {
+      const entries = entriesForChannel(params.channelName);
+      const pluginParams = toPluginEmptyAllowlistContext(params);
+      const warnings: string[] = [];
+      for (const entry of entries) {
+        warnings.push(...(entry.doctor.collectEmptyAllowlistExtraWarnings?.(pluginParams) ?? []));
+      }
+      return warnings;
+    },
     shouldSkipDefaultEmptyGroupAllowlistWarning: (params) =>
       shouldSkipDefaultEmptyGroupAllowlistWarningForEntries(
         entriesForChannel(params.channelName),
@@ -277,20 +271,23 @@ export async function runChannelDoctorConfigSequences(params: {
   env: NodeJS.ProcessEnv;
   shouldRepair: boolean;
 }): Promise<ChannelDoctorSequenceResult> {
+  const preserved = preserveUnavailableChannelConfig(params);
+  if (preserved) {
+    return { changeNotes: [], warningNotes: preserved.warnings ?? [] };
+  }
   const changeNotes: string[] = [];
+  const infoNotes: string[] = [];
   const warningNotes: string[] = [];
-  for (const entry of listChannelDoctorEntries(collectConfiguredChannelIds(params.cfg), {
-    cfg: params.cfg,
-    env: params.env,
-  })) {
+  for (const entry of listChannelDoctorEntries(collectConfiguredChannelIds(params.cfg), params)) {
     const result = await entry.doctor.runConfigSequence?.(params);
     if (!result) {
       continue;
     }
     changeNotes.push(...result.changeNotes);
+    infoNotes.push(...(result.infoNotes ?? []));
     warningNotes.push(...result.warningNotes);
   }
-  return { changeNotes, warningNotes };
+  return { changeNotes, warningNotes, ...(infoNotes.length > 0 ? { infoNotes } : {}) };
 }
 
 /** Collect compatibility migrations from configured channel doctor adapters in order. */
@@ -298,19 +295,16 @@ export function collectChannelDoctorCompatibilityMutations(
   cfg: OpenClawConfig,
   options: { env?: NodeJS.ProcessEnv } = {},
 ): ChannelDoctorConfigMutation[] {
-  const channelIds = collectConfiguredChannelIds(cfg);
-  if (channelIds.length === 0) {
-    return [];
+  const preserved = preserveUnavailableChannelConfig({ cfg, env: options.env });
+  if (preserved) {
+    return [preserved];
   }
+  const channelIds = collectConfiguredChannelIds(cfg);
   const mutations: ChannelDoctorConfigMutation[] = [];
   let nextCfg = cfg;
   for (const entry of listChannelDoctorEntries(channelIds, { cfg, env: options.env })) {
     const mutation = entry.doctor.normalizeCompatibilityConfig?.({ cfg: nextCfg });
-    if (!mutation || mutation.changes.length === 0) {
-      continue;
-    }
-    mutations.push(mutation);
-    nextCfg = mutation.config;
+    nextCfg = appendChannelDoctorMutation(mutations, nextCfg, mutation);
   }
   return mutations;
 }
@@ -320,6 +314,10 @@ export async function collectChannelDoctorStaleConfigMutations(
   cfg: OpenClawConfig,
   options: { env?: NodeJS.ProcessEnv; channelIds?: readonly string[] } = {},
 ): Promise<ChannelDoctorConfigMutation[]> {
+  const preserved = preserveUnavailableChannelConfig({ cfg, env: options.env });
+  if (preserved) {
+    return [preserved];
+  }
   const mutations: ChannelDoctorConfigMutation[] = [];
   let nextCfg = cfg;
   const channelIds = options.channelIds ?? collectConfiguredChannelIds(cfg);
@@ -328,11 +326,7 @@ export async function collectChannelDoctorStaleConfigMutations(
     env: options.env,
   })) {
     const mutation = await entry.doctor.cleanStaleConfig?.({ cfg: nextCfg });
-    if (!mutation || mutation.changes.length === 0) {
-      continue;
-    }
-    mutations.push(mutation);
-    nextCfg = mutation.config;
+    nextCfg = appendChannelDoctorMutation(mutations, nextCfg, mutation);
   }
   return mutations;
 }
@@ -344,10 +338,7 @@ export async function collectChannelDoctorPreviewWarnings(params: {
   env?: NodeJS.ProcessEnv;
 }): Promise<string[]> {
   const warnings: string[] = [];
-  for (const entry of listChannelDoctorEntries(collectConfiguredChannelIds(params.cfg), {
-    cfg: params.cfg,
-    env: params.env,
-  })) {
+  for (const entry of listChannelDoctorEntries(collectConfiguredChannelIds(params.cfg), params)) {
     let lines: string[] | undefined;
     try {
       lines = await entry.doctor.collectPreviewWarnings?.(params);
@@ -373,10 +364,7 @@ export async function collectChannelDoctorMutableAllowlistWarnings(params: {
   env?: NodeJS.ProcessEnv;
 }): Promise<string[]> {
   const warnings: string[] = [];
-  for (const entry of listChannelDoctorEntries(collectConfiguredChannelIds(params.cfg), {
-    cfg: params.cfg,
-    env: params.env,
-  })) {
+  for (const entry of listChannelDoctorEntries(collectConfiguredChannelIds(params.cfg), params)) {
     const lines = await entry.doctor.collectMutableAllowlistWarnings?.(params);
     if (lines?.length) {
       warnings.push(...lines);
@@ -391,39 +379,21 @@ export async function collectChannelDoctorRepairMutations(params: {
   doctorFixCommand: string;
   env?: NodeJS.ProcessEnv;
 }): Promise<ChannelDoctorConfigMutation[]> {
+  const preserved = preserveUnavailableChannelConfig(params);
+  if (preserved) {
+    return [preserved];
+  }
   const mutations: ChannelDoctorConfigMutation[] = [];
   let nextCfg = params.cfg;
-  for (const entry of listChannelDoctorEntries(collectConfiguredChannelIds(params.cfg), {
-    cfg: params.cfg,
-    env: params.env,
-  })) {
+  for (const entry of listChannelDoctorEntries(collectConfiguredChannelIds(params.cfg), params)) {
     const mutation = await entry.doctor.repairConfig?.({
       cfg: nextCfg,
       doctorFixCommand: params.doctorFixCommand,
       ...(params.env ? { env: params.env } : {}),
     });
-    if (!mutation || mutation.changes.length === 0) {
-      if (mutation?.warnings?.length) {
-        mutations.push({ config: nextCfg, changes: [], warnings: mutation.warnings });
-      }
-      continue;
-    }
-    mutations.push(mutation);
-    nextCfg = mutation.config;
+    nextCfg = appendChannelDoctorMutation(mutations, nextCfg, mutation);
   }
   return mutations;
-}
-
-/** Collect plugin-provided empty allowlist warning lines for one channel/account context. */
-export function collectChannelDoctorEmptyAllowlistExtraWarnings(
-  params: ChannelDoctorEmptyAllowlistLookupParams,
-): string[] {
-  return collectEmptyAllowlistExtraWarningsForEntries(
-    listChannelDoctorEntries([params.channelName], {
-      cfg: params.cfg ?? {},
-    }),
-    params,
-  );
 }
 
 /** Return true when a channel doctor owns empty group-allowlist warning behavior. */

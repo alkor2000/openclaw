@@ -2,9 +2,12 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import { asOptionalRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
   normalizeDailyIngestionState,
+  readDailyIngestionState,
   normalizeSessionIngestionState,
+  readSessionIngestionState,
 } from "../dreaming-ingestion-state.js";
 import {
   DREAMING_DAILY_INGESTION_NAMESPACE,
@@ -41,12 +44,6 @@ function targetNamespacesForSource(label: string): string[] {
   ];
 }
 
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
 async function memoryCoreLegacyTargetHasRows(source: LegacyDreamingSource): Promise<boolean> {
   const counts = await Promise.all(
     targetNamespacesForSource(source.label).map(
@@ -67,47 +64,15 @@ async function memoryCoreLegacySourceMatchesCanonical(
   raw: unknown,
 ): Promise<boolean> {
   if (source.label === "daily ingestion") {
-    const rows = await readMemoryCoreWorkspaceEntries({
-      namespace: DREAMING_DAILY_INGESTION_NAMESPACE,
-      workspaceDir: source.workspaceDir,
-    });
     return isDeepStrictEqual(
       normalizeDailyIngestionState(raw),
-      normalizeDailyIngestionState({
-        version: 1,
-        files: Object.fromEntries(rows.map((row) => [row.key, row.value])),
-      }),
+      await readDailyIngestionState(source.workspaceDir),
     );
   }
   if (source.label === "session ingestion") {
-    const [fileRows, seenRows] = await Promise.all([
-      readMemoryCoreWorkspaceEntries({
-        namespace: DREAMING_SESSION_INGESTION_FILES_NAMESPACE,
-        workspaceDir: source.workspaceDir,
-      }),
-      readMemoryCoreWorkspaceEntries<{ scope: string; index: number; hashes: string[] }>({
-        namespace: DREAMING_SESSION_INGESTION_SEEN_NAMESPACE,
-        workspaceDir: source.workspaceDir,
-      }),
-    ]);
-    const chunksByScope = new Map<string, Array<{ index: number; hashes: string[] }>>();
-    for (const row of seenRows) {
-      const chunks = chunksByScope.get(row.value.scope) ?? [];
-      chunks.push({ index: row.value.index, hashes: row.value.hashes });
-      chunksByScope.set(row.value.scope, chunks);
-    }
     return isDeepStrictEqual(
       normalizeSessionIngestionState(raw),
-      normalizeSessionIngestionState({
-        version: 3,
-        files: Object.fromEntries(fileRows.map((row) => [row.key, row.value])),
-        seenMessages: Object.fromEntries(
-          [...chunksByScope].map(([scope, chunks]) => [
-            scope,
-            chunks.toSorted((left, right) => left.index - right.index).flatMap((row) => row.hashes),
-          ]),
-        ),
-      }),
+      await readSessionIngestionState(source.workspaceDir),
     );
   }
   const [entryRows, metaRows] = await Promise.all([
@@ -137,7 +102,7 @@ async function memoryCoreLegacySourceMatchesCanonical(
     const canonical = normalizeShortTermRecallStore(canonicalRaw, updatedAt);
     const fallbackCandidates = new Set([updatedAt]);
     for (const row of entryRows) {
-      const value = asRecord(row.value);
+      const value = asOptionalRecord(row.value);
       for (const key of ["firstRecalledAt", "lastRecalledAt"] as const) {
         if (typeof value?.[key] === "string") {
           fallbackCandidates.add(value[key]);

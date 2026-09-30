@@ -1,5 +1,5 @@
 // Manual facade. Keep loader boundary explicit.
-import { loadBundledPluginPublicSurfaceModuleSync } from "./facade-loader.js";
+import { loadBundledPluginPublicSurfaceModuleSyncCore } from "./facade-loader.js";
 
 type FacadeModule = {
   isQaLabCliAvailable: () => boolean;
@@ -7,7 +7,7 @@ type FacadeModule = {
 };
 
 function loadFacadeModule(): FacadeModule {
-  return loadBundledPluginPublicSurfaceModuleSync<FacadeModule>({
+  return loadBundledPluginPublicSurfaceModuleSyncCore<FacadeModule>({
     dirName: "qa-lab",
     artifactBasename: "cli.js",
   });
@@ -24,11 +24,11 @@ function isMissingQaLabFacadeError(err: unknown): boolean {
 }
 
 /** Register QA Lab CLI commands when the bundled QA Lab facade is present. */
-export const registerQaLabCli: FacadeModule["registerQaLabCli"] = ((...args) =>
-  loadFacadeModule().registerQaLabCli(...args)) as FacadeModule["registerQaLabCli"];
+export const registerQaLabCli: FacadeModule["registerQaLabCli"] = (...args) =>
+  loadFacadeModule().registerQaLabCli(...args);
 
 /** Returns whether the QA Lab CLI facade can be loaded in this package build. */
-export const isQaLabCliAvailable: FacadeModule["isQaLabCliAvailable"] = (() => {
+export const isQaLabCliAvailable: FacadeModule["isQaLabCliAvailable"] = () => {
   try {
     return loadFacadeModule().isQaLabCliAvailable();
   } catch (err) {
@@ -37,4 +37,4 @@ export const isQaLabCliAvailable: FacadeModule["isQaLabCliAvailable"] = (() => {
     }
     throw err;
   }
-}) as FacadeModule["isQaLabCliAvailable"];
+};

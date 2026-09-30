@@ -35,14 +35,11 @@ export function createAgentRunEventHandler(params: {
   sourceRepliesAreToolOnly: boolean;
   provider: string;
   model: string;
-  runId: string;
   effectiveSessionId?: string;
   notifyUserAboutCompaction: boolean;
   onCompactionCompleted: () => number;
   messageToolDeliveryState: MessageToolDeliveryState;
 }): NonNullable<RunEmbeddedAgentParams["onAgentEvent"]> {
-  const commentaryTextByItem = new Map<string, string>();
-  const lastEmittedCommentaryByItem = new Map<string, string>();
   const shouldSuppressProgressAfterMessageToolDelivery = () =>
     params.sourceRepliesAreToolOnly &&
     params.messageToolDeliveryState.completed &&
@@ -59,26 +56,6 @@ export function createAgentRunEventHandler(params: {
       await deliver(noticePayload);
     } catch (err) {
       logVerbose(`compaction ${label} notice delivery failed (non-fatal): ${String(err)}`);
-    }
-  };
-  const sendCompactionNotice = async (phase: "start" | "end" | "incomplete") => {
-    await deliverCompactionNoticePayload(
-      createCompactionNoticePayload({
-        phase,
-        currentMessageId,
-        applyReplyToMode: params.turn.applyReplyToMode,
-      }),
-      phase,
-    );
-  };
-  const sendCompactionHookMessages = async (messages: string[]) => {
-    const noticePayload = createCompactionHookNoticePayload({
-      messages,
-      currentMessageId,
-      applyReplyToMode: params.turn.applyReplyToMode,
-    });
-    if (noticePayload) {
-      await deliverCompactionNoticePayload(noticePayload, "hook");
     }
   };
 
@@ -127,12 +104,6 @@ export function createAgentRunEventHandler(params: {
       }
     }
 
-    const suppressItemChannelProgress =
-      evt.stream === "item" &&
-      evt.data.suppressChannelProgress === true &&
-      Boolean(params.turn.opts?.onToolStart);
-    const hideItemFromChannelProgress =
-      evt.stream === "item" && evt.data.hideFromChannelProgress === true;
     const itemPhase = evt.stream === "item" ? readStringValue(evt.data.phase) : "";
     const itemName = evt.stream === "item" ? readStringValue(evt.data.name) : "";
     const itemStatus = evt.stream === "item" ? readStringValue(evt.data.status) : "";
@@ -152,51 +123,32 @@ export function createAgentRunEventHandler(params: {
     }
 
     if (
-      evt.stream === "assistant" &&
-      readStringValue(evt.data.phase) === "commentary" &&
-      !shouldSuppressProgressAfterMessageToolDelivery()
-    ) {
-      const commentaryItemId = readStringValue(evt.data.itemId) ?? "";
-      const snapshotText = readStringValue(evt.data.text);
-      const deltaText = readStringValue(evt.data.delta);
-      const accumulated =
-        evt.data.replace === true && snapshotText
-          ? snapshotText
-          : deltaText
-            ? `${commentaryTextByItem.get(commentaryItemId) ?? ""}${deltaText}`
-            : (snapshotText ?? "");
-      commentaryTextByItem.set(commentaryItemId, accumulated);
-      const commentaryText = accumulated.replace(/\s+/g, " ").trim();
-      if (commentaryText && lastEmittedCommentaryByItem.get(commentaryItemId) !== commentaryText) {
-        lastEmittedCommentaryByItem.set(commentaryItemId, commentaryText);
-        await params.turn.opts?.onItemEvent?.({
-          itemId: commentaryItemId || undefined,
-          kind: "preamble",
-          title: "Preamble",
-          phase: "update",
-          progressText: commentaryText,
-        });
-      }
-    }
-    if (
       evt.stream === "item" &&
-      !hideItemFromChannelProgress &&
-      !suppressItemChannelProgress &&
       (!suppressProgressAfterMessageToolDelivery || completedMessageToolDelivery)
     ) {
+      const itemSummary = readStringValue(evt.data.summary);
+      const itemProgressText = readStringValue(evt.data.progressText);
+      const itemMeta = readStringValue(evt.data.meta);
+      const itemCommandBearing =
+        typeof evt.data.commandBearing === "boolean" ? evt.data.commandBearing : undefined;
+      const itemApprovalId = readStringValue(evt.data.approvalId);
+      const itemApprovalSlug = readStringValue(evt.data.approvalSlug);
       await params.turn.opts?.onItemEvent?.({
         itemId: readStringValue(evt.data.itemId),
-        toolCallId: readStringValue(evt.data.toolCallId),
         kind: readStringValue(evt.data.kind),
         title: readStringValue(evt.data.title),
-        name: itemName,
         phase: itemPhase,
         status: itemStatus,
-        summary: readStringValue(evt.data.summary),
-        progressText: readStringValue(evt.data.progressText),
-        meta: readStringValue(evt.data.meta),
-        approvalId: readStringValue(evt.data.approvalId),
-        approvalSlug: readStringValue(evt.data.approvalSlug),
+        ...(evt.data.hideFromChannelProgress === true ? { hideFromChannelProgress: true } : {}),
+        ...(evt.data.suppressChannelProgress === true ? { suppressChannelProgress: true } : {}),
+        ...(itemToolCallId ? { toolCallId: itemToolCallId } : {}),
+        ...(itemName ? { name: itemName } : {}),
+        ...(itemSummary !== undefined ? { summary: itemSummary } : {}),
+        ...(itemProgressText !== undefined ? { progressText: itemProgressText } : {}),
+        ...(itemMeta !== undefined ? { meta: itemMeta } : {}),
+        ...(itemCommandBearing !== undefined ? { commandBearing: itemCommandBearing } : {}),
+        ...(itemApprovalId !== undefined ? { approvalId: itemApprovalId } : {}),
+        ...(itemApprovalSlug !== undefined ? { approvalSlug: itemApprovalSlug } : {}),
       });
     }
     if (evt.stream === "plan" && !shouldSuppressProgressAfterMessageToolDelivery()) {
@@ -204,6 +156,7 @@ export function createAgentRunEventHandler(params: {
         phase: readStringValue(evt.data.phase),
         title: readStringValue(evt.data.title),
         explanation: readStringValue(evt.data.explanation),
+        ...(evt.data.explanationFormat === "plain" ? { explanationFormat: "plain" as const } : {}),
         steps: normalizeAgentPlanSteps(evt.data.steps),
         source: readStringValue(evt.data.source),
       });
@@ -270,10 +223,24 @@ export function createAgentRunEventHandler(params: {
     const hookMessages = readCompactionHookMessages(evt.data.messages);
     const sendCompactionUserNotices = async (noticePhase: "start" | "end" | "incomplete") => {
       if (hookMessages.length > 0) {
-        await sendCompactionHookMessages(hookMessages);
+        const noticePayload = createCompactionHookNoticePayload({
+          messages: hookMessages,
+          currentMessageId,
+          applyReplyToMode: params.turn.applyReplyToMode,
+        });
+        if (noticePayload) {
+          await deliverCompactionNoticePayload(noticePayload, "hook");
+        }
       }
       if (params.notifyUserAboutCompaction) {
-        await sendCompactionNotice(noticePhase);
+        await deliverCompactionNoticePayload(
+          createCompactionNoticePayload({
+            phase: noticePhase,
+            currentMessageId,
+            applyReplyToMode: params.turn.applyReplyToMode,
+          }),
+          noticePhase,
+        );
       }
     };
     if (phase === "start") {
@@ -285,6 +252,7 @@ export function createAgentRunEventHandler(params: {
       return;
     }
     if (evt.data.completed !== true) {
+      await params.turn.opts?.onCompactionEnd?.({ completed: false });
       await sendCompactionUserNotices("incomplete");
       return;
     }
@@ -309,7 +277,7 @@ export function createAgentRunEventHandler(params: {
         consoleMessage,
       });
     }
-    await params.turn.opts?.onCompactionEnd?.();
+    await params.turn.opts?.onCompactionEnd?.({ completed: true });
     await sendCompactionUserNotices("end");
   };
 }

@@ -101,15 +101,24 @@ enum GatewayEnvironment {
         return self.profilePortReservation.port
     }
 
+    static func gatewayPort(root: [String: Any]) -> Int {
+        guard AppProfile.current.isActive else { return self.selectedGatewayPort(root: root) }
+        return self.profilePortReservation.port
+    }
+
     static func profileGatewayPortConflict() -> String? {
         guard AppProfile.current.isActive else { return nil }
         return self.profilePortReservation.conflict
     }
 
-    private static func selectedGatewayPort() -> Int {
+    static var gatewayPortRequiresRestart: Bool {
+        AppProfile.current.isActive && self.profilePortReservation.port != self.selectedGatewayPort()
+    }
+
+    private static func selectedGatewayPort(root: [String: Any] = OpenClawConfigFile.loadDict()) -> Int {
         self.resolvedGatewayPort(
             environment: ProcessInfo.processInfo.environment,
-            configPort: OpenClawConfigFile.gatewayPort(),
+            configPort: OpenClawConfigFile.gatewayPort(root: root),
             storedPort: AppDefaults.standard.integer(forKey: "gatewayPort"),
             profile: .current)
     }
@@ -122,12 +131,12 @@ enum GatewayEnvironment {
     {
         if let raw = environment["OPENCLAW_GATEWAY_PORT"] {
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            if let parsed = Int(trimmed), parsed > 0 { return parsed }
+            if let parsed = Int(trimmed), (1...65535).contains(parsed) { return parsed }
         }
-        if let configPort, configPort > 0 {
+        if let configPort, (1...65535).contains(configPort) {
             return configPort
         }
-        return storedPort > 0 ? storedPort : profile.defaultGatewayPort
+        return (1...65535).contains(storedPort) ? storedPort : profile.defaultGatewayPort
     }
 
     static func expectedGatewayVersion() -> Semver? {
@@ -144,11 +153,6 @@ enum GatewayEnvironment {
         CLIInstallPolicy.requiredGatewayVersionString(
             appVersion: self.appVersionString(),
             isDebug: CLIInstallBuild.isDebug)
-    }
-
-    /// Exposed for tests so we can inject fake version checks without rewriting bundle metadata.
-    static func expectedGatewayVersion(from versionString: String?) -> Semver? {
-        Semver.parse(versionString)
     }
 
     static func check() async -> GatewayEnvironmentStatus {
@@ -196,6 +200,15 @@ enum GatewayEnvironment {
                 gatewayBin: gatewayBin,
                 projectRoot: projectRoot,
                 searchPaths: searchPaths)
+            if let gatewayBin, installedRaw == nil {
+                let message = "OpenClaw Gateway at \(gatewayBin) could not be verified; reinstall or repair it."
+                return GatewayEnvironmentStatus(
+                    kind: .error(message),
+                    nodeVersion: runtime.version.description,
+                    gatewayVersion: nil,
+                    requiredGateway: expectedString,
+                    message: message)
+            }
             let installed = Semver.parse(installedRaw)
 
             if let expected, let installedRaw, installed != nil,
@@ -209,19 +222,15 @@ enum GatewayEnvironment {
                     requiredGateway: expectedText,
                     message: """
                     Gateway version \(installedRaw) is incompatible with app \(expectedText);
-                    install or update the global package.
+                    open Connection settings to update or set up the Gateway.
                     """)
             }
 
             let gatewayLabel = gatewayBin != nil ? "global" : "local"
             let gatewayVersionText = installedRaw ?? "unknown"
-            // Avoid repeating "(local)" twice; if using the local entrypoint, show the path once.
-            let localPathHint = gatewayBin == nil && projectEntrypoint != nil
-                ? " (local: \(projectEntrypoint ?? "unknown"))"
-                : ""
             let gatewayLabelText = gatewayBin != nil
                 ? "(\(gatewayLabel))"
-                : localPathHint.isEmpty ? "(\(gatewayLabel))" : localPathHint
+                : " (local: \(projectEntrypoint ?? "unknown"))"
             return GatewayEnvironmentStatus(
                 kind: .ok,
                 nodeVersion: runtime.version.description,
@@ -253,10 +262,8 @@ enum GatewayEnvironment {
         projectRoot: URL,
         searchPaths: [String]) async -> String?
     {
-        if let gatewayBin,
-           let version = await self.readGatewayVersion(binary: gatewayBin, searchPaths: searchPaths)
-        {
-            return version
+        if let gatewayBin {
+            return await self.readGatewayVersion(binary: gatewayBin, searchPaths: searchPaths)
         }
         return self.readLocalGatewayVersion(projectRoot: projectRoot)
     }
@@ -269,6 +276,7 @@ enum GatewayEnvironment {
                 arguments: ["--version"],
                 environment: ["PATH": searchPaths.joined(separator: ":")],
                 timeout: CommandResolver.versionProbeTimeout)
+            guard result.terminationStatus == 0 else { return nil }
             let elapsedMs = Int(Date().timeIntervalSince(start) * 1000)
             if elapsedMs > 500 {
                 self.logger.warning(

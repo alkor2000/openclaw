@@ -1,13 +1,12 @@
-import {
-  GATEWAY_CLIENT_CAPS,
-  hasGatewayClientCap,
-} from "../../../packages/gateway-protocol/src/client-info.js";
 import { validateAgentParams } from "../../../packages/gateway-protocol/src/index.js";
 import { prepareAgentRequestPreflight } from "../agent-turn/agent-request-preflight.js";
 import { createAgentTurnService } from "../agent-turn/agent-turn-service.js";
 import { createAgentTurnIo } from "../agent-turn/io.js";
-import { captureAgentTurnPrincipal } from "../agent-turn/principal.js";
+import { captureAgentTurnPrincipal, resolveAgentTurnRunObserver } from "../agent-turn/principal.js";
+import { SessionMutationAuthorizationChangedError } from "../session-mutation-authorization-error.js";
+import { captureGatewayClientUploadCommitGuard } from "../upload-policy.js";
 import type { AgentRunRequest } from "./agent-request-types.js";
+import { createAgentRuntimeAuthorityGuard } from "./agent-runtime-authority.js";
 import type { GatewayRequestHandlers } from "./types.js";
 import { assertValidParams } from "./validation.js";
 
@@ -17,7 +16,22 @@ export const agentRunHandler: GatewayRequestHandlers["agent"] = async ({
   context,
   client,
   isWebchatConnect,
+  hasCurrentClientAuthority,
+  sessionMutationCommitGuard,
 }) => {
+  const assertUploadAllowed = captureGatewayClientUploadCommitGuard({
+    method: "agent",
+    requestParams: params,
+    client,
+    context,
+  });
+  const assertAdmissionCurrent = () => {
+    sessionMutationCommitGuard?.();
+    if (hasCurrentClientAuthority?.() === false) {
+      throw new Error("Gateway caller authority is no longer active.");
+    }
+  };
+  assertAdmissionCurrent();
   const io = createAgentTurnIo(respond);
   if (
     !assertValidParams(params, validateAgentParams, "agent", (ok, payload, error, meta) =>
@@ -26,21 +40,40 @@ export const agentRunHandler: GatewayRequestHandlers["agent"] = async ({
   ) {
     return;
   }
+  const runtimeAuthority = createAgentRuntimeAuthorityGuard(
+    client,
+    context,
+    respond,
+    assertAdmissionCurrent,
+  );
+  if (!runtimeAuthority.ensureActive()) {
+    return;
+  }
   const request = params as AgentRunRequest;
   const principal = captureAgentTurnPrincipal(client);
   const preflight = prepareAgentRequestPreflight({ request, context, client: principal, io });
   if (!preflight) {
     return;
   }
-  const connId = principal?.connId;
-  const onRunObserved =
-    connId && hasGatewayClientCap(principal?.connect?.caps, GATEWAY_CLIENT_CAPS.TOOL_EVENTS)
-      ? (runId: string) => context.registerToolEventRecipient(runId, connId)
-      : undefined;
-  await createAgentTurnService({ context, isWebchatConnect }).startTurn({
-    preflight,
+  const onRunObserved = resolveAgentTurnRunObserver({
     principal,
-    io,
-    onRunObserved,
+    registerToolEventRecipient: context.registerToolEventRecipient,
   });
+  try {
+    await createAgentTurnService({ context, isWebchatConnect }).startTurn({
+      assertAdmissionCurrent: runtimeAuthority.commitGuard,
+      assertInputCommitAllowed: assertUploadAllowed,
+      hasCurrentClientAuthority,
+      preflight,
+      principal,
+      io,
+      onRunObserved,
+    });
+  } catch (error) {
+    if (error instanceof SessionMutationAuthorizationChangedError) {
+      respond(false, undefined, error.error);
+      return;
+    }
+    runtimeAuthority.handleClosedError(error);
+  }
 };

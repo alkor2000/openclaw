@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 import { resolveQaParityPackScenarioIds } from "./agentic-parity.js";
 import { resolveQaRuntimePairLaneScenarioIds } from "./runtime-pair-lane-selection.js";
 import {
-  QA_RUNTIME_PAIR_LANES,
   readQaScenarioById,
   readQaScenarioExecutionConfig,
   readQaScenarioPack,
@@ -11,17 +10,21 @@ import {
 import { selectQaFlowSuiteScenarios } from "./suite-planning.js";
 
 describe("QA runtime-pair scenario catalog", () => {
-  it("uses the canonical lanes with audited declaration counts", () => {
-    expect(QA_RUNTIME_PAIR_LANES).toEqual(["core", "extended", "soak"]);
+  it("pins deterministic sessions_spawn fixture inputs", () => {
+    const config = readQaScenarioExecutionConfig("runtime-tool-sessions-spawn");
 
-    const laneCounts = Object.fromEntries(
-      QA_RUNTIME_PAIR_LANES.map((lane) => [
-        lane,
-        readQaScenarioPack().scenarios.filter((scenario) => scenario.runtimePairLane === lane)
-          .length,
-      ]),
+    expect(config?.happyPrompt).toContain("sessions_spawn directly exactly once");
+    expect(config?.happyPrompt).toContain(
+      'task="Runtime tool fixture subagent: reply exactly RUNTIME-TOOL-FIXTURE."',
     );
-    expect(laneCounts).toEqual({ core: 36, extended: 8, soak: 2 });
+    expect(config?.happyPrompt).toContain('label="runtime-tool-fixture"');
+    expect(config?.happyPrompt).toContain('mode="run"');
+    expect(config?.happyPrompt).toContain("thread=false");
+    expect(config?.happyPrompt).toContain("expectsCompletionMessage=false");
+    expect(config?.failurePrompt).toContain('sessions_spawn directly exactly once with task=""');
+    expect(config?.failurePrompt).toContain(
+      "Do not repair, omit, replace, or retry the empty task",
+    );
   });
 
   it("declares every release agentic scenario in the core lane", () => {
@@ -41,7 +44,6 @@ describe("QA runtime-pair scenario catalog", () => {
       "goal-followthrough-live",
       "plugin-hook-health-sentinel",
       "codex-legacy-read-tool-vocabulary",
-      "gateway-restart-multi-live",
       "streaming-final-integrity",
       "cron-model-created-explicit-authority",
       "cron-model-created-one-shot-recurring",
@@ -85,7 +87,7 @@ describe("QA runtime-pair scenario catalog", () => {
     expect(longContextFlow).not.toContain("patchConfig");
   });
 
-  it("selects the pinned gateway restart pair explicitly and implicitly at GPT-5.4", () => {
+  it("keeps the pinned gateway restart scenario owned by the OpenClaw runtime", () => {
     const scenarioId = "gateway-restart-multi-live";
     const scenario = readQaScenarioById(scenarioId);
     const scenarios = readQaScenarioPack().scenarios;
@@ -94,7 +96,8 @@ describe("QA runtime-pair scenario catalog", () => {
       primaryModel: "openai/gpt-5.4",
     };
 
-    expect(scenario.runtimePairLane).toBe("core");
+    expect(scenario.runtimePairLane).toBeUndefined();
+    expect(scenario.execution).toMatchObject({ kind: "flow", runtime: "openclaw" });
     expect(readQaScenarioExecutionConfig(scenarioId)).toMatchObject({
       requiredProviderMode: "live-frontier",
       requiredProvider: "openai",
@@ -119,7 +122,7 @@ describe("QA runtime-pair scenario catalog", () => {
 
     expect(explicitIds).toEqual([scenarioId]);
     expect(implicitIds).toContain(scenarioId);
-    expect(runtimePairLane.scenarioIds).toContain(scenarioId);
+    expect(runtimePairLane.scenarioIds).not.toContain(scenarioId);
     expect(runtimePairLane.excludedLaneScenarios.map((excluded) => excluded.id)).not.toContain(
       scenarioId,
     );

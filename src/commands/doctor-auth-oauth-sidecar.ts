@@ -1,22 +1,23 @@
-/** Doctor repair for legacy OAuth sidecar files and inline auth profile stores. */
 import fs from "node:fs";
 import path from "node:path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { readNonBlankString as readNonEmptyString } from "@openclaw/normalization-core/string-coerce";
 import { note } from "../../packages/terminal-core/src/note.js";
-import { listAgentIds, resolveAgentDir, resolveDefaultAgentDir } from "../agents/agent-scope.js";
 import { AUTH_STORE_VERSION } from "../agents/auth-profiles/constants.js";
-import { clearRuntimeAuthProfileStoreSnapshots } from "../agents/auth-profiles/store.js";
+import { clearRuntimeAuthProfileStoreSnapshots } from "../agents/auth-profiles/runtime-snapshots.js";
 import { formatCliCommand } from "../cli/command-format.js";
-import { resolveOAuthDir, resolveStateDir } from "../config/paths.js";
+import { resolveOAuthDir } from "../config/paths.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { loadJsonFile, saveJsonFile } from "../infra/json-file.js";
+import { loadJsonFileThroughSymlink, writeJsonTarget } from "../infra/json-file.js";
 import { shortenHomePath } from "../utils.js";
-import { resolveLegacyAuthProfilesPath as resolveAuthStorePath } from "./doctor-auth-legacy-paths.js";
+import {
+  listAuthProfileRepairCandidates,
+  type AuthProfileRepairCandidate,
+} from "./doctor-auth-legacy-paths.js";
 import type { DoctorPrompter } from "./doctor-prompter.js";
 import {
   isLegacyOAuthRef,
   isLegacyOAuthSidecarPayload,
-  legacyOAuthSidecarTestUtils,
   loadLegacyOAuthSidecarMaterial,
   resolveLegacyOAuthSidecarPath,
   type LegacyOAuthRef,
@@ -24,11 +25,6 @@ import {
 } from "./doctor/shared/legacy-oauth-sidecar.js";
 
 const LEGACY_OAUTH_SECRET_DIRNAME = "auth-profiles";
-
-type AuthProfileRepairCandidate = {
-  agentDir?: string;
-  authPath: string;
-};
 
 type LegacyOAuthSidecarProfile = {
   profileId: string;
@@ -41,66 +37,11 @@ type LegacyOAuthSidecarStore = AuthProfileRepairCandidate & {
   profiles: LegacyOAuthSidecarProfile[];
 };
 
-type LegacyOAuthUnreferencedSidecar = {
-  sidecarPath: string;
-};
-
 type LegacyOAuthSidecarRepairResult = {
   detected: string[];
   changes: string[];
   warnings: string[];
 };
-
-function readNonEmptyString(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value : undefined;
-}
-
-function addCandidate(
-  candidates: Map<string, AuthProfileRepairCandidate>,
-  agentDir: string | undefined,
-): void {
-  const authPath = resolveAuthStorePath(agentDir);
-  candidates.set(path.resolve(authPath), { agentDir, authPath });
-}
-
-function listExistingAgentDirsFromState(env: NodeJS.ProcessEnv): string[] {
-  const root = path.join(resolveStateDir(env), "agents");
-  let entries: fs.Dirent[];
-  try {
-    entries = fs.readdirSync(root, { withFileTypes: true });
-  } catch {
-    return [];
-  }
-  return entries
-    .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
-    .map((entry) => path.join(root, entry.name, "agent"))
-    .filter((agentDir) => {
-      try {
-        return fs.statSync(agentDir).isDirectory();
-      } catch {
-        return false;
-      }
-    });
-}
-
-function listAuthProfileRepairCandidates(
-  cfg: OpenClawConfig,
-  env: NodeJS.ProcessEnv,
-): AuthProfileRepairCandidate[] {
-  const candidates = new Map<string, AuthProfileRepairCandidate>();
-  addCandidate(candidates, resolveDefaultAgentDir(cfg, env));
-  const envAgentDir = readNonEmptyString(env.OPENCLAW_AGENT_DIR);
-  if (envAgentDir) {
-    addCandidate(candidates, envAgentDir);
-  }
-  for (const agentId of listAgentIds(cfg)) {
-    addCandidate(candidates, resolveAgentDir(cfg, agentId, env));
-  }
-  for (const agentDir of listExistingAgentDirsFromState(env)) {
-    addCandidate(candidates, agentDir);
-  }
-  return [...candidates.values()];
-}
 
 function resolveLegacyOAuthSidecarStore(
   candidate: AuthProfileRepairCandidate,
@@ -108,7 +49,7 @@ function resolveLegacyOAuthSidecarStore(
   if (!fs.existsSync(candidate.authPath)) {
     return null;
   }
-  const raw = loadJsonFile(candidate.authPath);
+  const raw = loadJsonFileThroughSymlink(candidate.authPath);
   if (!isRecord(raw) || !isRecord(raw.profiles)) {
     return null;
   }
@@ -135,7 +76,7 @@ function resolveLegacyOAuthSidecarStore(
 function listUnreferencedLegacyOAuthSidecars(
   referencedRefIds: Set<string>,
   env: NodeJS.ProcessEnv,
-): LegacyOAuthUnreferencedSidecar[] {
+): string[] {
   const sidecarDir = path.join(resolveOAuthDir(env), LEGACY_OAUTH_SECRET_DIRNAME);
   let entries: fs.Dirent[];
   try {
@@ -152,7 +93,9 @@ function listUnreferencedLegacyOAuthSidecars(
       return [];
     }
     const sidecarPath = path.join(sidecarDir, entry.name);
-    return isLegacyOAuthSidecarPayload(loadJsonFile(sidecarPath)) ? [{ sidecarPath }] : [];
+    return isLegacyOAuthSidecarPayload(loadJsonFileThroughSymlink(sidecarPath))
+      ? [sidecarPath]
+      : [];
   });
 }
 
@@ -181,12 +124,6 @@ function applyLegacyOAuthSidecarMaterial(params: {
   return true;
 }
 
-function backupLegacyOAuthSidecarStore(authPath: string, now: () => number): string {
-  const backupPath = `${authPath}.oauth-ref.${now()}.bak`;
-  fs.copyFileSync(authPath, backupPath);
-  return backupPath;
-}
-
 /**
  * Migrates legacy Codex OAuth sidecar secrets back into inline auth profile credentials.
  *
@@ -210,10 +147,7 @@ export async function maybeRepairLegacyOAuthSidecarProfiles(params: {
   const unreferencedSidecars = listUnreferencedLegacyOAuthSidecars(referencedRefIds, env);
 
   const result: LegacyOAuthSidecarRepairResult = {
-    detected: [
-      ...stores.map((entry) => entry.authPath),
-      ...unreferencedSidecars.map((entry) => entry.sidecarPath),
-    ],
+    detected: [...stores.map((entry) => entry.authPath), ...unreferencedSidecars],
     changes: [],
     warnings: [],
   };
@@ -240,12 +174,16 @@ export async function maybeRepairLegacyOAuthSidecarProfiles(params: {
     );
   }
 
-  const shouldRepair = await params.prompter.confirmAutoFix({
-    message: "Migrate legacy Codex OAuth credentials now?",
-    initialValue: true,
-  });
-  if (!shouldRepair) {
-    return result;
+  // Unreferenced sidecars alone are informational: the store loop below never
+  // touches them, so prompting would confirm a guaranteed no-op on every run.
+  if (stores.length > 0) {
+    const shouldRepair = await params.prompter.confirmAutoFix({
+      message: "Migrate legacy Codex OAuth credentials now?",
+      initialValue: true,
+    });
+    if (!shouldRepair) {
+      return result;
+    }
   }
 
   const migratedSidecarsByRefId = new Map<string, string>();
@@ -278,11 +216,12 @@ export async function maybeRepairLegacyOAuthSidecarProfiles(params: {
     }
 
     try {
-      const backupPath = backupLegacyOAuthSidecarStore(store.authPath, now);
+      const backupPath = `${store.authPath}.oauth-ref.${now()}.bak`;
+      fs.copyFileSync(store.authPath, backupPath);
       if (!("version" in store.raw)) {
         store.raw.version = AUTH_STORE_VERSION;
       }
-      saveJsonFile(store.authPath, store.raw);
+      writeJsonTarget(store.authPath, store.raw);
       for (const [refId, sidecarPath] of storeMigratedSidecarsByRefId) {
         migratedSidecarsByRefId.set(refId, sidecarPath);
       }
@@ -328,15 +267,4 @@ export async function maybeRepairLegacyOAuthSidecarProfiles(params: {
     note(result.warnings.map((warning) => `- ${warning}`).join("\n"), "Doctor warnings");
   }
   return result;
-}
-
-const testing = {
-  buildLegacyOAuthSecretAad: legacyOAuthSidecarTestUtils.buildLegacyOAuthSecretAad,
-  buildLegacyOAuthSecretKey: legacyOAuthSidecarTestUtils.buildLegacyOAuthSecretKey,
-};
-
-if (process.env.VITEST || process.env.NODE_ENV === "test") {
-  (globalThis as Record<PropertyKey, unknown>)[
-    Symbol.for("openclaw.doctorAuthOAuthSidecarTestApi")
-  ] = testing;
 }

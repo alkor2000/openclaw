@@ -24,7 +24,7 @@ function truncateText(input: string, maxLen: number) {
 }
 
 function extractMessageText(message: ChatMessage): { role: string; text: string } | null {
-  const role = typeof message.role === "string" ? message.role : "";
+  const role = message.role;
   if (role !== "user" && role !== "assistant") {
     return null;
   }
@@ -34,6 +34,7 @@ function extractMessageText(message: ChatMessage): { role: string; text: string 
 
 export async function buildReminderContextLines(params: {
   agentSessionKey?: string;
+  agentId?: string;
   gatewayOpts: GatewayCallOptions;
   contextMessages: number;
   callGatewayTool: GatewayToolCaller;
@@ -58,6 +59,7 @@ export async function buildReminderContextLines(params: {
       params.gatewayOpts,
       {
         sessionKey: resolvedKey,
+        agentId: params.agentId,
         limit: maxMessages,
       },
     );
@@ -66,9 +68,6 @@ export async function buildReminderContextLines(params: {
       .map((msg) => extractMessageText(msg as ChatMessage))
       .filter((msg): msg is { role: string; text: string } => Boolean(msg));
     const recent = parsed.slice(-maxMessages);
-    if (recent.length === 0) {
-      return [];
-    }
     const lines: string[] = [];
     let total = 0;
     for (const entry of recent) {

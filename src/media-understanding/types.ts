@@ -1,5 +1,4 @@
-// Shared media-understanding types for attachments, provider hooks, request
-// auth, decisions, and structured extraction inputs.
+import type { Result } from "@openclaw/normalization-core/result";
 import type { MediaUnderstandingCapability } from "../../packages/media-understanding-common/src/types.js";
 import type { AuthProfileStore } from "../agents/auth-profiles/types.js";
 import type { ModelProviderConfig } from "../config/types.js";
@@ -44,10 +43,30 @@ type MediaUnderstandingAttachmentDecision = {
   chosen?: MediaUnderstandingModelDecision;
 };
 
+export type MediaAttachmentDisposition =
+  | { kind: "handled" }
+  | { kind: "handed-to-native-vision" }
+  | { kind: "not-selected" }
+  | { kind: "capability-disabled" }
+  | { kind: "no-model" }
+  | { kind: "scope-denied" }
+  | { kind: "failed"; reason?: string };
+
+export type MediaAttachmentProcessing = "completed" | "omitted";
+
 export type MediaUnderstandingDecision = {
   capability: MediaUnderstandingCapability;
   outcome: MediaUnderstandingDecisionOutcome;
   attachments: MediaUnderstandingAttachmentDecision[];
+  // Optional on the shipped SDK contract: plugins pass FinalizedMsgContext into
+  // inbound-reply dispatch and may hold legacy decision literals. Core producers
+  // (runner, apply-capability, runtime) always populate it; absence renders no
+  // markers rather than breaking plugin compilation.
+  attachmentDispositions?: Record<number, MediaAttachmentDisposition>;
+  // CLI/provider completion is independent of usable output or a rendered marker.
+  // Optional for shipped SDK decision literals; absence means unknown processing.
+  attachmentProcessing?: Record<number, MediaAttachmentProcessing>;
+  nativeVisionActive?: boolean;
 };
 
 type MediaUnderstandingProviderRequestAuthOverride =
@@ -81,7 +100,12 @@ export type MediaUnderstandingProviderRequestAuth =
   | { kind: "api-key"; apiKey: string; source?: string }
   | { kind: "none"; source: string };
 
-export type AudioTranscriptionRequest = {
+export type AudioTranscriptionRequest = MediaUnderstandingProviderRequest & {
+  language?: string;
+  query?: Record<string, string | number | boolean>;
+};
+
+type MediaUnderstandingProviderRequest = {
   buffer: Buffer;
   fileName: string;
   mime?: string;
@@ -92,9 +116,7 @@ export type AudioTranscriptionRequest = {
   headers?: Record<string, string>;
   request?: MediaUnderstandingProviderRequestTransportOverrides;
   model?: string;
-  language?: string;
   prompt?: string;
-  query?: Record<string, string | number | boolean>;
   timeoutMs: number;
   signal?: AbortSignal;
   fetchFn?: typeof fetch;
@@ -105,47 +127,23 @@ export type AudioTranscriptionResult = {
   model?: string;
 };
 
-export type VideoDescriptionRequest = {
-  buffer: Buffer;
-  fileName: string;
-  mime?: string;
-  /** Compatibility field for existing providers; prefer auth.kind/apiKey. */
-  apiKey: string;
-  auth?: MediaUnderstandingProviderRequestAuth;
-  baseUrl?: string;
-  headers?: Record<string, string>;
-  request?: MediaUnderstandingProviderRequestTransportOverrides;
-  model?: string;
-  prompt?: string;
-  timeoutMs: number;
-  signal?: AbortSignal;
-  fetchFn?: typeof fetch;
+type AudioTranscriptionContext = Omit<AudioTranscriptionRequest, "apiKey" | "auth"> & {
+  cfg: OpenClawConfig;
+  agentDir?: string;
+  workspaceDir?: string;
+  profile?: string;
+  preferredProfile?: string;
 };
+
+export type VideoDescriptionRequest = MediaUnderstandingProviderRequest;
 
 export type VideoDescriptionResult = {
   text: string;
   model?: string;
 };
 
-export type ImageDescriptionRequest = {
-  buffer: Buffer;
-  fileName: string;
-  mime?: string;
-  prompt?: string;
-  maxTokens?: number;
-  timeoutMs: number;
-  signal?: AbortSignal;
-  profile?: string;
-  preferredProfile?: string;
-  authStore?: AuthProfileStore;
-  agentId?: string;
-  agentDir: string;
-  workspaceDir?: string;
-  preparedModelRuntime?: MediaPreparedModelRuntime;
-  cfg: OpenClawConfig;
-  model: string;
-  provider: string;
-};
+export type ImageDescriptionRequest = ImagesDescriptionInput &
+  Omit<ImagesDescriptionRequest, "images">;
 
 export type ImagesDescriptionInput = {
   buffer: Buffer;
@@ -176,21 +174,15 @@ export type ImageDescriptionResult = {
   model?: string;
 };
 
-export type ImagesDescriptionResult = {
-  text: string;
-  model?: string;
-};
+export type ImagesDescriptionResult = ImageDescriptionResult;
 
 export type StructuredExtractionTextInput = {
   type: "text";
   text: string;
 };
 
-export type StructuredExtractionImageInput = {
+export type StructuredExtractionImageInput = ImagesDescriptionInput & {
   type: "image";
-  buffer: Buffer;
-  fileName: string;
-  mime?: string;
 };
 
 export type StructuredExtractionInput =
@@ -259,6 +251,11 @@ export type MediaUnderstandingProvider = {
     ctx: MediaUnderstandingProviderAuthContext,
   ) => MediaUnderstandingProviderSyntheticAuthResult | null | undefined;
   transcribeAudio?: (req: AudioTranscriptionRequest) => Promise<AudioTranscriptionResult>;
+  /** Called after file loading. Result.error is only a rejection before audio upload;
+   * upload/HTTP failures must throw and stop automatic provider selection. */
+  transcribeAudioWithContext?: (
+    req: AudioTranscriptionContext,
+  ) => Promise<Result<AudioTranscriptionResult, unknown>>;
   describeVideo?: (req: VideoDescriptionRequest) => Promise<VideoDescriptionResult>;
   describeImage?: (req: ImageDescriptionRequest) => Promise<ImageDescriptionResult>;
   describeImages?: (req: ImagesDescriptionRequest) => Promise<ImagesDescriptionResult>;

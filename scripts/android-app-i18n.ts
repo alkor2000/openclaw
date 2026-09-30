@@ -75,17 +75,12 @@ const WEAR_GENERATED_RESOURCE_RE =
 
 type NativeInventoryEntry = {
   id: string;
-  kind: string;
-  path: string;
   source: string;
+  sites: Array<{ kind: string; path: string }>;
   surface: "android" | "apple";
 };
 
-type NativeArtifactEntry = {
-  id: string;
-  source: string;
-  translated: string;
-};
+type NativeTranslations = Record<string, string>;
 
 type ResourceString = {
   attrs: string;
@@ -315,16 +310,17 @@ async function readStrings(
 
 async function readAndroidSource(
   root = SOURCE_ROOT,
+  extensionPattern = /\.kt$/u,
 ): Promise<Array<{ path: string; source: string }>> {
   const entries = await readdir(root, { withFileTypes: true });
   const sources: Array<{ path: string; source: string }> = [];
   for (const entry of entries) {
     const fullPath = path.join(root, entry.name);
     if (entry.isDirectory()) {
-      sources.push(...(await readAndroidSource(fullPath)));
+      sources.push(...(await readAndroidSource(fullPath, extensionPattern)));
       continue;
     }
-    if (entry.isFile() && entry.name.endsWith(".kt")) {
+    if (entry.isFile() && extensionPattern.test(entry.name)) {
       sources.push({
         path: path.relative(ROOT, fullPath).split(path.sep).join("/"),
         source: await readFile(fullPath, "utf8"),
@@ -343,26 +339,11 @@ type AndroidResourceReferenceSource = {
   source: string;
 };
 
-async function readAndroidResourceReferences(
+function readAndroidResourceReferences(
   root = ANDROID_MAIN_ROOT,
 ): Promise<AndroidResourceReferenceSource[]> {
-  const entries = await readdir(root, { withFileTypes: true });
-  const sources: AndroidResourceReferenceSource[] = [];
-  for (const entry of entries) {
-    const fullPath = path.join(root, entry.name);
-    if (entry.isDirectory()) {
-      // This walk is confined to app/src/main, so Gradle build output is never eligible.
-      sources.push(...(await readAndroidResourceReferences(fullPath)));
-      continue;
-    }
-    if (entry.isFile() && /\.(?:kt|kts|xml)$/u.test(entry.name)) {
-      sources.push({
-        path: path.relative(ROOT, fullPath).split(path.sep).join("/"),
-        source: await readFile(fullPath, "utf8"),
-      });
-    }
-  }
-  return sources;
+  // Source-set roots exclude Gradle build output.
+  return readAndroidSource(root, /\.(?:kt|kts|xml)$/u);
 }
 
 export function findUnusedAndroidResourceKeys(
@@ -391,11 +372,15 @@ function lineNumber(source: string, offset: number): number {
 }
 
 function decodeKotlinLiteral(value: string): string {
-  return value
-    .replaceAll("\\n", "\n")
-    .replaceAll('\\"', '"')
-    .replaceAll("\\$", "$")
-    .replaceAll("\\\\", "\\");
+  return value.replace(
+    /\\(?:u([0-9a-fA-F]{4})|[n"$\\])/gu,
+    (escape, codeUnit: string | undefined) => {
+      if (codeUnit) {
+        return String.fromCharCode(Number.parseInt(codeUnit, 16));
+      }
+      return escape === "\\n" ? "\n" : escape.slice(1);
+    },
+  );
 }
 
 function collectExplicitRuntimeSources(
@@ -531,10 +516,6 @@ const ALLOWED_UI_LITERALS = new Map<string, ReadonlySet<string>>([
     new Set(["${endpoint.host}:${endpoint.port}"]),
   ],
   [
-    "apps/android/app/src/main/java/ai/openclaw/app/ui/VoiceScreen.kt",
-    new Set(["${normalized.takeUtf16Safe(87)}..."]),
-  ],
-  [
     "apps/android/app/src/main/java/ai/openclaw/app/ui/SidebarShell.kt",
     // Compose animation labels are tooling identifiers, not rendered copy.
     new Set(["sidebar-content-translation"]),
@@ -593,6 +574,26 @@ function shouldScanUiLiterals(repoPath: string): boolean {
   );
 }
 
+function createDoubleQuoteScanner() {
+  let quoted = false;
+  let escaped = false;
+  return (character: string | undefined): boolean => {
+    if (escaped) {
+      escaped = false;
+      return true;
+    }
+    if (quoted && character === "\\") {
+      escaped = true;
+      return true;
+    }
+    if (character === '"') {
+      quoted = !quoted;
+      return true;
+    }
+    return quoted;
+  };
+}
+
 function findClosingDelimiter(
   source: string,
   openingOffset: number,
@@ -600,23 +601,10 @@ function findClosingDelimiter(
   closing: string,
 ): number | null {
   let depth = 0;
-  let quoted = false;
-  let escaped = false;
+  const skipQuoted = createDoubleQuoteScanner();
   for (let index = openingOffset; index < source.length; index += 1) {
     const character = source[index];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (quoted && character === "\\") {
-      escaped = true;
-      continue;
-    }
-    if (character === '"') {
-      quoted = !quoted;
-      continue;
-    }
-    if (quoted) {
+    if (skipQuoted(character)) {
       continue;
     }
     if (character === opening) {
@@ -637,26 +625,13 @@ function expressionEnd(source: string, expressionStart: number): number {
     return source.length;
   }
   const start = expressionStart + cursor;
-  let quoted = false;
-  let escaped = false;
+  const skipQuoted = createDoubleQuoteScanner();
   let lineStart = start;
   const depths = { "(": 0, "[": 0, "{": 0 };
   const closingToOpening = { ")": "(", "]": "[", "}": "{" } as const;
   for (let index = start; index < source.length; index += 1) {
     const character = source[index];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (quoted && character === "\\") {
-      escaped = true;
-      continue;
-    }
-    if (character === '"') {
-      quoted = !quoted;
-      continue;
-    }
-    if (quoted) {
+    if (skipQuoted(character)) {
       continue;
     }
     if (character === "(" || character === "[" || character === "{") {
@@ -696,27 +671,14 @@ function splitTopLevelSegments(
 ): Array<{ end: number; start: number; value: string }> {
   const segments: Array<{ end: number; start: number; value: string }> = [];
   let segmentStart = start;
-  let quoted = false;
-  let escaped = false;
+  const skipQuoted = createDoubleQuoteScanner();
   let typeArgumentDepth = 0;
   let inDefaultValue = false;
   const depths = { "(": 0, "[": 0, "{": 0 };
   const closingToOpening = { ")": "(", "]": "[", "}": "{" } as const;
   for (let index = start; index < end; index += 1) {
     const character = source[index];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (quoted && character === "\\") {
-      escaped = true;
-      continue;
-    }
-    if (character === '"') {
-      quoted = !quoted;
-      continue;
-    }
-    if (quoted) {
+    if (skipQuoted(character)) {
       continue;
     }
     if (options.trackTypeArguments && !inDefaultValue && character === "<") {
@@ -886,21 +848,11 @@ function collectTypedModelLiteralFindings(
     if (!className) {
       continue;
     }
-    let openingParen = (declaration.index ?? 0) + declaration[0].length;
-    while (/\s/u.test(source[openingParen] ?? "")) {
-      openingParen += 1;
-    }
-    if (source[openingParen] === "<") {
-      const closingTypeArguments = findClosingDelimiter(source, openingParen, "<", ">");
-      if (closingTypeArguments === null) {
-        continue;
-      }
-      openingParen = closingTypeArguments + 1;
-      while (/\s/u.test(source[openingParen] ?? "")) {
-        openingParen += 1;
-      }
-    }
-    if (source[openingParen] !== "(") {
+    const openingParen = findParameterOpening(
+      source,
+      (declaration.index ?? 0) + declaration[0].length,
+    );
+    if (openingParen === null) {
       continue;
     }
     const closingParen = findClosingDelimiter(source, openingParen, "(", ")");
@@ -925,24 +877,8 @@ function collectTypedModelLiteralFindings(
     }
     const callPattern = new RegExp(`\\b${className}\\b`, "gu");
     for (const call of source.matchAll(callPattern)) {
-      let callOpening = (call.index ?? 0) + call[0].length;
-      while (/\s/u.test(source[callOpening] ?? "")) {
-        callOpening += 1;
-      }
-      if (source[callOpening] === "<") {
-        const closingTypeArguments = findClosingDelimiter(source, callOpening, "<", ">");
-        if (closingTypeArguments === null) {
-          continue;
-        }
-        callOpening = closingTypeArguments + 1;
-        while (/\s/u.test(source[callOpening] ?? "")) {
-          callOpening += 1;
-        }
-      }
-      if (source[callOpening] !== "(") {
-        continue;
-      }
-      if (callOpening === openingParen) {
+      const callOpening = findParameterOpening(source, (call.index ?? 0) + call[0].length);
+      if (callOpening === null || callOpening === openingParen) {
         continue;
       }
       const callClosing = findClosingDelimiter(source, callOpening, "(", ")");
@@ -986,6 +922,24 @@ function collectTypedModelLiteralFindings(
     }
   }
   return findings;
+}
+
+function findParameterOpening(source: string, startOffset: number): number | null {
+  let offset = startOffset;
+  while (/\s/u.test(source[offset] ?? "")) {
+    offset += 1;
+  }
+  if (source[offset] === "<") {
+    const closingTypeArguments = findClosingDelimiter(source, offset, "<", ">");
+    if (closingTypeArguments === null) {
+      return null;
+    }
+    offset = closingTypeArguments + 1;
+    while (/\s/u.test(source[offset] ?? "")) {
+      offset += 1;
+    }
+  }
+  return source[offset] === "(" ? offset : null;
 }
 
 export function findUnlocalizedAndroidUiLiterals(
@@ -1090,58 +1044,37 @@ async function readInventory(): Promise<NativeInventoryEntry[]> {
   return (parsed.entries ?? []).filter((entry) => entry.surface === "android");
 }
 
-async function readArtifacts(): Promise<Map<string, NativeArtifactEntry[]>> {
+async function readArtifacts(): Promise<Map<string, NativeTranslations>> {
   return new Map(
     await Promise.all(
       NATIVE_I18N_LOCALES.map(async (locale) => {
         const parsed = JSON.parse(
           await readFile(path.join(ARTIFACT_ROOT, `${locale}.json`), "utf8"),
-        ) as { entries?: NativeArtifactEntry[] };
-        return [locale, parsed.entries ?? []] as const;
+        ) as { translations?: NativeTranslations };
+        return [locale, parsed.translations ?? {}] as const;
       }),
     ),
   );
 }
 
 function translationsBySource(
-  artifactEntries: readonly NativeArtifactEntry[],
+  inventory: readonly NativeInventoryEntry[],
+  translationsById: Readonly<NativeTranslations>,
 ): Map<string, string[]> {
   const translations = new Map<string, string[]>();
-  for (const entry of artifactEntries) {
-    const values = translations.get(entry.source) ?? [];
-    values.push(entry.translated);
-    translations.set(entry.source, values);
+  for (const entry of inventory) {
+    const translated = translationsById[entry.id];
+    if (translated !== undefined) {
+      translations.set(entry.source, [translated]);
+    }
   }
   return translations;
-}
-
-function artifactEntriesById(
-  artifactEntries: readonly NativeArtifactEntry[],
-): Map<string, NativeArtifactEntry> {
-  return new Map(artifactEntries.map((entry) => [entry.id, entry]));
-}
-
-export function selectExactArtifactTranslation(
-  source: string,
-  inventoryId: string,
-  artifactEntries: ReadonlyMap<string, { source: string; translated: string }>,
-): string {
-  const artifactEntry = artifactEntries.get(inventoryId);
-  if (!artifactEntry) {
-    return source;
-  }
-  if (artifactEntry.source !== source) {
-    throw new Error(
-      `Wear translation source drift for ${inventoryId}: ${JSON.stringify(artifactEntry.source)} != ${JSON.stringify(source)}`,
-    );
-  }
-  return artifactEntry.translated || source;
 }
 
 function localizeManualStrings(
   base: ReadonlyMap<string, ResourceString>,
   inventoryBySource: ReadonlyMap<string, NativeInventoryEntry>,
-  artifactEntries: ReadonlyMap<string, NativeArtifactEntry>,
+  translations: Readonly<NativeTranslations>,
   surface: string,
 ): ResourceString[] {
   return [...base.values()].map((entry) => {
@@ -1153,10 +1086,7 @@ function localizeManualStrings(
         `${surface} string is missing from native inventory: ${JSON.stringify(source)}`,
       );
     }
-    const value =
-      translatable && inventoryEntry
-        ? selectExactArtifactTranslation(source, inventoryEntry.id, artifactEntries)
-        : source;
+    const value = (translatable && inventoryEntry && translations[inventoryEntry.id]) || source;
     return {
       attrs: translatable ? withGeneratedTranslationLintIgnores(entry.attrs) : entry.attrs,
       key: entry.key,
@@ -1185,17 +1115,18 @@ function renderStringsXml(
     for (const [key, entry] of [...generated].toSorted(([left], [right]) =>
       compareText(left, right),
     )) {
-      const formatted =
-        (readKotlinInterpolations(entry.source)?.length ?? 0) > 0 ? "" : ' formatted="false"';
-      // Translation-memory text intentionally preserves technical tokens and source punctuation,
-      // so Android's English dictionary and typography suggestions do not apply to managed keys.
-      lines.push(
-        `    <string name="${key}"${withGeneratedTranslationLintIgnores(formatted)}>"${renderAndroidResourceValue(entry.source, entry.value)}"</string>`,
-      );
+      lines.push(renderGeneratedString(key, entry));
     }
   }
   lines.push("</resources>", "");
   return lines.join("\n");
+}
+
+function renderGeneratedString(key: string, entry: { source: string; value: string }): string {
+  const formatted =
+    (readKotlinInterpolations(entry.source)?.length ?? 0) > 0 ? "" : ' formatted="false"';
+  // Translation-memory text preserves technical tokens and source punctuation.
+  return `    <string name="${key}"${withGeneratedTranslationLintIgnores(formatted)}>"${renderAndroidResourceValue(entry.source, entry.value)}"</string>`;
 }
 
 function renderAssistantXml(items: readonly string[]): string {
@@ -1226,8 +1157,8 @@ function renderKotlin(sourceToKey: ReadonlyMap<string, string>): string {
 }
 
 export async function buildAndroidAppI18nCatalog(): Promise<GeneratedCatalog> {
+  const inventory = await readInventory();
   const [
-    inventory,
     artifacts,
     localeStrings,
     thirdPartyBaseStrings,
@@ -1235,7 +1166,6 @@ export async function buildAndroidAppI18nCatalog(): Promise<GeneratedCatalog> {
     sourceFiles,
     toolDisplaySources,
   ] = await Promise.all([
-    readInventory(),
     readArtifacts(),
     Promise.all(LOCALES.map((locale) => readStrings(locale))),
     readStrings("values", ANDROID_THIRD_PARTY_RESOURCE_ROOT, THIRD_PARTY_STRINGS_FILE),
@@ -1247,48 +1177,46 @@ export async function buildAndroidAppI18nCatalog(): Promise<GeneratedCatalog> {
   const translatedStrings = localeStrings.slice(1);
   const wearInventoryBySource = new Map(
     inventory
-      .filter((entry) => entry.path === WEAR_STRINGS_REPO_PATH)
+      .filter((entry) => entry.sites.some((site) => site.path === WEAR_STRINGS_REPO_PATH))
       .map((entry) => [entry.source, entry]),
   );
   const thirdPartyInventoryBySource = new Map(
     inventory
-      .filter((entry) => entry.path === THIRD_PARTY_STRINGS_REPO_PATH)
+      .filter((entry) => entry.sites.some((site) => site.path === THIRD_PARTY_STRINGS_REPO_PATH))
       .map((entry) => [entry.source, entry]),
   );
   const manualBase = [...baseStrings.values()].filter(
     (entry) => !entry.key.startsWith(MANAGED_PREFIX),
   );
   const manualSourceToKey = new Map(manualBase.map((entry) => [entry.value, entry.key]));
-  const entriesBySource = new Map<string, NativeInventoryEntry[]>();
+  const sources = new Set<string>();
   for (const entry of inventory) {
-    if (entry.surface !== "android" || entry.kind === "resource-string") {
+    if (
+      entry.surface !== "android" ||
+      entry.sites.every((site) => site.kind === "resource-string")
+    ) {
       continue;
     }
-    const group = entriesBySource.get(entry.source) ?? [];
-    group.push(entry);
-    entriesBySource.set(entry.source, group);
+    sources.add(entry.source);
   }
   for (const source of collectExplicitRuntimeSources(sourceFiles)) {
-    if (!entriesBySource.has(source)) {
-      entriesBySource.set(source, []);
-    }
+    sources.add(source);
   }
   for (const source of toolDisplaySources) {
-    if (!entriesBySource.has(source)) {
-      entriesBySource.set(source, []);
-    }
+    sources.add(source);
   }
   const sourceToKey = new Map<string, string>();
-  for (const source of entriesBySource.keys()) {
+  for (const source of sources) {
     sourceToKey.set(source, manualSourceToKey.get(source) ?? resourceKey(source));
   }
   const resources = new Map<string, string>();
   const contradictions: TranslationContradiction[] = [];
   for (const [localeIndex, locale] of NATIVE_I18N_LOCALES.entries()) {
     const manualTranslations = translatedStrings[localeIndex] ?? new Map();
-    const artifactTranslationsBySource = translationsBySource(artifacts.get(locale) ?? []);
+    const localeTranslations = artifacts.get(locale) ?? {};
+    const artifactTranslationsBySource = translationsBySource(inventory, localeTranslations);
     const generated = new Map<string, { source: string; value: string }>();
-    for (const source of entriesBySource.keys()) {
+    for (const source of sources) {
       const key = sourceToKey.get(source);
       if (!key || !key.startsWith(MANAGED_PREFIX)) {
         continue;
@@ -1329,7 +1257,7 @@ export async function buildAndroidAppI18nCatalog(): Promise<GeneratedCatalog> {
     const wearManual = localizeManualStrings(
       wearBaseStrings,
       wearInventoryBySource,
-      artifactEntriesById(artifacts.get(locale) ?? []),
+      localeTranslations,
       "Wear",
     );
     resources.set(
@@ -1339,7 +1267,7 @@ export async function buildAndroidAppI18nCatalog(): Promise<GeneratedCatalog> {
     const thirdPartyManual = localizeManualStrings(
       thirdPartyBaseStrings,
       thirdPartyInventoryBySource,
-      artifactEntriesById(artifacts.get(locale) ?? []),
+      localeTranslations,
       "Android third-party",
     );
     resources.set(
@@ -1371,13 +1299,8 @@ export async function buildAndroidAppI18nCatalog(): Promise<GeneratedCatalog> {
     "utf8",
   );
   const assistantItems = parseArrays(assistantSource).get("ask_openclaw_query_patterns") ?? [];
-  for (const [locale, artifactEntries] of artifacts) {
-    const translatedBySource = new Map<string, string[]>();
-    for (const entry of artifactEntries) {
-      const values = translatedBySource.get(entry.source) ?? [];
-      values.push(entry.translated);
-      translatedBySource.set(entry.source, values);
-    }
+  for (const [locale, localeTranslations] of artifacts) {
+    const translatedBySource = translationsBySource(inventory, localeTranslations);
     const translatedItems = assistantItems.map(
       (source) =>
         selectDeterministicTranslation(source, translatedBySource.get(source) ?? []) || source,
@@ -1392,7 +1315,7 @@ export async function buildAndroidAppI18nCatalog(): Promise<GeneratedCatalog> {
     contradictions,
     kotlin: renderKotlin(sourceToKey),
     resources,
-    sources: new Set(sourceToKey.keys()),
+    sources,
   };
 }
 
@@ -1431,11 +1354,103 @@ function onlyManagedRowsPending(current: string, expected: string): boolean {
   return true;
 }
 
+function obsoleteGeneratedSources(
+  currentKotlin: string,
+  catalog: GeneratedCatalog,
+): Map<string, string> {
+  const obsolete = new Map<string, string>();
+  const suffix = "  )\n";
+  const prefix = renderKotlin(new Map()).slice(0, -suffix.length);
+  if (!currentKotlin.startsWith(prefix) || !currentKotlin.endsWith(suffix)) {
+    return obsolete;
+  }
+  const remaining = currentKotlin
+    .slice(prefix.length, -suffix.length)
+    .replace(
+      /^ {4}"((?:\\.|[^"\\])*)" to R\.string\.(native_[a-f0-9]{16}),\n/gmu,
+      (line, literal: string, key: string) => {
+        const source = decodeKotlinLiteral(literal);
+        if (
+          catalog.sources.has(source) ||
+          literal !== escapeKotlin(source) ||
+          key !== resourceKey(source) ||
+          readKotlinInterpolations(source)?.length !== 0 ||
+          obsolete.has(key)
+        ) {
+          return line;
+        }
+        obsolete.set(key, source);
+        return "";
+      },
+    );
+  return `${prefix}${remaining}${suffix}` === catalog.kotlin ? obsolete : new Map();
+}
+
+function removeObsoleteGeneratedStrings(
+  current: string,
+  expected: string,
+  obsolete: ReadonlyMap<string, string>,
+): string {
+  const header = `${GENERATED_HEADER}\n`;
+  const headerIndex = expected.indexOf(header);
+  const prefix = expected.slice(0, headerIndex + header.length);
+  const suffix = "</resources>\n";
+  if (headerIndex < 0 || !current.startsWith(prefix) || !current.endsWith(suffix)) {
+    return current;
+  }
+  const seen = new Set<string>();
+  const remaining = current
+    .slice(prefix.length, -suffix.length)
+    .replace(/^ {4}<string name="native_[a-f0-9]{16}"[^\n]*<\/string>\n/gmu, (line) => {
+      const entry = parseStrings(line)[0];
+      const source = entry && obsolete.get(entry.key);
+      if (!entry || source === undefined || seen.has(entry.key)) {
+        return line;
+      }
+      seen.add(entry.key);
+      const value = decodeAndroidResourceValue(entry.rawValue);
+      return value.trim() && `${renderGeneratedString(entry.key, { source, value })}\n` === line
+        ? ""
+        : line;
+    });
+  return `${prefix}${remaining}${suffix}`;
+}
+
 export async function syncAndroidAppI18n(
-  options: { check?: boolean; tolerateManagedPending?: boolean } = {},
+  options: {
+    check?: boolean;
+    tolerateManagedPending?: boolean;
+    reportObsolete?: (message: string) => void;
+  } = {},
 ) {
   const catalog = await buildAndroidAppI18nCatalog();
+  const currentKotlin = await readFile(GENERATED_KOTLIN_PATH, "utf8").catch(() => "");
+  const obsolete =
+    options.check && options.reportObsolete
+      ? obsoleteGeneratedSources(currentKotlin, catalog)
+      : new Map<string, string>();
+  if (obsolete.size > 0) {
+    const references = (
+      await Promise.all([
+        readAndroidResourceReferences(),
+        readAndroidResourceReferences(path.dirname(ANDROID_PLAY_SOURCE_ROOT)),
+        readAndroidResourceReferences(ANDROID_THIRD_PARTY_ROOT),
+      ])
+    )
+      .flat()
+      .filter((entry) => path.resolve(ROOT, entry.path) !== GENERATED_KOTLIN_PATH);
+    const unused = new Set(findUnusedAndroidResourceKeys(obsolete.keys(), references));
+    const base = await readStrings("values");
+    for (const key of obsolete.keys()) {
+      // Stale lookup rows must still compile, and direct resource callers stay blocking.
+      if (!unused.has(key) || !base.has(key)) {
+        obsolete.clear();
+        break;
+      }
+    }
+  }
   const drift: string[] = [];
+  const obsoleteFiles: string[] = [];
   let sawUnmanagedDrift = false;
   for (const [filePath, expected] of catalog.resources) {
     const current = await readFile(filePath, "utf8").catch(() => "");
@@ -1443,6 +1458,15 @@ export async function syncAndroidAppI18n(
       continue;
     }
     const relativeFilePath = path.relative(ROOT, filePath).split(path.sep).join("/");
+    if (
+      obsolete.size > 0 &&
+      filePath.startsWith(`${RESOURCE_ROOT}${path.sep}`) &&
+      filePath.endsWith(`${path.sep}strings.xml`) &&
+      removeObsoleteGeneratedStrings(current, expected, obsolete) === expected
+    ) {
+      obsoleteFiles.push(relativeFilePath);
+      continue;
+    }
     if (
       options.check &&
       options.tolerateManagedPending &&
@@ -1459,11 +1483,12 @@ export async function syncAndroidAppI18n(
       await writeFile(filePath, expected);
     }
   }
-  const currentKotlin = await readFile(GENERATED_KOTLIN_PATH, "utf8").catch(() => "");
   if (currentKotlin !== catalog.kotlin) {
     // The Kotlin map derives 1:1 from the same managed catalog: tolerate it
     // exactly when every resource delta above was managed-pending.
-    if (!(options.check && options.tolerateManagedPending && !sawUnmanagedDrift)) {
+    if (obsolete.size > 0) {
+      obsoleteFiles.push(path.relative(ROOT, GENERATED_KOTLIN_PATH).split(path.sep).join("/"));
+    } else if (!(options.check && options.tolerateManagedPending && !sawUnmanagedDrift)) {
       drift.push(path.relative(ROOT, GENERATED_KOTLIN_PATH).split(path.sep).join("/"));
       if (!options.check) {
         await writeFile(GENERATED_KOTLIN_PATH, catalog.kotlin);
@@ -1472,6 +1497,11 @@ export async function syncAndroidAppI18n(
   }
   if (options.check && drift.length > 0) {
     throw new Error(`Android generated localization drift:\n${drift.join("\n")}`);
+  }
+  if (obsoleteFiles.length > 0) {
+    options.reportObsolete?.(
+      `Android obsolete generated localization rows: ${obsoleteFiles.join(", ")}`,
+    );
   }
   if (catalog.contradictions.length > 0) {
     const limit = 20;
@@ -1546,7 +1576,9 @@ export async function verifyAndroidAppI18n() {
   );
 }
 
-export async function checkAndroidAppI18n(options: { tolerateManagedPending?: boolean } = {}) {
+export async function checkAndroidAppI18n(
+  options: { tolerateManagedPending?: boolean; reportObsolete?: (message: string) => void } = {},
+) {
   await verifyAndroidAppI18n();
   await syncAndroidAppI18n({ check: true, ...options });
   const localeStrings = await Promise.all(LOCALES.map((locale) => readStrings(locale)));

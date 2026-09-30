@@ -1,4 +1,3 @@
-// Normalizes runtime status values for CLI and gateway reporting.
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 
 type RuntimeStatusFormatInput = {
@@ -31,7 +30,7 @@ export function formatRuntimeStatusWithDetails({
     fullDetails.push(`state ${normalizedState}`);
   }
   for (const detail of details) {
-    const normalizedDetail = detail.trim();
+    const normalizedDetail = detail.replace(/\s+/g, " ").trim();
     if (normalizedDetail) {
       fullDetails.push(normalizedDetail);
     }

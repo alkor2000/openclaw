@@ -23,10 +23,13 @@ import {
   validateWorkerLiveEventParams,
   validateWorkerTranscriptCommitParams,
 } from "../index.js";
+import { WorkerGatewayToolResultSchema } from "./worker-gateway-tool.js";
 import {
   WORKER_INFERENCE_MAX_OUTPUT_TOKENS,
+  validateWorkerInferenceEventFrame,
   validateWorkerInferenceStartParams,
 } from "./worker-inference.js";
+import { WORKER_PROTOCOL_MAX_PAYLOAD_BYTES } from "./worker-protocol-primitives.js";
 
 const bundleHash = "a".repeat(64);
 const handshake: WorkerAdmissionHandshake = {
@@ -350,10 +353,15 @@ describe("worker protocol schemas", () => {
     ).toBe(false);
   });
 
+  it("advertises only the current execution-context dialect", () => {
+    expect(WORKER_PROTOCOL_FEATURES).not.toContain(WORKER_LAUNCH_V2_PROTOCOL_FEATURE);
+    expect(WORKER_PROTOCOL_FEATURES).not.toContain("worker-execution-context-v1");
+    expect(WORKER_PROTOCOL_FEATURES).toContain("worker-execution-context-v2");
+  });
+
   it("validates the additive live-event protocol", () => {
     expect(WORKER_RPC_SET_VERSION).toBe(1);
     expect(WORKER_PROTOCOL_FEATURES).toContain("worker-live-event-v1");
-    expect(WORKER_PROTOCOL_FEATURES).toContain(WORKER_LAUNCH_V2_PROTOCOL_FEATURE);
     for (const validEvent of [
       assistant,
       event("thinking", { text: "x", delta: "x" }),
@@ -459,6 +467,29 @@ describe("worker protocol schemas", () => {
   });
 
   it.each([
+    { type: "text_start", contentSignature: "signature" },
+    { type: "text_delta", delta: "text" },
+    { type: "text_end", contentSignature: "signature" },
+    { type: "thinking_start" },
+    { type: "thinking_delta", delta: "thought" },
+    { type: "thinking_end", contentSignature: "signature" },
+    { type: "toolcall_start", id: "call-1", toolName: "probe" },
+    { type: "toolcall_delta", delta: "{}" },
+    { type: "toolcall_end" },
+  ])("keeps inference content events closed and indexed: $type", (contentEvent) => {
+    const validateEvent = (value: unknown) =>
+      validateWorkerInferenceEventFrame({
+        type: "event",
+        event: "worker.inference.event",
+        payload: { ...inferenceIdentity, seq: 1, event: value },
+      });
+    expect(validateEvent({ ...contentEvent, contentIndex: 0 })).toBe(true);
+    expect(validateEvent(contentEvent)).toBe(false);
+    expect(validateEvent({ ...contentEvent, contentIndex: -1 })).toBe(false);
+    expect(validateEvent({ ...contentEvent, contentIndex: 0, unexpected: true })).toBe(false);
+  });
+
+  it.each([
     transcriptCommit({ messages: [] }),
     transcriptCommit({ seq: 0 }),
     transcriptCommit({ sessionId: "other" }),
@@ -526,8 +557,47 @@ describe("worker protocol schemas", () => {
   });
 
   it("keeps worker close reasons closed", () => {
+    expect(Value.Check(WorkerProtocolCloseReasonSchema, "admission-rejected")).toBe(true);
     expect(Value.Check(WorkerProtocolCloseReasonSchema, "credential-replaced")).toBe(true);
     expect(Value.Check(WorkerProtocolCloseReasonSchema, "placement-mismatch")).toBe(true);
     expect(Value.Check(WorkerProtocolCloseReasonSchema, "not-a-worker-reason")).toBe(false);
+  });
+});
+
+describe("worker message wire boundaries", () => {
+  it.each([
+    { content: { type: "text", text: "ok", textSignature: "" }, accepts: [false, true, true] },
+    { content: { type: "text", text: "ok", textSignature: "signed" }, accepts: [true, true, true] },
+    { content: { type: "image", data: "", mimeType: "image/png" }, accepts: [false, false, true] },
+    {
+      content: { type: "image", data: "encoded", mimeType: "image/png" },
+      accepts: [true, true, true],
+    },
+    { content: { type: "text", text: "ok", extra: true }, accepts: [false, false, false] },
+    {
+      content: { type: "text", text: "a".repeat(WORKER_PROTOCOL_MAX_PAYLOAD_BYTES + 1) },
+      accepts: [false, true, false],
+    },
+  ])("retains each transport's content limits ($accepts)", ({ content, accepts }) => {
+    const message = { role: "user", content: [content], timestamp: 1 };
+    expect([
+      validateWorkerTranscriptCommitParams(transcriptCommit({ messages: [message] })),
+      validateWorkerInferenceStartParams({ ...inferenceStart, context: { messages: [message] } }),
+      Value.Check(WorkerGatewayToolResultSchema, { content: [content] }),
+    ]).toEqual(accepts);
+  });
+
+  it("retains the inference timestamp ceiling without changing transcript admission", () => {
+    const message = {
+      role: "user",
+      content: [{ type: "text", text: "ok" }],
+      timestamp: Number.MAX_SAFE_INTEGER + 1,
+    };
+    expect(validateWorkerTranscriptCommitParams(transcriptCommit({ messages: [message] }))).toBe(
+      true,
+    );
+    expect(
+      validateWorkerInferenceStartParams({ ...inferenceStart, context: { messages: [message] } }),
+    ).toBe(false);
   });
 });

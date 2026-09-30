@@ -18,15 +18,21 @@ export function computeBackoffSchedule(scheduleMs: readonly number[], attempt: n
   return attempt <= 0 ? 0 : (scheduleMs[index] ?? 0);
 }
 
+export function resolveSleepDelayMs(ms: number): number {
+  return Number.isFinite(ms) && ms > 0
+    ? Math.min(Math.max(Math.floor(ms), 1), MAX_TIMER_TIMEOUT_MS)
+    : 0;
+}
+
 export async function sleepWithAbort(
   ms: number,
   abortSignal?: AbortSignal,
   options: { ref?: boolean } = {},
 ): Promise<void> {
-  if (!Number.isFinite(ms) || ms <= 0) {
+  const delayMs = resolveSleepDelayMs(ms);
+  if (delayMs === 0) {
     return;
   }
-  const delayMs = Math.min(Math.max(Math.floor(ms), 1), MAX_TIMER_TIMEOUT_MS);
   await new Promise<void>((resolve, reject) => {
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -159,30 +165,35 @@ const DEFAULT_RETRY_CONFIG: Required<RetryConfig> = {
   jitter: 0,
 };
 
-const defaultSleep = (ms: number) =>
-  new Promise<void>((resolve) => {
-    setTimeout(resolve, ms);
-  });
-
-function asFiniteNumber(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
+const defaultSleep = async (ms: number): Promise<void> => {
+  let remainingMs = ms;
+  // Native timers overflow to a near-immediate wake; split rather than shorten a long wait.
+  do {
+    const delayMs = Math.min(remainingMs, MAX_TIMER_TIMEOUT_MS);
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, delayMs);
+    });
+    remainingMs -= delayMs;
+  } while (remainingMs > 0);
+};
 
 function clampNumber(value: unknown, fallback: number, min?: number, max?: number): number {
-  const next = asFiniteNumber(value);
-  if (next === undefined) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
     return fallback;
   }
-  return Math.min(Math.max(next, min ?? Number.NEGATIVE_INFINITY), max ?? Number.POSITIVE_INFINITY);
+  return Math.min(
+    Math.max(value, min ?? Number.NEGATIVE_INFINITY),
+    max ?? Number.POSITIVE_INFINITY,
+  );
 }
 
 function resolveAttemptCount(value: unknown, fallback: number): number {
-  return Math.max(1, Math.round(asFiniteNumber(value) ?? fallback));
+  return Math.max(1, Math.round(clampNumber(value, fallback)));
 }
 
 function resolveRetryDelayMs(value: number): number {
   const finite =
-    value === Number.POSITIVE_INFINITY ? MAX_TIMER_TIMEOUT_MS : (asFiniteNumber(value) ?? 0);
+    value === Number.POSITIVE_INFINITY ? MAX_TIMER_TIMEOUT_MS : Number.isFinite(value) ? value : 0;
   return Math.min(Math.max(Math.round(finite), 0), MAX_TIMER_TIMEOUT_MS);
 }
 
@@ -190,8 +201,9 @@ function resolveJitterConfig(value: unknown, fallback: number | "full"): number 
   if (value === "full") {
     return "full";
   }
-  const fraction = asFiniteNumber(value);
-  return fraction === undefined ? fallback : Math.min(Math.max(fraction, 0), 1);
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.min(Math.max(value, 0), 1)
+    : fallback;
 }
 
 export function resolveRetryConfig(

@@ -16,7 +16,6 @@ import {
   buildNodeRuntimeSummary,
   buildNodeRuntimeWarnings,
   collectNodeRuntimeDiagnostics,
-  detectVersionManagerName,
   type NodeRuntimeDiagnostics,
 } from "./doctor-node-runtime.js";
 
@@ -32,80 +31,18 @@ function makeDiag(overrides: Partial<NodeRuntimeDiagnostics> = {}): NodeRuntimeD
   };
 }
 
-describe("detectVersionManagerName", () => {
-  it("returns null for empty environment and null path", () => {
-    expect(detectVersionManagerName({}, null)).toBe(null);
-  });
-
-  it("returns null for a plain system install path", () => {
-    expect(detectVersionManagerName({}, "/usr/bin/node")).toBe(null);
-  });
-
-  it("detects nvm via NVM_DIR", () => {
-    expect(detectVersionManagerName({ NVM_DIR: "/home/test/.nvm" }, "/usr/bin/node")).toBe("nvm");
-  });
-
-  it("detects nvm via execPath", () => {
-    expect(detectVersionManagerName({}, "/home/test/.nvm/versions/node/v24.15.0/bin/node")).toBe(
-      "nvm",
-    );
-  });
-
-  it("detects fnm via execPath", () => {
-    expect(
-      detectVersionManagerName(
-        {},
-        "/home/test/.local/share/fnm/node-versions/v24.15.0/installation/bin/node",
-      ),
-    ).toBe("fnm");
-  });
-
-  it("detects volta via execPath", () => {
-    expect(
-      detectVersionManagerName({}, "/home/test/.volta/tools/image/node/24.15.0/bin/node"),
-    ).toBe("volta");
-  });
-
-  it("detects asdf via execPath", () => {
-    expect(detectVersionManagerName({}, "/home/test/.asdf/installs/nodejs/24.15.0/bin/node")).toBe(
-      "asdf",
-    );
-  });
-
-  it("detects n via execPath", () => {
-    expect(detectVersionManagerName({}, "/usr/local/n/versions/node/24.15.0/bin/node")).toBe("n");
-  });
-
-  it("detects nodenv via execPath", () => {
-    expect(detectVersionManagerName({}, "/home/test/.nodenv/versions/24.15.0/bin/node")).toBe(
-      "nodenv",
-    );
-  });
-
-  it("detects nodebrew via execPath", () => {
-    expect(detectVersionManagerName({}, "/home/test/.nodebrew/node/v24.15.0/bin/node")).toBe(
-      "nodebrew",
-    );
-  });
-
-  it("detects nvs via execPath", () => {
-    expect(detectVersionManagerName({}, "/home/test/.nvs/node/24.15.0/x64/bin/node")).toBe("nvs");
-  });
-
-  it("detects managers on Windows-style backslash paths regardless of casing", () => {
-    expect(
-      detectVersionManagerName({}, "C:\\Users\\Test\\.NVM\\versions\\node\\v24.15.0\\node.exe"),
-    ).toBe("nvm");
-    expect(
-      detectVersionManagerName(
-        {},
-        "c:\\users\\test\\.volta\\tools\\image\\node\\24.15.0\\node.exe",
-      ),
-    ).toBe("volta");
-  });
-});
-
 describe("collectNodeRuntimeDiagnostics", () => {
+  it("reports the selected system Node despite an installed nvm", () => {
+    const diag = collectNodeRuntimeDiagnostics(
+      { NVM_DIR: "/home/test/.nvm" },
+      "/usr/bin/node",
+      "v24.15.0",
+    );
+    expect(diag.versionManaged).toBe(false);
+    expect(diag.versionManagerHint).toBe(null);
+    expect(buildNodeRuntimeSummary(diag)).toBe("Node 24.15.0 · system install");
+  });
+
   it("collects an nvm-managed runtime", () => {
     const diag = collectNodeRuntimeDiagnostics(
       {},
@@ -116,6 +53,38 @@ describe("collectNodeRuntimeDiagnostics", () => {
     expect(diag.major).toBe(24);
     expect(diag.versionManaged).toBe(true);
     expect(diag.versionManagerHint).toBe("nvm");
+  });
+
+  it("reports the selected fnm runtime despite an installed nvm", () => {
+    const diag = collectNodeRuntimeDiagnostics(
+      { NVM_DIR: "/home/test/.nvm", FNM_DIR: "/opt/fnm" },
+      "/opt/fnm/node-versions/v24.15.0/installation/bin/node",
+      "v24.15.0",
+    );
+    expect(diag.versionManaged).toBe(true);
+    expect(diag.versionManagerHint).toBe("fnm");
+    expect(buildNodeRuntimeSummary(diag)).toBe("Node 24.15.0 · via fnm");
+  });
+
+  it("classifies Windows executable paths with mixed casing", () => {
+    const diag = collectNodeRuntimeDiagnostics(
+      {},
+      "C:\\Users\\Test\\.NVM\\versions\\node\\v24.15.0\\node.exe",
+      "v24.15.0",
+    );
+    expect(diag.versionManaged).toBe(true);
+    expect(diag.versionManagerHint).toBe("nvm");
+  });
+
+  it("renders other managed runtimes without inventing a manager name", () => {
+    const diag = collectNodeRuntimeDiagnostics(
+      {},
+      "/home/test/.asdf/installs/nodejs/24.15.0/bin/node",
+      "v24.15.0",
+    );
+    expect(diag.versionManaged).toBe(true);
+    expect(diag.versionManagerHint).toBe(null);
+    expect(buildNodeRuntimeSummary(diag)).toBe("Node 24.15.0 · version-managed");
   });
 
   it("degrades gracefully for an unknown runtime shape", () => {

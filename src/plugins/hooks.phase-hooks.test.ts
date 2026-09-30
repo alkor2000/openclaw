@@ -1,10 +1,10 @@
-/** Tests phase-scoped plugin hooks and hook registration ordering. */
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { applyEmbeddedAttemptToolsAllow } from "../agents/embedded-agent-runner/run/attempt-tool-construction-plan.js";
 import { readToolAllowlistIntersection } from "../agents/tool-policy.js";
 import { createHookRunner } from "./hooks.js";
 import { addStaticTestHooks } from "./hooks.test-fixtures.js";
-import { createEmptyPluginRegistry, type PluginRegistry } from "./registry.js";
+import { createEmptyPluginRegistry } from "./registry-empty.js";
+import type { PluginRegistry } from "./registry.js";
 import type {
   PluginHookBeforeModelResolveResult,
   PluginHookBeforePromptBuildResult,
@@ -34,19 +34,6 @@ describe("phase hooks merger", () => {
       return await runner.runBeforeModelResolve({ prompt: "test" }, {});
     }
     return await runner.runBeforePromptBuild({ prompt: "test", messages: [] }, {});
-  }
-
-  async function expectPhaseHookMerge(params: {
-    hookName: "before_model_resolve" | "before_prompt_build";
-    hooks: ReadonlyArray<{
-      pluginId: string;
-      result: PluginHookBeforeModelResolveResult | PluginHookBeforePromptBuildResult;
-      priority?: number;
-    }>;
-    expected: PluginHookBeforeModelResolveResult | PluginHookBeforePromptBuildResult;
-  }) {
-    const result = await runPhaseHook(params);
-    expect(result).toStrictEqual(params.expected);
   }
 
   it.each([
@@ -86,9 +73,6 @@ describe("phase hooks merger", () => {
       ],
       expected: {
         prependContext: "context A\n\ncontext B",
-        appendContext: undefined,
-        prependSystemContext: undefined,
-        appendSystemContext: undefined,
         systemPrompt: "system A",
       },
     },
@@ -114,9 +98,6 @@ describe("phase hooks merger", () => {
         },
       ],
       expected: {
-        systemPrompt: undefined,
-        prependContext: undefined,
-        appendContext: undefined,
         prependSystemContext: "prepend A\n\nprepend B",
         appendSystemContext: "append A\n\nappend B",
       },
@@ -137,11 +118,6 @@ describe("phase hooks merger", () => {
         },
       ],
       expected: {
-        systemPrompt: undefined,
-        prependContext: undefined,
-        appendContext: undefined,
-        prependSystemContext: undefined,
-        appendSystemContext: undefined,
         toolsAllow: ["read", "web_search"],
       },
     },
@@ -161,11 +137,6 @@ describe("phase hooks merger", () => {
         },
       ],
       expected: {
-        systemPrompt: undefined,
-        prependContext: undefined,
-        appendContext: undefined,
-        prependSystemContext: undefined,
-        appendSystemContext: undefined,
         toolsAllow: [],
       },
     },
@@ -179,11 +150,6 @@ describe("phase hooks merger", () => {
         },
       ],
       expected: {
-        systemPrompt: undefined,
-        prependContext: undefined,
-        appendContext: undefined,
-        prependSystemContext: undefined,
-        appendSystemContext: undefined,
         toolsAllow: [],
       },
     },
@@ -197,16 +163,23 @@ describe("phase hooks merger", () => {
         },
       ],
       expected: {
-        systemPrompt: undefined,
-        prependContext: undefined,
-        appendContext: undefined,
-        prependSystemContext: undefined,
-        appendSystemContext: undefined,
         toolsAllow: [],
       },
     },
   ] as const)("$name", async ({ hookName, hooks, expected }) => {
-    await expectPhaseHookMerge({ hookName, hooks, expected });
+    const result = await runPhaseHook({ hookName, hooks });
+    expect(result).toStrictEqual(
+      hookName === "before_model_resolve"
+        ? expected
+        : {
+            systemPrompt: undefined,
+            prependContext: undefined,
+            appendContext: undefined,
+            prependSystemContext: undefined,
+            appendSystemContext: undefined,
+            ...expected,
+          },
+    );
   });
 
   it("accepts a frozen toolsAllow returned by a plugin", async () => {
@@ -241,5 +214,136 @@ describe("phase hooks merger", () => {
         toolsAllow,
       ),
     ).toEqual([{ name: "web_search" }]);
+  });
+
+  it("dispatches authorized enrichment only after the host supplies the final tool surface", async () => {
+    const enrichment = vi.fn((_event, ctx) => {
+      expect(ctx.toolAuthority?.allows("memory_search")).toBe(false);
+      expect(ctx.toolAuthority?.allows("message")).toBe(true);
+      return { prependContext: "authorized context", systemPrompt: "ignored override" };
+    });
+    registry.typedHooks.push(
+      {
+        pluginId: "restrictor",
+        hookName: "before_prompt_build",
+        handler: () => ({ toolsAllow: ["message"] }),
+        source: "test",
+      },
+      {
+        pluginId: "enricher",
+        hookName: "before_prompt_build",
+        handler: enrichment,
+        requiresToolAuthority: true,
+        source: "test",
+      },
+    );
+    const runner = createHookRunner(registry);
+    const event = { prompt: "test", messages: [] };
+
+    await expect(runner.runBeforePromptBuild(event, {})).resolves.toMatchObject({
+      toolsAllow: ["message"],
+    });
+    expect(enrichment).not.toHaveBeenCalled();
+
+    const result = await runner.runAuthorizedPromptBuild(
+      event,
+      {},
+      {
+        toolAuthorityFingerprint: "turn-authority",
+        activeToolNames: ["message"],
+        assertHostActive: () => undefined,
+      },
+    );
+    const retainedAuthority = enrichment.mock.calls[0]?.[1].toolAuthority;
+
+    expect(result).toEqual({ prependContext: "authorized context" });
+    expect(() => retainedAuthority?.assertActive()).toThrow("no longer active");
+  });
+
+  it("rejects enrichment that finishes after the host authority closes", async () => {
+    let releaseEnrichment: () => void = () => {
+      throw new Error("enrichment gate was not initialized");
+    };
+    const enrichmentGate = new Promise<void>((resolve) => {
+      releaseEnrichment = resolve;
+    });
+    const enrichment = vi.fn(async () => {
+      await enrichmentGate;
+      return { prependContext: "stale authorized context" };
+    });
+    registry.typedHooks.push({
+      pluginId: "enricher",
+      hookName: "before_prompt_build",
+      handler: enrichment,
+      requiresToolAuthority: true,
+      source: "test",
+    });
+    const runner = createHookRunner(registry);
+    let hostActive = true;
+    const run = runner.runAuthorizedPromptBuild(
+      { prompt: "test", messages: [] },
+      {},
+      {
+        toolAuthorityFingerprint: "turn-authority",
+        activeToolNames: ["memory_search"],
+        assertHostActive: () => {
+          if (!hostActive) {
+            throw new Error("host turn authority is no longer active");
+          }
+        },
+      },
+    );
+    await vi.waitFor(() => {
+      expect(enrichment).toHaveBeenCalledOnce();
+    });
+
+    hostActive = false;
+    releaseEnrichment();
+
+    await expect(run).rejects.toThrow("host turn authority is no longer active");
+  });
+
+  it("does not start a later authorized handler after host authority closes", async () => {
+    let hostActive = true;
+    const firstEnrichment = vi.fn(async () => {
+      hostActive = false;
+      return { prependContext: "first context" };
+    });
+    const laterEnrichment = vi.fn(() => ({ prependContext: "stale later context" }));
+    registry.typedHooks.push(
+      {
+        pluginId: "first-enricher",
+        hookName: "before_prompt_build",
+        handler: firstEnrichment,
+        requiresToolAuthority: true,
+        source: "test",
+      },
+      {
+        pluginId: "later-enricher",
+        hookName: "before_prompt_build",
+        handler: laterEnrichment,
+        requiresToolAuthority: true,
+        source: "test",
+      },
+    );
+    const runner = createHookRunner(registry);
+
+    await expect(
+      runner.runAuthorizedPromptBuild(
+        { prompt: "test", messages: [] },
+        {},
+        {
+          toolAuthorityFingerprint: "turn-authority",
+          activeToolNames: ["memory_search"],
+          assertHostActive: () => {
+            if (!hostActive) {
+              throw new Error("host turn authority is no longer active");
+            }
+          },
+        },
+      ),
+    ).rejects.toThrow("host turn authority is no longer active");
+    expect(firstEnrichment).toHaveBeenCalledOnce();
+    expect(laterEnrichment).not.toHaveBeenCalled();
   });
 });

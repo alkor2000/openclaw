@@ -33,10 +33,13 @@ import {
   collectDisabledCodexPluginRouteIssues,
   enableCodexPluginForRequiredRoutes,
 } from "./codex-route-config-scan.js";
-import { parseModelRef } from "./codex-route-model-ref.js";
+import {
+  isBlockedLegacyCodexModelRef,
+  parseCodexRouteModelRef,
+  toCanonicalOpenAIModelRef,
+} from "./codex-route-model-ref.js";
 import { maybeRepairCodexSessionRoutes } from "./codex-route-session-repair.js";
 import type {
-  CodexRouteHit,
   CodexRuntimeRouteHit,
   LegacyLosslessCompactionConfig,
   UnsupportedCodexCompactionOverride,
@@ -45,9 +48,23 @@ import {
   collectBlockedLegacyOpenAICodexProviderPlan,
   type BlockedLegacyOpenAICodexProviderPlan,
 } from "./legacy-config-migrations.runtime.models.js";
+import { rewriteKnownModelRefs } from "./legacy-config-migrations.runtime.models.refs.js";
+import { migrateLegacyRuntimeModelRef } from "./legacy-runtime-model-providers.js";
 
-function formatCodexRouteChange(hit: CodexRouteHit): string {
-  return `${hit.path}: ${hit.model} -> ${hit.canonicalModel}.`;
+export function resolveKnownModelRefMigrationTarget(
+  cfg: OpenClawConfig,
+  ref: string,
+): string | undefined {
+  const blockedModelIdentities = new Set(
+    collectBlockedLegacyOpenAICodexProviderPlan(cfg).blockedModelIdentities,
+  );
+  if (isBlockedLegacyCodexModelRef({ modelRef: ref, blockedModelIdentities })) {
+    return undefined;
+  }
+  const providerRef =
+    migrateLegacyRuntimeModelRef(ref)?.ref ?? toCanonicalOpenAIModelRef(ref) ?? ref;
+  const migrated = rewriteKnownModelRefs(providerRef, "model", []).value;
+  return typeof migrated === "string" && migrated !== ref ? migrated : undefined;
 }
 
 function formatUnsupportedCompactionWarning(params: {
@@ -152,7 +169,7 @@ function ownValues(record: Record<string, unknown>, keys: readonly string[]): un
 }
 
 function modelUsesCodexForEveryAgent(cfg: OpenClawConfig, modelRef: string): boolean {
-  const parsed = parseModelRef(modelRef);
+  const parsed = parseCodexRouteModelRef(modelRef);
   if (!parsed || parsed.modelId === "*") {
     return false;
   }
@@ -179,7 +196,7 @@ function collectCodexModelParamHits(
     listMutableCodexRouteAgentEntries(cfg).map(({ agentId, path }) => [agentId, path]),
   );
   for (const route of collectCodexRuntimeRouteHits(cfg, env)) {
-    const parsed = parseModelRef(route.canonicalModel);
+    const parsed = parseCodexRouteModelRef(route.canonicalModel);
     if (!parsed || parsed.provider !== "openai") {
       continue;
     }
@@ -484,27 +501,17 @@ export function maybeRepairCodexRoutes(params: {
     (hit) => hit.removable,
   );
   if (
-    hits.length === 0 &&
-    disabledCodexPluginHits.length === 0 &&
-    unsupportedCompactionOverrides.length === 0 &&
-    legacyLosslessCompactionConfigs.length === 0 &&
-    !hasRemovableServiceTier &&
-    !blockedProviderPlan.warning
+    !params.shouldRepair ||
+    (hits.length === 0 &&
+      disabledCodexPluginHits.length === 0 &&
+      unsupportedCompactionOverrides.length === 0 &&
+      legacyLosslessCompactionConfigs.length === 0 &&
+      !hasRemovableServiceTier &&
+      !blockedProviderPlan.warning)
   ) {
     return {
       cfg: params.cfg,
       warnings: collectCodexRouteWarnings({ cfg: params.cfg, env, blockedProviderPlan }),
-      changes: [],
-    };
-  }
-  if (!params.shouldRepair) {
-    return {
-      cfg: params.cfg,
-      warnings: collectCodexRouteWarnings({
-        cfg: params.cfg,
-        env,
-        blockedProviderPlan,
-      }),
       changes: [],
     };
   }
@@ -527,7 +534,7 @@ export function maybeRepairCodexRoutes(params: {
     repaired.changes.length > 0
       ? [
           `Repaired Codex model routes:\n${repaired.changes
-            .map((hit) => `- ${formatCodexRouteChange(hit)}`)
+            .map((hit) => `- ${hit.path}: ${hit.model} -> ${hit.canonicalModel}.`)
             .join("\n")}`,
         ]
       : [];

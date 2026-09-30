@@ -1,30 +1,32 @@
-// Vydra plugin module implements shared behavior.
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { resolveGeneratedMediaMaxBytes } from "openclaw/plugin-sdk/media-generation-runtime";
 import { extensionForMime, type MediaKind } from "openclaw/plugin-sdk/media-mime";
 import { resolveApiKeyForProvider } from "openclaw/plugin-sdk/provider-auth-runtime";
 import {
   assertOkOrThrowHttpError,
   createProviderOperationDeadline,
+  createProviderOperationTimeoutError,
   createProviderOperationTimeoutResolver,
   fetchWithTimeoutGuarded,
   pollProviderOperationJson,
+  postJsonRequest,
+  readProviderBinaryResponse,
+  readProviderJsonResponse,
   resolveProviderHttpRequestConfig,
+  resolveProviderOperationTimeoutMs,
   sanitizeConfiguredModelProviderRequest,
   type ProviderOperationDeadline,
   type ProviderOperationTimeoutMs,
 } from "openclaw/plugin-sdk/provider-http";
-import { readResponseWithLimit } from "openclaw/plugin-sdk/response-limit-runtime";
 import type { SsrFPolicy } from "openclaw/plugin-sdk/ssrf-runtime";
 import {
+  asOptionalRecord,
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { DEFAULT_VYDRA_BASE_URL, normalizeVydraBaseUrl } from "./defaults.js";
 
-export const DEFAULT_VYDRA_BASE_URL = "https://www.vydra.ai/api/v1";
-export const DEFAULT_VYDRA_IMAGE_MODEL = "grok-imagine";
-export const DEFAULT_VYDRA_VIDEO_MODEL = "veo3";
-export const DEFAULT_VYDRA_SPEECH_MODEL = "elevenlabs/tts";
-export const DEFAULT_VYDRA_VOICE_ID = "21m00Tcm4TlvDq8ikWAM";
+export { DEFAULT_VYDRA_IMAGE_MODEL, DEFAULT_VYDRA_VIDEO_MODEL } from "./defaults.js";
 const DEFAULT_HTTP_TIMEOUT_MS = 120_000;
 const POLL_INTERVAL_MS = 2_500;
 const MAX_POLL_ATTEMPTS = 120;
@@ -40,25 +42,11 @@ type VydraRequestPolicy = Pick<
 
 type VydraMediaKind = Extract<MediaKind, "audio" | "image" | "video">;
 
-type VydraJobPayload = {
-  id?: string;
-  jobId?: string;
-  status?: string;
-  message?: string;
-  error?: string | { message?: string; detail?: string } | null;
-};
-
-function asObject(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
 function addUrlValue(value: unknown, urls: Set<string>): void {
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (/^https?:\/\//iu.test(trimmed)) {
-      urls.add(trimmed);
+  const normalized = normalizeOptionalString(value);
+  if (normalized !== undefined) {
+    if (/^https?:\/\//iu.test(normalized)) {
+      urls.add(normalized);
     }
     return;
   }
@@ -69,39 +57,7 @@ function addUrlValue(value: unknown, urls: Set<string>): void {
   }
 }
 
-export const trimToUndefined = normalizeOptionalString;
-
-export function normalizeVydraBaseUrl(value: string | undefined): string {
-  const fallback = DEFAULT_VYDRA_BASE_URL;
-  const trimmed = trimToUndefined(value);
-  if (!trimmed) {
-    return fallback;
-  }
-  try {
-    const url = new URL(trimmed);
-    if (url.hostname === "vydra.ai") {
-      url.hostname = "www.vydra.ai";
-    }
-    const pathname = url.pathname.replace(/\/+$/u, "");
-    if (!pathname) {
-      url.pathname = "/api/v1";
-    } else {
-      url.pathname = pathname;
-    }
-    return url.toString().replace(/\/$/u, "");
-  } catch {
-    return fallback;
-  }
-}
-
-function resolveVydraBaseUrlFromConfig(cfg: unknown): string {
-  const models = asObject(asObject(cfg)?.models);
-  const providers = asObject(models?.providers);
-  const vydra = asObject(providers?.vydra);
-  return normalizeVydraBaseUrl(trimToUndefined(vydra?.baseUrl));
-}
-
-export async function resolveVydraRequestContext(params: {
+async function resolveVydraRequestContext(params: {
   cfg: OpenClawConfig;
   agentDir?: string;
   authStore?: VydraAuthStore;
@@ -125,7 +81,7 @@ export async function resolveVydraRequestContext(params: {
   const providerConfig = params.cfg.models?.providers?.vydra;
   const { baseUrl, allowPrivateNetwork, headers, dispatcherPolicy } =
     resolveProviderHttpRequestConfig({
-      baseUrl: resolveVydraBaseUrlFromConfig(params.cfg),
+      baseUrl: normalizeVydraBaseUrl(providerConfig?.baseUrl),
       defaultBaseUrl: DEFAULT_VYDRA_BASE_URL,
       defaultHeaders: {
         Authorization: `Bearer ${auth.apiKey}`,
@@ -149,38 +105,41 @@ export async function resolveVydraRequestContext(params: {
   };
 }
 
-export function resolveVydraResponseJobId(payload: unknown): string | undefined {
-  const object = asObject(payload) as VydraJobPayload | undefined;
-  return trimToUndefined(object?.jobId) ?? trimToUndefined(object?.id);
+function resolveVydraResponseJobId(payload: unknown): string | undefined {
+  const object = asOptionalRecord(payload);
+  return normalizeOptionalString(object?.jobId) ?? normalizeOptionalString(object?.id);
 }
 
-export function resolveVydraResponseStatus(payload: unknown): string | undefined {
-  return normalizeOptionalLowercaseString(trimToUndefined(asObject(payload)?.status));
+function resolveVydraResponseStatus(payload: unknown): string | undefined {
+  return normalizeOptionalLowercaseString(asOptionalRecord(payload)?.status);
 }
 
 function resolveVydraErrorMessage(payload: unknown): string | undefined {
-  const object = asObject(payload) as VydraJobPayload | undefined;
+  const object = asOptionalRecord(payload);
   const error = object?.error;
   if (typeof error === "string" && error.trim()) {
     return error.trim();
   }
-  const errorObject = asObject(error);
+  const errorObject = asOptionalRecord(error);
   return (
-    trimToUndefined(errorObject?.message) ??
-    trimToUndefined(errorObject?.detail) ??
-    trimToUndefined(object?.message)
+    normalizeOptionalString(errorObject?.message) ??
+    normalizeOptionalString(errorObject?.detail) ??
+    normalizeOptionalString(object?.message)
   );
 }
 
 export function extractVydraResultUrls(payload: unknown, kind: VydraMediaKind): string[] {
   const urls = new Set<string>();
-  const preferredKeys =
-    kind === "audio"
-      ? ["audioUrl", "audioUrls"]
-      : kind === "image"
-        ? ["imageUrl", "imageUrls"]
-        : ["videoUrl", "videoUrls"];
-  const sharedKeys = ["resultUrl", "resultUrls", "outputUrl", "outputUrls", "url", "urls"];
+  const urlKeys = [
+    `${kind}Url`,
+    `${kind}Urls`,
+    "resultUrl",
+    "resultUrls",
+    "outputUrl",
+    "outputUrls",
+    "url",
+    "urls",
+  ];
   const recurseKeys = ["output", "outputs", "result", "results", "data", "asset", "assets"];
 
   const visit = (value: unknown, depth = 0) => {
@@ -193,11 +152,11 @@ export function extractVydraResultUrls(payload: unknown, kind: VydraMediaKind): 
       }
       return;
     }
-    const object = asObject(value);
+    const object = asOptionalRecord(value);
     if (!object) {
       return;
     }
-    for (const key of [...preferredKeys, ...sharedKeys]) {
+    for (const key of urlKeys) {
       addUrlValue(object[key], urls);
     }
     for (const key of recurseKeys) {
@@ -224,12 +183,6 @@ function resolveVydraHttpTimeoutMs(timeoutMs: ProviderOperationTimeoutMs | undef
     return DEFAULT_HTTP_TIMEOUT_MS;
   }
   return resolved;
-}
-
-function createVydraTimeoutError(deadline: ProviderOperationDeadline): Error {
-  const timeoutLabel =
-    typeof deadline.timeoutMs === "number" ? ` after ${deadline.timeoutMs}ms` : "";
-  return new Error(`${deadline.label} timed out${timeoutLabel}`);
 }
 
 function resolveVydraGuardedRequestOptions(
@@ -287,87 +240,42 @@ export async function downloadVydraAsset(params: {
     resolveVydraGuardedRequestOptions(params.requestPolicy),
   );
   try {
-    try {
-      await assertOkOrThrowHttpError(result.response, `Vydra ${params.kind} download failed`, {
-        bodyTimeoutMs: resolveTimeoutMs,
-        onBodyTimeout: () => createVydraTimeoutError(deadline),
-      });
-      const mimeType =
-        result.response.headers.get("content-type")?.trim() ||
-        (params.kind === "image"
-          ? "image/png"
-          : params.kind === "audio"
-            ? "audio/mpeg"
-            : "video/mp4");
-      const buffer = await readResponseWithLimit(result.response, params.maxBytes, {
-        timeoutMs: resolveTimeoutMs,
-        onTimeout: () => createVydraTimeoutError(deadline),
-        onOverflow: ({ maxBytes }) =>
-          new Error(`Vydra ${params.kind} download exceeds ${maxBytes} bytes`),
-      });
-      const extension = resolveVydraFileExtension(params.kind, mimeType);
-      const fileStem =
-        params.kind === "image" ? "image" : params.kind === "audio" ? "audio" : "video";
-      return {
-        buffer,
-        mimeType,
-        fileName: `${fileStem}-1.${extension}`,
-      };
-    } catch (error) {
-      // The guarded request signal remains active through body consumption and
-      // can win the same absolute-deadline race. Keep timeout precedence stable.
-      if (typeof deadline.deadlineAtMs === "number" && Date.now() >= deadline.deadlineAtMs) {
-        throw createVydraTimeoutError(deadline);
-      }
-      throw error;
+    await assertOkOrThrowHttpError(result.response, `Vydra ${params.kind} download failed`, {
+      bodyTimeoutMs: resolveTimeoutMs,
+      onBodyTimeout: () => createProviderOperationTimeoutError(deadline),
+    });
+    const mimeType =
+      result.response.headers.get("content-type")?.trim() ||
+      (params.kind === "image"
+        ? "image/png"
+        : params.kind === "audio"
+          ? "audio/mpeg"
+          : "video/mp4");
+    const buffer = await readProviderBinaryResponse(result.response, deadline.label, params.kind, {
+      maxBytes: params.maxBytes,
+      chunkTimeoutMs: 0,
+      timeoutMs: resolveTimeoutMs,
+      onTimeout: () => createProviderOperationTimeoutError(deadline),
+      onOverflow: ({ maxBytes }) => new Error(`${deadline.label} exceeds ${maxBytes} bytes`),
+    });
+    const extension = resolveVydraFileExtension(params.kind, mimeType);
+    return {
+      buffer,
+      mimeType,
+      fileName: `${params.kind}-1.${extension}`,
+    };
+  } catch (error) {
+    // The request timer can fire before wall-clock time reaches the operation deadline.
+    if (error instanceof Error && error.name === "TimeoutError") {
+      throw createProviderOperationTimeoutError(deadline);
     }
+    throw error;
   } finally {
     await result.release();
   }
 }
 
-async function waitForVydraJob(params: {
-  baseUrl: string;
-  jobId: string;
-  timeoutMs?: number;
-  deadline?: ProviderOperationDeadline;
-  fetchFn: typeof fetch;
-  kind: VydraMediaKind;
-  requestPolicy: VydraRequestPolicy;
-}): Promise<unknown> {
-  const deadline =
-    params.deadline ??
-    createProviderOperationDeadline({
-      timeoutMs: params.timeoutMs,
-      label: `Vydra job ${params.jobId}`,
-    });
-  return await pollProviderOperationJson<unknown>({
-    url: `${params.baseUrl}/jobs/${params.jobId}`,
-    headers: params.requestPolicy.headers,
-    deadline,
-    defaultTimeoutMs: DEFAULT_HTTP_TIMEOUT_MS,
-    fetchFn: params.fetchFn,
-    maxAttempts: MAX_POLL_ATTEMPTS,
-    pollIntervalMs: POLL_INTERVAL_MS,
-    requestFailedMessage: "Vydra job status request failed",
-    timeoutMessage: `Vydra job ${params.jobId} did not finish in time`,
-    allowPrivateNetwork: params.requestPolicy.allowPrivateNetwork,
-    ssrfPolicy: params.requestPolicy.ssrfPolicy,
-    dispatcherPolicy: params.requestPolicy.dispatcherPolicy,
-    auditContext: "vydra-job-status",
-    isComplete: (payload) =>
-      resolveVydraResponseStatus(payload) === "completed" ||
-      extractVydraResultUrls(payload, params.kind).length > 0,
-    getFailureMessage: (payload) => {
-      const status = resolveVydraResponseStatus(payload);
-      return status === "failed" || status === "error" || status === "cancelled"
-        ? (resolveVydraErrorMessage(payload) ?? `Vydra job ${params.jobId} failed`)
-        : undefined;
-    },
-  });
-}
-
-export async function resolveCompletedVydraPayload(params: {
+async function resolveCompletedVydraPayload(params: {
   submitted: unknown;
   baseUrl: string;
   timeoutMs?: number;
@@ -387,13 +295,127 @@ export async function resolveCompletedVydraPayload(params: {
   if (!jobId) {
     throw new Error(resolveVydraErrorMessage(params.submitted) ?? params.missingJobIdMessage);
   }
-  return waitForVydraJob({
-    baseUrl: params.baseUrl,
-    jobId,
-    timeoutMs: params.timeoutMs,
-    ...(params.deadline ? { deadline: params.deadline } : {}),
+  const deadline =
+    params.deadline ??
+    createProviderOperationDeadline({
+      timeoutMs: params.timeoutMs,
+      label: `Vydra job ${jobId}`,
+    });
+  return await pollProviderOperationJson<unknown>({
+    url: `${params.baseUrl}/jobs/${jobId}`,
+    headers: params.requestPolicy.headers,
+    deadline,
+    defaultTimeoutMs: DEFAULT_HTTP_TIMEOUT_MS,
     fetchFn: params.fetchFn,
-    kind: params.kind,
-    requestPolicy: params.requestPolicy,
+    maxAttempts: MAX_POLL_ATTEMPTS,
+    pollIntervalMs: POLL_INTERVAL_MS,
+    requestFailedMessage: "Vydra job status request failed",
+    timeoutMessage: `Vydra job ${jobId} did not finish in time`,
+    allowPrivateNetwork: params.requestPolicy.allowPrivateNetwork,
+    ssrfPolicy: params.requestPolicy.ssrfPolicy,
+    dispatcherPolicy: params.requestPolicy.dispatcherPolicy,
+    auditContext: "vydra-job-status",
+    isComplete: (payload) =>
+      resolveVydraResponseStatus(payload) === "completed" ||
+      extractVydraResultUrls(payload, params.kind).length > 0,
+    getFailureMessage: (payload) => {
+      const status = resolveVydraResponseStatus(payload);
+      return status === "failed" || status === "error" || status === "cancelled"
+        ? (resolveVydraErrorMessage(payload) ?? `Vydra job ${jobId} failed`)
+        : undefined;
+    },
   });
+}
+
+export async function runVydraGeneration(params: {
+  cfg: OpenClawConfig;
+  agentDir?: string;
+  authStore?: VydraAuthStore;
+  body: unknown;
+  deadlineTimeoutMs?: number;
+  kind: Extract<VydraMediaKind, "image" | "video">;
+  model: string;
+  ssrfPolicy?: SsrFPolicy;
+  timeoutMs?: number;
+}): Promise<{
+  asset: { buffer: Buffer; mimeType: string; fileName: string };
+  jobId?: string;
+  resultUrl: string;
+  status: string;
+}> {
+  const { fetchFn, baseUrl, requestPolicy } = await resolveVydraRequestContext({
+    cfg: params.cfg,
+    agentDir: params.agentDir,
+    authStore: params.authStore,
+    capability: params.kind,
+    ...(params.ssrfPolicy ? { ssrfPolicy: params.ssrfPolicy } : {}),
+  });
+  const operationLabel = `Vydra ${params.kind} generation`;
+  const deadline =
+    params.deadlineTimeoutMs === undefined
+      ? undefined
+      : createProviderOperationDeadline({
+          timeoutMs: params.deadlineTimeoutMs,
+          label: operationLabel,
+        });
+  const timeoutMs = deadline
+    ? resolveProviderOperationTimeoutMs({
+        deadline,
+        defaultTimeoutMs: DEFAULT_HTTP_TIMEOUT_MS,
+      })
+    : params.timeoutMs;
+  const { response, release } = await postJsonRequest({
+    url: `${baseUrl}/models/${params.model}`,
+    headers: requestPolicy.headers,
+    body: params.body,
+    timeoutMs,
+    fetchFn,
+    allowPrivateNetwork: requestPolicy.allowPrivateNetwork,
+    ...(requestPolicy.ssrfPolicy ? { ssrfPolicy: requestPolicy.ssrfPolicy } : {}),
+    dispatcherPolicy: requestPolicy.dispatcherPolicy,
+  });
+
+  try {
+    await assertOkOrThrowHttpError(response, `${operationLabel} failed`);
+    const submitted = await readProviderJsonResponse(
+      response,
+      params.kind === "image" ? "vydra.image-generation" : operationLabel,
+    );
+    const completedPayload = await resolveCompletedVydraPayload({
+      submitted,
+      baseUrl,
+      ...(deadline ? { deadline } : { timeoutMs: params.timeoutMs }),
+      fetchFn,
+      kind: params.kind,
+      missingJobIdMessage: `${operationLabel} response missing job id`,
+      requestPolicy,
+    });
+    const resultUrl = extractVydraResultUrls(completedPayload, params.kind)[0];
+    if (!resultUrl) {
+      throw new Error(`${operationLabel} completed without a ${params.kind} URL`);
+    }
+    const asset = await downloadVydraAsset({
+      url: resultUrl,
+      kind: params.kind,
+      timeoutMs: deadline
+        ? createProviderOperationTimeoutResolver({
+            deadline,
+            defaultTimeoutMs: DEFAULT_HTTP_TIMEOUT_MS,
+          })
+        : params.timeoutMs,
+      fetchFn,
+      maxBytes: resolveGeneratedMediaMaxBytes(params.cfg, params.kind),
+      requestPolicy,
+    });
+    const jobId =
+      resolveVydraResponseJobId(completedPayload) ?? resolveVydraResponseJobId(submitted);
+    return {
+      asset,
+      ...(jobId ? { jobId } : {}),
+      resultUrl,
+      status: resolveVydraResponseStatus(completedPayload) ?? "completed",
+    };
+  } finally {
+    await release();
+  }
 }

@@ -7,6 +7,7 @@ import { sanitizeSurrogates } from "@openclaw/ai/internal/shared";
 import { stableStringify } from "@openclaw/normalization-core";
 import { resolveStateDir } from "../config/paths.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { isIncognitoSessionKey } from "../shared/incognito-session-key.js";
 import { resolveUserPath } from "../utils.js";
 import { parseBooleanValue } from "../utils/boolean.js";
 import { safeJsonStringify } from "../utils/safe-json.js";
@@ -40,24 +41,28 @@ type CacheTraceEvent = {
   modelId?: string;
   modelApi?: string | null;
   workspaceDir?: string;
-  prompt?: string;
+  prompt?: unknown;
   system?: unknown;
-  options?: Record<string, unknown>;
-  model?: Record<string, unknown>;
-  messages?: AgentMessage[];
+  options?: unknown;
+  model?: unknown;
+  messages?: unknown;
   messageCount?: number;
   messageRoles?: Array<string | undefined>;
   messageFingerprints?: string[];
   messagesDigest?: string;
   systemDigest?: string;
-  note?: string;
-  error?: string;
+  note?: unknown;
+  error?: unknown;
+};
+
+type CacheTracePayload = Partial<Omit<CacheTraceEvent, "messages">> & {
+  messages?: AgentMessage[];
 };
 
 type CacheTrace = {
   enabled: true;
   filePath: string;
-  recordStage: (stage: CacheTraceStage, payload?: Partial<CacheTraceEvent>) => void;
+  recordStage: (stage: CacheTraceStage, payload?: CacheTracePayload) => void;
   wrapStreamFn: (streamFn: StreamFn) => StreamFn;
 };
 
@@ -138,7 +143,7 @@ function summarizeMessages(messages: AgentMessage[]): {
 /** Create a cache trace recorder when diagnostics config/env enables it. */
 export function createCacheTrace(params: CacheTraceInit): CacheTrace | null {
   const cfg = resolveCacheTraceConfig(params);
-  if (!cfg.enabled) {
+  if (!cfg.enabled || isIncognitoSessionKey(params.sessionKey)) {
     return null;
   }
 

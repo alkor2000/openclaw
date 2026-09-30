@@ -29,4 +29,6 @@ export type LoadedCronStore = {
   configJobIndexes: number[];
   configJobRuntimeEntries: CronConfigJobRuntimeEntry[];
   invalidConfigRows: QuarantinedCronConfigJob[];
+  jobsFingerprint?: string;
+  runtimeFingerprint?: string;
 };

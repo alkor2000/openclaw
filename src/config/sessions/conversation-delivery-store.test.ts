@@ -2,8 +2,11 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { normalizeLegacySessionEntryDelivery } from "../../infra/state-migrations.legacy-session-store.js";
 import { buildConversationRef } from "../../routing/conversation-ref.js";
-import { closeOpenClawAgentDatabasesForTest } from "../../state/openclaw-agent-db.js";
-import { withTempDir } from "../../test-helpers/temp-dir.js";
+import {
+  closeOpenClawAgentDatabasesForTest,
+  openOpenClawAgentDatabase,
+} from "../../state/openclaw-agent-db.js";
+import { withTestDir } from "../../test-helpers/temp-dir.js";
 import type { DeliveryContext } from "../../utils/delivery-context.types.js";
 import {
   beginConversationDeliveryOperation,
@@ -17,9 +20,12 @@ import {
 } from "./conversation-delivery-store.js";
 import { resolveConversation } from "./conversation-registry.js";
 import {
+  applySessionEntryLifecycleMutation,
   deleteSessionEntryLifecycle,
-  upsertSessionEntry as upsertCanonicalSessionEntry,
+  loadSessionEntry,
+  upsertSessionEntryCore as upsertCanonicalSessionEntry,
 } from "./session-accessor.js";
+import { resolveSqliteReadScope, toDatabaseOptions } from "./session-accessor.sqlite-scope.js";
 import type { SessionEntry, SessionOrigin } from "./types.js";
 
 type LegacyDeliveryFixture = Partial<SessionEntry> & {
@@ -38,7 +44,7 @@ async function withConversationStore(
     conversationRef: string;
   }) => Promise<void> | void,
 ): Promise<void> {
-  await withTempDir({ prefix: "openclaw-conversation-delivery-" }, async (dir) => {
+  await withTestDir({ prefix: "openclaw-conversation-delivery-" }, async (dir) => {
     const storePath = path.join(dir, "sessions.json");
     const scope = { agentId: "main", storePath };
     try {
@@ -72,6 +78,51 @@ async function withConversationStore(
 }
 
 describe("conversation delivery store", () => {
+  it("reopens retained delivery receipts", async () => {
+    await withConversationStore(({ scope, conversationRef }) => {
+      beginConversationDeliveryOperation(scope, {
+        operationId: "legacy",
+        operationKind: "send",
+        conversationRef,
+        message: "legacy",
+      });
+      const legacy = markConversationDeliverySent(scope, "legacy", "legacy-message");
+      closeOpenClawAgentDatabasesForTest();
+      expect(getConversationDeliveryOperation(scope, "legacy")).toEqual(legacy);
+    });
+  });
+
+  it("validates retry input without recreating a missing operation", async () => {
+    await withConversationStore(({ scope, conversationRef }) => {
+      const input = {
+        operationKind: "send" as const,
+        conversationRef,
+        sourceSessionKey: "agent:main:telegram:direct:operator",
+        message: "hello",
+      };
+      expect(getConversationDeliveryOperation(scope, "missing", input)).toBeUndefined();
+      expect(getConversationDeliveryOperation(scope, "missing")).toBeUndefined();
+      const begun = beginConversationDeliveryOperation(scope, { operationId: "retry", ...input });
+      expect(
+        getConversationDeliveryOperation(scope, " retry ", {
+          ...input,
+          sourceSessionKey: ` ${input.sourceSessionKey} `,
+        }),
+      ).toEqual(begun.record);
+      for (const changed of [
+        { operationKind: "turn" as const },
+        { conversationRef: "conv_ffffffffffffffffffffffffffffffff" },
+        { sourceSessionKey: "agent:main:other" },
+        { message: "changed" },
+      ]) {
+        expect(() =>
+          getConversationDeliveryOperation(scope, "retry", { ...input, ...changed }),
+        ).toThrow("Conversation delivery operation was reused with different input: retry");
+      }
+      expect(getConversationDeliveryOperation(scope, "retry")).toEqual(begun.record);
+    });
+  });
+
   it("creates idempotent operations and rejects operation-id input reuse", async () => {
     await withConversationStore(({ scope, conversationRef }) => {
       const first = beginConversationDeliveryOperation(scope, {
@@ -211,24 +262,110 @@ describe("conversation delivery store", () => {
     });
   });
 
-  it("retains terminal delivery evidence after its local session binding is pruned", async () => {
+  it("preserves routed session bindings and terminal delivery evidence during maintenance", async () => {
     await withConversationStore(async ({ scope, conversationRef }) => {
+      const sessionKey = "agent:main:reef:direct:peer-agent";
       beginConversationDeliveryOperation(scope, {
-        operationId: "operation-pruned-session",
+        operationId: "operation-preserved-session",
         operationKind: "send",
         conversationRef,
+        sourceSessionKey: sessionKey,
         message: "hello",
       });
-      markConversationDeliverySent(scope, "operation-pruned-session", "platform-pruned");
+      markConversationDeliverySent(scope, "operation-preserved-session", "platform-preserved");
+
+      await applySessionEntryLifecycleMutation({
+        agentId: scope.agentId,
+        storePath: scope.storePath,
+        maintenanceOverride: { mode: "enforce", pruneAfterMs: 1 },
+      });
+
+      expect(resolveConversation(scope, conversationRef)).toMatchObject({
+        conversationRef,
+        channel: "reef",
+        sessionId: "reef-session",
+      });
+      expect(loadSessionEntry({ ...scope, sessionKey })?.archivedAt).toBeUndefined();
+      expect(getConversationDeliveryOperation(scope, "operation-preserved-session")).toMatchObject({
+        channel: "reef",
+        conversationRef,
+        platformMessageId: "platform-preserved",
+        status: "sent",
+      });
+    });
+  });
+
+  it("removes only source-bound delivery evidence and its progress cache when fully deleted", async () => {
+    await withConversationStore(async ({ scope, conversationRef }) => {
+      const sessionKey = "agent:main:reef:direct:peer-agent";
+      const database = openOpenClawAgentDatabase(toDatabaseOptions(resolveSqliteReadScope(scope)));
+      const progressJson = JSON.stringify({ lines: ["Working"] });
+      for (const [operationId, sourceSessionKey] of [
+        ["operation-deleted-session", sessionKey],
+        ["operation-other-session", "agent:main:other"],
+      ] as const) {
+        beginConversationDeliveryOperation(scope, {
+          operationId,
+          operationKind: "send",
+          conversationRef,
+          sourceSessionKey,
+          message: "hello",
+        });
+        markConversationDeliverySent(scope, operationId, "platform-deleted");
+        database.db
+          .prepare(
+            "INSERT INTO cache_entries (scope, key, value_json, updated_at) VALUES ('conversation-progress', ?, ?, 1)",
+          )
+          .run(operationId, progressJson);
+      }
+      database.db
+        .prepare(
+          "INSERT INTO cache_entries (scope, key, value_json, updated_at) VALUES (?, ?, ?, ?)",
+        )
+        .run("unrelated", "operation-deleted-session", "keep", 1);
+
+      await deleteSessionEntryLifecycle({
+        agentId: scope.agentId,
+        archiveTranscript: false,
+        deleteDeliveryArtifacts: true,
+        storePath: scope.storePath,
+        target: { canonicalKey: sessionKey, storeKeys: [sessionKey] },
+      });
+
+      expect(getConversationDeliveryOperation(scope, "operation-deleted-session")).toBeUndefined();
+      expect(
+        database.db
+          .prepare(
+            "SELECT key, value_json FROM cache_entries WHERE scope = 'conversation-progress'",
+          )
+          .all(),
+      ).toEqual([{ key: "operation-other-session", value_json: progressJson }]);
+      expect(
+        database.db
+          .prepare("SELECT value_json FROM cache_entries WHERE scope = ? AND key = ?")
+          .get("unrelated", "operation-deleted-session"),
+      ).toEqual({ value_json: "keep" });
+      expect(resolveConversation(scope, conversationRef)).toMatchObject({ conversationRef });
+    });
+  });
+
+  it("retains source-bound delivery evidence for guarded lifecycle cleanup", async () => {
+    await withConversationStore(async ({ scope, conversationRef }) => {
+      const sessionKey = "agent:main:reef:direct:peer-agent";
+      beginConversationDeliveryOperation(scope, {
+        operationId: "operation-migrated-session",
+        operationKind: "send",
+        conversationRef,
+        sourceSessionKey: sessionKey,
+        message: "hello",
+      });
+      markConversationDeliverySent(scope, "operation-migrated-session", "platform-migrated");
 
       await deleteSessionEntryLifecycle({
         agentId: scope.agentId,
         archiveTranscript: false,
         storePath: scope.storePath,
-        target: {
-          canonicalKey: "agent:main:reef:direct:peer-agent",
-          storeKeys: ["agent:main:reef:direct:peer-agent"],
-        },
+        target: { canonicalKey: sessionKey, storeKeys: [sessionKey] },
       });
 
       expect(resolveConversation(scope, conversationRef)).toMatchObject({
@@ -236,10 +373,11 @@ describe("conversation delivery store", () => {
         channel: "reef",
       });
       expect(resolveConversation(scope, conversationRef)?.sessionId).toBeUndefined();
-      expect(getConversationDeliveryOperation(scope, "operation-pruned-session")).toMatchObject({
-        channel: "reef",
+      expect(loadSessionEntry({ ...scope, sessionKey })).toBeUndefined();
+      expect(getConversationDeliveryOperation(scope, "operation-migrated-session")).toMatchObject({
         conversationRef,
-        platformMessageId: "platform-pruned",
+        platformMessageId: "platform-migrated",
+        sourceSessionKey: sessionKey,
         status: "sent",
       });
     });

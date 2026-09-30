@@ -3,7 +3,7 @@ import type { Model } from "openclaw/plugin-sdk/llm";
 /**
  * Tests provider stream shared helpers and stream hook capture.
  */
-import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
+import { createRequireRecord, createZeroUsageFixture } from "openclaw/plugin-sdk/test-fixtures";
 import { describe, expect, it } from "vitest";
 import { createAssistantMessageEventStream } from "../llm/utils/event-stream.js";
 import {
@@ -28,6 +28,62 @@ function textBlock(text: string) {
   return { type: "text", text };
 }
 
+function completeAssistantMessage(
+  value: Record<string, unknown>,
+  fallbackStopReason = "stop",
+): Record<string, unknown> {
+  const content =
+    typeof value.content === "string"
+      ? [textBlock(value.content)]
+      : Array.isArray(value.content)
+        ? value.content
+        : [];
+  return {
+    ...value,
+    role: "assistant",
+    content,
+    api: "openai-completions",
+    provider: "test",
+    model: "test-model",
+    usage: createZeroUsageFixture(),
+    stopReason: typeof value.stopReason === "string" ? value.stopReason : fallbackStopReason,
+    timestamp: 1,
+  };
+}
+
+function completeStreamEvent(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return value;
+  }
+  const event = value as Record<string, unknown>;
+  const requiresPartial =
+    event.type === "start" ||
+    (typeof event.type === "string" &&
+      event.type !== "text_delta" &&
+      event.type !== "done" &&
+      event.type !== "error");
+  const partial =
+    event.partial && typeof event.partial === "object" && !Array.isArray(event.partial)
+      ? completeAssistantMessage(event.partial as Record<string, unknown>)
+      : requiresPartial
+        ? completeAssistantMessage({ content: [] })
+        : undefined;
+  const message =
+    event.message && typeof event.message === "object" && !Array.isArray(event.message)
+      ? completeAssistantMessage(event.message as Record<string, unknown>, String(event.reason))
+      : undefined;
+  const error =
+    event.error && typeof event.error === "object" && !Array.isArray(event.error)
+      ? completeAssistantMessage(event.error as Record<string, unknown>, "error")
+      : undefined;
+  return {
+    ...event,
+    ...(partial ? { partial } : {}),
+    ...(message ? { message } : {}),
+    ...(error ? { error } : {}),
+  };
+}
+
 function textDelta(delta: string, contentIndex = 0, partial?: Record<string, unknown>) {
   return {
     type: "text_delta",
@@ -45,16 +101,21 @@ function doneEvent(content: AssistantContent, reason = "stop") {
   return {
     type: "done",
     reason,
-    message: { role: "assistant", content, stopReason: reason },
+    message: completeAssistantMessage({ content, stopReason: reason }),
   };
 }
 
 function doneWithoutStopReason(content: string) {
-  return { type: "done", reason: "stop", message: { role: "assistant", content } };
+  return { type: "done", reason: "stop", message: completeAssistantMessage({ content }) };
 }
 
 function errorEvent(error: Record<string, unknown>, partial?: Record<string, unknown>) {
-  return { type: "error", ...(partial ? { partial } : {}), error };
+  return {
+    type: "error",
+    reason: "error",
+    ...(partial ? { partial: completeAssistantMessage(partial, "error") } : {}),
+    error: completeAssistantMessage(error, "error"),
+  };
 }
 
 const lmstudioBinaryModel = {
@@ -80,6 +141,19 @@ const lmstudioBareModel = {
 
 const requireRecord = createRequireRecord("record", "expected-label-record");
 
+const streamTestModel = {
+  id: "test-model",
+  name: "Test Model",
+  api: "openai-completions",
+  provider: "test",
+  baseUrl: "https://example.test/v1",
+  reasoning: false,
+  input: ["text"],
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  contextWindow: 8_192,
+  maxTokens: 1_024,
+} satisfies Model<"openai-completions">;
+
 function messageOf(event: unknown) {
   return requireRecord(requireRecord(event, "done event").message, "done message");
 }
@@ -89,7 +163,7 @@ function createEventStream(events: unknown[]): ReturnType<StreamFn> {
   const stream = output as unknown as { push(event: unknown): void; end(): void };
   queueMicrotask(() => {
     for (const event of events) {
-      stream.push(event);
+      stream.push(completeStreamEvent(event));
     }
     stream.end();
   });
@@ -115,7 +189,7 @@ function createControlledPlainTextToolCallCompatStream() {
   const baseStream: StreamFn = () => source as ReturnType<StreamFn>;
   const wrapped = createPlainTextToolCallCompatWrapper(baseStream);
   const stream = wrapped(
-    { provider: "test", api: "openai-completions", id: "test-model" } as never,
+    streamTestModel,
     {
       messages: [],
       tools: [{ name: "read", description: "Read", parameters: { type: "object" } }],
@@ -135,7 +209,7 @@ async function collectPlainTextToolCallCompatEventsFromStream(
 ): Promise<StreamEvent[]> {
   const wrapped = createPlainTextToolCallCompatWrapper(baseStreamFn);
   const stream = await resolveStream(
-    wrapped({} as never, { tools: toolNames.map((name) => ({ name })) } as never, {}),
+    wrapped(streamTestModel, { tools: toolNames.map((name) => ({ name })) } as never, {}),
   );
   const output: StreamEvent[] = [];
   for await (const event of stream as AsyncIterable<unknown>) {
@@ -171,7 +245,7 @@ async function collectPlainTextToolCallCompatEventsAndResult(events: unknown[]) 
     return outputEvents;
   })();
   for (const event of events) {
-    source.push(event as never);
+    source.push(completeStreamEvent(event) as never);
   }
   source.end();
   return {
@@ -217,40 +291,20 @@ describe("defaultToolStreamExtraParams", () => {
 });
 
 describe("isOpenAICompatibleThinkingEnabled", () => {
-  it("uses explicit request reasoning before session thinking level", () => {
-    expect(
-      isOpenAICompatibleThinkingEnabled({
-        thinkingLevel: "high",
-        options: { reasoning: "none" } as never,
-      }),
-    ).toBe(false);
-    expect(
-      isOpenAICompatibleThinkingEnabled({
-        thinkingLevel: "off",
-        options: { reasoningEffort: "medium" } as never,
-      }),
-    ).toBe(true);
-  });
-
-  it("treats off and none as disabled", () => {
-    expect(isOpenAICompatibleThinkingEnabled({ thinkingLevel: "off", options: {} })).toBe(false);
-    expect(
-      isOpenAICompatibleThinkingEnabled({
-        thinkingLevel: "high",
-        options: { reasoning: "none" } as never,
-      }),
-    ).toBe(false);
-  });
-
-  it("defaults to enabled for missing or non-string values", () => {
-    expect(isOpenAICompatibleThinkingEnabled({ thinkingLevel: undefined, options: {} })).toBe(true);
-    expect(
-      isOpenAICompatibleThinkingEnabled({
-        thinkingLevel: "off",
-        options: { reasoning: { effort: "off" } } as never,
-      }),
-    ).toBe(true);
-  });
+  it.each([
+    { thinkingLevel: "high", options: { reasoning: "none" }, enabled: false },
+    { thinkingLevel: "off", options: { reasoningEffort: "medium" }, enabled: true },
+    { thinkingLevel: "off", options: {}, enabled: false },
+    { thinkingLevel: undefined, options: {}, enabled: true },
+    { thinkingLevel: "off", options: { reasoning: { effort: "off" } }, enabled: true },
+  ] as const)(
+    "resolves thinking $thinkingLevel with request $options to $enabled",
+    ({ thinkingLevel, options, enabled }) => {
+      expect(isOpenAICompatibleThinkingEnabled({ thinkingLevel, options: options as never })).toBe(
+        enabled,
+      );
+    },
+  );
 });
 
 describe("setQwenChatTemplateThinking", () => {
@@ -393,40 +447,32 @@ describe("normalizeOpenAICompatibleReasoningReplay", () => {
     ]);
   });
 
-  it("strips reasoning across all replay messages when thinking is disabled", () => {
-    const payload = {
-      messages: [
-        { role: "user", reasoning_content: "cross-provider" },
-        { role: "assistant", reasoning_content: "native" },
-        { role: "tool", reasoning_content: "cross-provider" },
-      ],
-    };
+  it.each([false, true])(
+    "strips disabled reasoning with assistant-only policy %s",
+    (stripAssistantMessagesOnly) => {
+      const payload = {
+        messages: [
+          { role: "user", reasoning_content: "preserve user" },
+          { role: "assistant", reasoning_content: "remove assistant" },
+          { role: "tool", reasoning_content: "preserve tool" },
+        ],
+      };
+      normalizeOpenAICompatibleReasoningReplay(payload, {
+        thinkingEnabled: false,
+        stripAssistantMessagesOnly,
+      });
 
-    normalizeOpenAICompatibleReasoningReplay(payload, { thinkingEnabled: false });
-
-    expect(payload.messages).toEqual([{ role: "user" }, { role: "assistant" }, { role: "tool" }]);
-  });
-
-  it("preserves non-assistant replay metadata for assistant-only provider policies", () => {
-    const payload = {
-      messages: [
-        { role: "user", reasoning_content: "preserve user" },
-        { role: "assistant", reasoning_content: "remove assistant" },
-        { role: "tool", reasoning_content: "preserve tool" },
-      ],
-    };
-
-    normalizeOpenAICompatibleReasoningReplay(payload, {
-      thinkingEnabled: false,
-      stripAssistantMessagesOnly: true,
-    });
-
-    expect(payload.messages).toEqual([
-      { role: "user", reasoning_content: "preserve user" },
-      { role: "assistant" },
-      { role: "tool", reasoning_content: "preserve tool" },
-    ]);
-  });
+      expect(payload.messages).toEqual(
+        stripAssistantMessagesOnly
+          ? [
+              { role: "user", reasoning_content: "preserve user" },
+              { role: "assistant" },
+              { role: "tool", reasoning_content: "preserve tool" },
+            ]
+          : [{ role: "user" }, { role: "assistant" }, { role: "tool" }],
+      );
+    },
+  );
 });
 
 describe("createDeepSeekV4OpenAICompatibleThinkingWrapper", () => {
@@ -471,15 +517,9 @@ describe("createPayloadPatchStreamWrapper", () => {
     };
 
     const wrapped = createPayloadPatchStreamWrapper(baseStreamFn, ({ payload, options }) => {
-      payload.reasoning = (options as { reasoning?: unknown } | undefined)?.reasoning;
+      payload.reasoning = options?.reasoning;
     });
-    void wrapped(
-      { id: "model" } as never,
-      { messages: [] } as never,
-      {
-        reasoning: "medium",
-      } as never,
-    );
+    void wrapped(streamTestModel, { messages: [] }, { reasoning: "medium" });
 
     expect(captured).toEqual({ reasoning: "medium" });
   });
@@ -505,12 +545,44 @@ describe("createPayloadPatchStreamWrapper", () => {
 });
 
 describe("createOpenAICompatibleCompletionsThinkingOffWrapper", () => {
-  it("maps reasoning_effort to the model's disabled value when thinking is off", () => {
-    const { baseStreamFn, payloads } = createPayloadCapture("high");
-    const wrapped = createOpenAICompatibleCompletionsThinkingOffWrapper(baseStreamFn, "off");
-    void wrapped(lmstudioBinaryModel, { messages: [] }, {});
+  it.each([
+    { thinkingLevel: undefined, efforts: ["none", "high", "high"] },
+    { thinkingLevel: "off", efforts: ["none", "high", "none"] },
+    { thinkingLevel: "high", efforts: ["none", "high", "high"] },
+  ] as const)(
+    "uses per-call thinking before the $thinkingLevel default",
+    ({ thinkingLevel, efforts }) => {
+      const { baseStreamFn, payloads } = createPayloadCapture("high");
+      const wrapped = createOpenAICompatibleCompletionsThinkingOffWrapper(
+        baseStreamFn,
+        thinkingLevel,
+      );
+      for (const reasoning of ["off", "max", undefined] as const) {
+        void wrapped(lmstudioBinaryModel, { messages: [] }, { reasoning });
+      }
 
-    expect(payloads[0]?.reasoning_effort).toBe("none");
+      expect(payloads.map((payload) => payload.reasoning_effort)).toEqual(efforts);
+    },
+  );
+
+  it("preserves native none unless the request selects the configured off mapping", () => {
+    const { baseStreamFn, payloads } = createPayloadCapture("none");
+    const wrapped = createOpenAICompatibleCompletionsThinkingOffWrapper(baseStreamFn, "off");
+    for (const reasoning of ["off", "max", undefined] as const) {
+      void wrapped(
+        {
+          ...lmstudioBinaryModel,
+          compat: {
+            supportedReasoningEfforts: ["none", "low", "high"],
+            reasoningEffortMap: { off: "low", none: "none" },
+          },
+        },
+        { messages: [] },
+        { reasoning },
+      );
+    }
+
+    expect(payloads.map((payload) => payload.reasoning_effort)).toEqual(["low", "none", "low"]);
   });
 
   it("drops reasoning_effort when the model has no disabled effort", () => {
@@ -527,14 +599,6 @@ describe("createOpenAICompatibleCompletionsThinkingOffWrapper", () => {
     void wrapped(lmstudioBinaryModel, { messages: [] }, {});
 
     expect(payloads[0]).not.toHaveProperty("reasoning_effort");
-  });
-
-  it("leaves enabled thinking levels unchanged", () => {
-    const { baseStreamFn, payloads } = createPayloadCapture("high");
-    const wrapped = createOpenAICompatibleCompletionsThinkingOffWrapper(baseStreamFn, "high");
-    void wrapped(lmstudioBinaryModel, { messages: [] }, {});
-
-    expect(payloads[0]?.reasoning_effort).toBe("high");
   });
 });
 
@@ -575,7 +639,10 @@ describe("createPlainTextToolCallCompatWrapper", () => {
       message?: { content?: unknown; stopReason?: unknown };
     };
     expect(done.reason).toBe("length");
-    expect(done.message).toMatchObject({ content: rawToolText, stopReason: "length" });
+    expect(done.message).toMatchObject({
+      content: [textBlock(rawToolText)],
+      stopReason: "length",
+    });
   });
 
   it("passes through bracketed text when no configured tool names match", async () => {
@@ -793,7 +860,7 @@ describe("createPlainTextToolCallCompatWrapper", () => {
     const iterator = (await resolveStream(stream))[Symbol.asyncIterator]();
 
     try {
-      source.push({ type: "start", partial: { content: [] } } as never);
+      source.push(completeStreamEvent({ type: "start", partial: { content: [] } }) as never);
       expect((await nextEvent(iterator, "start")).type).toBe("start");
       source.push({ type: "text_delta", contentIndex: 0, delta: rawToolText } as never);
       source.push(doneEvent([textBlock(rawToolText)]) as never);
@@ -889,69 +956,45 @@ describe("createPlainTextToolCallCompatWrapper", () => {
     expect(JSON.stringify(events)).not.toContain(marker);
   });
 
-  it("preserves visible text after a byte-over-cap XML prefix below the character cap", async () => {
+  it("keeps a byte-over-cap visible suffix at its streamed content index in done messages", async () => {
     const marker = "<function=read>";
     const visibleText = "Visible answer";
-    const rawText = `${createByteOverCapZeroArgumentXmlCall("read")}\n${visibleText}`;
-    expect(rawText.length).toBeLessThan(256_000);
-    const events = await collectTextDoneEvents([rawText], rawText);
+    const firstChunk = `${marker}${"\u00a0".repeat(100_000)}`;
+    const secondChunk = `${"\u00a0".repeat(28_001)}</function>\n${visibleText}`;
+    const content = [
+      { type: "text", text: firstChunk },
+      { type: "thinking", thinking: "checking" },
+      { type: "text", text: secondChunk },
+    ];
+    const events = await collectPlainTextToolCallCompatEvents([
+      textDelta(firstChunk),
+      {
+        type: "text_delta",
+        contentIndex: 2,
+        delta: secondChunk,
+        partial: { role: "assistant", content },
+      },
+      doneEvent(content),
+    ]);
 
     expect(events.map((event) => requireRecord(event, "event").type)).toEqual([
       "text_delta",
       "done",
     ]);
+    const expectedContent = [
+      { type: "text", text: "" },
+      { type: "thinking", thinking: "checking" },
+      { type: "text", text: visibleText },
+    ];
     expect(requireRecord(events[0], "text event")).toMatchObject({
       delta: visibleText,
-      partial: { content: [{ type: "text", text: visibleText }] },
+      partial: { content: expectedContent },
     });
     expect(requireRecord(events[1], "done event").message).toMatchObject({
-      content: [{ type: "text", text: visibleText }],
+      content: expectedContent,
     });
     expect(JSON.stringify(events)).not.toContain(marker);
   });
-
-  it.each(["first pass", "repeated pass"])(
-    "keeps a byte-over-cap visible suffix at its streamed content index in done messages (%s)",
-    async () => {
-      const marker = "<function=read>";
-      const visibleText = "Visible answer";
-      const firstChunk = `${marker}${"\u00a0".repeat(100_000)}`;
-      const secondChunk = `${"\u00a0".repeat(28_001)}</function>\n${visibleText}`;
-      const content = [
-        { type: "text", text: firstChunk },
-        { type: "thinking", thinking: "checking" },
-        { type: "text", text: secondChunk },
-      ];
-      const events = await collectPlainTextToolCallCompatEvents([
-        textDelta(firstChunk),
-        {
-          type: "text_delta",
-          contentIndex: 2,
-          delta: secondChunk,
-          partial: { role: "assistant", content },
-        },
-        doneEvent(content),
-      ]);
-
-      expect(events.map((event) => requireRecord(event, "event").type)).toEqual([
-        "text_delta",
-        "done",
-      ]);
-      const expectedContent = [
-        { type: "text", text: "" },
-        { type: "thinking", thinking: "checking" },
-        { type: "text", text: visibleText },
-      ];
-      expect(requireRecord(events[0], "text event")).toMatchObject({
-        delta: visibleText,
-        partial: { content: expectedContent },
-      });
-      expect(requireRecord(events[1], "done event").message).toMatchObject({
-        content: expectedContent,
-      });
-      expect(JSON.stringify(events)).not.toContain(marker);
-    },
-  );
 
   it("scrubs earlier partial blocks when a later block completes a byte-over-cap XML prefix", async () => {
     const marker = "<function=read>";
@@ -1100,7 +1143,7 @@ describe("createPlainTextToolCallCompatWrapper", () => {
 
     expect(events.map((event) => event.type)).toEqual(["error"]);
     const terminalError = requireRecord(events[0], "error event");
-    expect(requireRecord(terminalError.partial, "error partial").content).toBe("");
+    expect(requireRecord(terminalError.partial, "error partial").content).toEqual([textBlock("")]);
     expect(requireRecord(terminalError.error, "error body")).toMatchObject({
       content: [],
       errorMessage: "stream failed",
@@ -1127,14 +1170,19 @@ describe("createPlainTextToolCallCompatWrapper", () => {
   it("retains non-text blocks in order around an over-cap XML call suffix", async () => {
     const visibleText = "Visible suffix";
     const thinkingBefore = { type: "thinking", thinking: "Before image." };
-    const image = { type: "image", data: "aW1n", mimeType: "image/png" };
+    const existingToolCall = {
+      type: "toolCall",
+      id: "call_existing",
+      name: "alreadyStructured",
+      arguments: {},
+    };
     const thinkingAfter = { type: "thinking", thinking: "After suffix." };
     const events = await collectPlainTextToolCallCompatEvents([
       doneEvent(
         [
           thinkingBefore,
           textBlock(`<function=read>${"\u00a0".repeat(128_001)}`),
-          image,
+          existingToolCall,
           textBlock(`</function>\n${visibleText}`),
           thinkingAfter,
         ],
@@ -1145,7 +1193,7 @@ describe("createPlainTextToolCallCompatWrapper", () => {
     const doneMessage = messageOf(events[0]);
     expect(doneMessage.content).toEqual([
       thinkingBefore,
-      image,
+      existingToolCall,
       { type: "text", text: visibleText },
       thinkingAfter,
     ]);
@@ -1456,24 +1504,6 @@ describe("createPlainTextToolCallCompatWrapper", () => {
     expect(JSON.stringify(events)).not.toContain("[tool:read]");
   });
 
-  it("reclassifies split over-cap mixed text and streams the visible suffix", async () => {
-    const toolPrefix = ["[tool:read]", "<parameter=path>", "x".repeat(256_001)].join("\n");
-    const visibleSuffix = "Visible answer after the tool-looking prefix.";
-    const rawText = [toolPrefix, "</parameter>", "</function>", visibleSuffix].join("\n");
-    const events = await collectTextDoneEvents(
-      [toolPrefix, ["</parameter>", "</function>", visibleSuffix].join("\n")],
-      rawText,
-      true,
-    );
-
-    expect(events.map((event) => (event as { type?: string }).type)).toEqual([
-      "text_delta",
-      "done",
-    ]);
-    expect(String(requireRecord(events[0], "text event").delta)).toBe(visibleSuffix);
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-  });
-
   it("preserves XML visible suffix after Unicode payload text", async () => {
     const toolPrefix = ["[tool:read]", "<parameter=path>", `${"x".repeat(256_001)}İ`].join("\n");
     const visibleSuffix = "Visible suffix after Unicode payload.";
@@ -1484,7 +1514,9 @@ describe("createPlainTextToolCallCompatWrapper", () => {
       true,
     );
 
+    expect(events.map((event) => event.type)).toEqual(["text_delta", "done"]);
     expect(String(requireRecord(events[0], "text event").delta)).toBe(visibleSuffix);
+    expect(JSON.stringify(events)).not.toContain("[tool:read]");
     expect(JSON.stringify(events)).not.toContain("</parameter>");
     expect(JSON.stringify(events)).not.toContain("</function>");
   });
@@ -1513,23 +1545,6 @@ describe("createPlainTextToolCallCompatWrapper", () => {
     expect(
       requireRecord(requireRecord(events[1], "error event").error, "error record").content,
     ).toEqual([{ type: "text", text: visibleSuffix }]);
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-  });
-
-  it("preserves visible suffix text when the tool terminator arrives after the scan cap", async () => {
-    const toolPrefix = ["[tool:read]", "<parameter=path>", "x".repeat(400_000)].join("\n");
-    const visibleSuffix = "Visible answer after a very large tool-looking prefix.";
-    const rawText = [toolPrefix, "</parameter>", "</function>", visibleSuffix].join("\n");
-    const events = await collectTextDoneEvents(
-      [toolPrefix, ["</parameter>", "</function>", visibleSuffix].join("\n")],
-      rawText,
-    );
-
-    expect(events.map((event) => (event as { type?: string }).type)).toEqual([
-      "text_delta",
-      "done",
-    ]);
-    expect(String(requireRecord(events[0], "text event").delta)).toBe(visibleSuffix);
     expect(JSON.stringify(events)).not.toContain("[tool:read]");
   });
 
@@ -1567,33 +1582,12 @@ describe("createPlainTextToolCallCompatWrapper", () => {
     expect(JSON.stringify(events)).not.toContain("[tool:read]");
   });
 
-  it("preserves long visible suffix text after an over-cap terminator", async () => {
-    const toolPrefix = ["[tool:read]", "<parameter=path>", "x".repeat(400_000)].join("\n");
-    const visibleSuffix = `Visible answer ${"y".repeat(70_000)}`;
-    const rawText = [toolPrefix, "</parameter>", "</function>", visibleSuffix].join("\n");
-    const events = await collectTextDoneEvents(
-      [toolPrefix, ["</parameter>", "</function>", visibleSuffix].join("\n")],
-      rawText,
-    );
-
-    expect(events.map((event) => (event as { type?: string }).type)).toEqual([
-      "text_delta",
-      "done",
-    ]);
-    expect(String(requireRecord(events[0], "text event").delta)).toBe(visibleSuffix);
-    expect(JSON.stringify(events)).not.toContain("[tool:read]");
-  });
-
-  it.each([
-    ["both events omit contentIndex", {}, {}],
-    ["only the delta omits contentIndex", {}, { contentIndex: 0 }],
-    ["only text_end omits contentIndex", { contentIndex: 0 }, {}],
-  ])("does not duplicate visible suffix text when %s", async (_name, deltaIndex, endIndex) => {
+  it("does not duplicate visible suffix text when both events omit contentIndex", async () => {
     const visibleSuffix = "Visible answer from a mixed-index stream.";
     const rawText = [`[tool:read] {"path":"${"x".repeat(256_001)}"}`, visibleSuffix].join("\n");
     const events = await collectPlainTextToolCallCompatEvents([
-      { type: "text_delta", ...deltaIndex, delta: rawText },
-      { type: "text_end", ...endIndex, content: rawText },
+      { type: "text_delta", delta: rawText },
+      { type: "text_end", content: rawText },
       doneEvent([textBlock(rawText)]),
     ]);
 
@@ -1603,28 +1597,6 @@ describe("createPlainTextToolCallCompatWrapper", () => {
     ]);
     expect(String(requireRecord(events[0], "text event").delta)).toBe(visibleSuffix);
     expect(JSON.stringify(events)).not.toContain("[tool:read]");
-  });
-
-  it("deduplicates cumulative text_end across multiple stripped calls", async () => {
-    const call = `<function=read>${"\u00a0".repeat(128_001)}</function>\n`;
-    const first = `${call}ONE\n`;
-    const second = `TWO\n${call}THREE`;
-    const rawText = first + second;
-    const events = await collectPlainTextToolCallCompatEvents([
-      textDelta(first),
-      textDelta(second),
-      textEnd(rawText),
-      doneEvent([textBlock(rawText)]),
-    ]);
-
-    expect(events.map((event) => event.type)).toEqual([
-      "text_delta",
-      "text_delta",
-      "text_delta",
-      "done",
-    ]);
-    expect(events.slice(0, 3).map((event) => event.delta)).toEqual(["ONE\n", "TWO\n", "THREE"]);
-    expect(messageOf(events.at(-1)).content).toEqual([{ type: "text", text: "ONE\nTWO\nTHREE" }]);
   });
 
   it("keeps partial snapshots current for multi-delta visible suffix text", async () => {
@@ -1704,7 +1676,7 @@ describe("createPlainTextToolCallCompatWrapper", () => {
     ].join(separator);
 
     try {
-      source.push({ type: "start", partial: { content: [] } } as never);
+      source.push(completeStreamEvent({ type: "start", partial: { content: [] } }) as never);
       expect((await nextEvent(iterator, "start")).type).toBe("start");
       source.push({ type: "text_delta", contentIndex: 0, delta: rawToolText } as never);
       source.push(doneEvent([textBlock(rawToolText)]) as never);
@@ -1721,7 +1693,7 @@ describe("createPlainTextToolCallCompatWrapper", () => {
     const rawToolText = ["<function=read>", "</function>"].join("\n");
 
     try {
-      source.push({ type: "start", partial: { content: [] } } as never);
+      source.push(completeStreamEvent({ type: "start", partial: { content: [] } }) as never);
       expect((await nextEvent(iterator, "start")).type).toBe("start");
 
       let streamedText = "";
@@ -1772,7 +1744,7 @@ describe("createPlainTextToolCallCompatWrapper", () => {
     const iterator = (await resolveStream(stream))[Symbol.asyncIterator]();
 
     try {
-      source.push({ type: "start", partial: { content: [] } } as never);
+      source.push(completeStreamEvent({ type: "start", partial: { content: [] } }) as never);
       expect((await nextEvent(iterator, "start")).type).toBe("start");
 
       source.push({

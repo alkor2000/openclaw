@@ -3,13 +3,19 @@ import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { pathToFileURL } from "node:url";
-import type { SubagentRunRecord } from "../src/agents/subagent-registry.types.js";
+import { toErrorObject } from "@openclaw/normalization-core/error-coercion";
+import type { SubagentRunRecord } from "../src/agents/subagents/registry/subagent-registry.types.js";
 import type { DB as OpenClawStateKyselyDatabase } from "../src/state/openclaw-state-db.generated.js";
 import {
   WORKER_RESULT_SENTINEL,
   type WorkerResult,
   type WorkerScenario,
 } from "./bench-agent-concurrency.js";
+import { classifyBoundedUnsignedDecimal } from "./lib/arg-utils.mts";
+
+type BenchmarkRegistryRuntime = Awaited<
+  ReturnType<typeof import("./bench-agent-concurrency-runtime.mjs").installBenchmarkRegistryRuntime>
+>;
 
 type WorkerOptions = {
   scenario: WorkerScenario;
@@ -32,14 +38,14 @@ const SCENARIOS = new Set<WorkerScenario>([
 ]);
 
 function parseInteger(raw: string | undefined, flag: string, min: number, max: number): number {
-  if (!raw || !/^\d+$/u.test(raw)) {
+  const result = classifyBoundedUnsignedDecimal(raw, min, max);
+  if (result.kind === "syntax") {
     throw new Error(`${flag} must be an integer`);
   }
-  const value = Number(raw);
-  if (value < min || value > max) {
+  if (result.kind !== "value") {
     throw new Error(`${flag} must be between ${min} and ${max}`);
   }
-  return value;
+  return result.value;
 }
 
 function parseOptions(argv: string[]): WorkerOptions {
@@ -67,14 +73,6 @@ function parseOptions(argv: string[]): WorkerOptions {
   };
 }
 
-function processMaxRssBytes(): number {
-  return Math.max(0, Math.round(process.resourceUsage().maxRSS * 1024));
-}
-
-function toError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
-}
-
 async function waitForCondition(check: () => boolean): Promise<boolean> {
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
@@ -88,32 +86,29 @@ async function waitForCondition(check: () => boolean): Promise<boolean> {
   return check();
 }
 
-async function drainSpawnSampleRootWork(
-  waitForRootWork?: (timeoutMs: number) => Promise<{ drained: boolean; active: number }>,
-): Promise<void> {
+async function drainSpawnSampleActiveWork(
+  waitForActiveWork?: (
+    timeoutMs: number,
+  ) => Promise<{ drained: boolean; snapshot: { counts: { totalActive: number } } }>,
+): Promise<number> {
   const wait =
-    waitForRootWork ??
-    (await import("../src/process/gateway-work-admission.js")).waitForActiveGatewayRootWork;
+    waitForActiveWork ??
+    (await import("../src/infra/gateway-active-work.js")).waitForGatewayActiveWork;
   const result = await wait(30_000);
-  if (!result.drained || result.active !== 0) {
-    throw new Error(`spawn sample left ${result.active} active gateway root work items`);
+  const active = result.snapshot.counts.totalActive;
+  if (!result.drained || active !== 0) {
+    throw new Error(`spawn sample left ${active} active gateway work items`);
   }
+  return active;
 }
 
 async function resetRuntime(persist: boolean): Promise<void> {
-  const [subagents, tasks, stateDb, agentDb] = await Promise.all([
-    import("../src/agents/subagent-registry.test-helpers.js"),
-    import("../src/tasks/task-runtime.test-helpers.js"),
+  const [subagents, stateDb, agentDb] = await Promise.all([
+    import("../src/agents/subagents/registry/subagent-registry.test-helpers.js"),
     import("../src/state/openclaw-state-db.js"),
     import("../src/state/openclaw-agent-db.js"),
   ]);
   subagents.resetSubagentRegistryForTests({ persist });
-  subagents.testing.setDepsForTest();
-  tasks.resetTaskRegistryControlRuntimeForTests();
-  tasks.resetTaskRegistryDeliveryRuntimeForTests();
-  tasks.resetDetachedTaskLifecycleRuntimeForTests();
-  tasks.resetTaskRegistryForTests({ persist });
-  tasks.resetTaskFlowRegistryForTests({ persist });
   stateDb.closeOpenClawStateDatabaseForTest();
   agentDb.closeOpenClawAgentDatabasesForTest();
 }
@@ -179,79 +174,7 @@ function createTerminalWaitBarrier() {
   };
 }
 
-async function configureSpawnRuntime(
-  mode: "memory" | "durable",
-  callGateway: typeof import("../src/gateway/call.js").callGateway,
-): Promise<void> {
-  const [subagents, registry, taskStore, flowStore] = await Promise.all([
-    import("../src/agents/subagent-registry.test-helpers.js"),
-    import("../src/agents/subagent-registry-memory.js"),
-    import("../src/tasks/task-registry.store.js"),
-    import("../src/tasks/task-flow-registry.store.test-support.js"),
-  ]);
-  const sharedDeps = {
-    callGateway,
-    getRuntimeConfig: () => ({}),
-    onAgentEvent: () => () => {},
-    resolveAgentTimeoutMs: () => 1_000,
-    captureSubagentCompletionReply: async (childSessionKey: string) => {
-      const entry = [...registry.subagentRuns.values()].find(
-        (candidate) => candidate.childSessionKey === childSessionKey,
-      );
-      if (entry) {
-        // Completion already owns the row at this awaited seam. Suppress only
-        // its unrelated session projection, not the terminal registry/task transition.
-        entry.execution.suppressSessionEffects = true;
-      }
-      return undefined;
-    },
-    cleanupBrowserSessionsForLifecycleEnd: async () => {},
-    runSubagentAnnounceFlow: async () => false,
-    maybeWakeRequesterAfterAllChildrenSettled: async () => false,
-    ensureContextEnginesInitialized: () => {},
-    loadAgentRuntimePluginRegistryHandle: () => undefined,
-    resolveContextEngine: async () =>
-      ({
-        info: { id: "bench", name: "bench", version: "1" },
-        ingest: async () => ({ ok: true }),
-        assemble: async () => ({ messages: [] }),
-        onSubagentEnded: async () => {},
-      }) as unknown as import("../src/context-engine/types.js").ContextEngine,
-  };
-  if (mode === "memory") {
-    subagents.testing.setDepsForTest({
-      ...sharedDeps,
-      persistSubagentRunsToDisk: () => {},
-      persistSubagentRunsToDiskOrThrow: () => {},
-    });
-    taskStore.configureTaskRegistryRuntime({
-      store: {
-        loadSnapshot: () => ({ tasks: new Map(), deliveryStates: new Map() }),
-        saveSnapshot: () => {},
-        upsertTaskWithDeliveryState: () => {},
-        upsertTask: () => {},
-        deleteTaskWithDeliveryState: () => {},
-        deleteTask: () => {},
-        upsertDeliveryState: () => {},
-        deleteDeliveryState: () => {},
-        close: () => {},
-      },
-    });
-    flowStore.configureTaskFlowRegistryRuntime({
-      store: {
-        loadSnapshot: () => ({ flows: new Map() }),
-        saveSnapshot: () => {},
-        upsertFlow: () => {},
-        deleteFlow: () => {},
-        close: () => {},
-      },
-    });
-    return;
-  }
-  subagents.testing.setDepsForTest(sharedDeps);
-}
-
-type BenchmarkStateDatabase = Pick<OpenClawStateKyselyDatabase, "subagent_runs" | "task_runs">;
+type BenchmarkStateDatabase = Pick<OpenClawStateKyselyDatabase, "subagent_runs">;
 
 async function readDurableRows() {
   const [{ executeSqliteQuerySync, getNodeSqliteKysely }, stateDb] = await Promise.all([
@@ -264,14 +187,14 @@ async function readDurableRows() {
     path: database.path,
     subagentRows: executeSqliteQuerySync(
       database.db,
-      db.selectFrom("subagent_runs").select(["run_id", "ended_at"]).orderBy("run_id"),
-    ).rows,
-    taskRows: executeSqliteQuerySync(
-      database.db,
       db
-        .selectFrom("task_runs")
-        .select(["run_id", "status", "ended_at"])
-        .where("runtime", "=", "subagent")
+        .selectFrom("subagent_runs")
+        .select((eb) => [
+          "run_id",
+          eb
+            .fn<number | null>("json_extract", ["payload_json", eb.val("$.execution.endedAt")])
+            .as("ended_at"),
+        ])
         .orderBy("run_id"),
     ).rows,
   };
@@ -283,16 +206,6 @@ function listSqliteFiles(root: string): string[] {
     .map(String)
     .filter((entry) => entry.includes(".sqlite"))
     .toSorted();
-}
-
-async function listBenchmarkTasks() {
-  const tasks = await import("../src/tasks/task-registry.js");
-  return tasks.listTaskRecords().filter((task) => task.runtime === "subagent");
-}
-
-async function listBenchmarkTaskMemory() {
-  const state = await import("../src/tasks/task-registry-state.js");
-  return [...state.tasks.values()].filter((task) => task.runtime === "subagent");
 }
 
 function assertExactRunIds(actual: Array<string | null>, expected: string[], label: string): void {
@@ -312,15 +225,15 @@ async function runSpawnSample(
   serial: number,
   mode: "memory" | "durable",
   stateDir: string,
+  registryRuntime: BenchmarkRegistryRuntime,
 ): Promise<Sample> {
   const [pipeline, registry] = await Promise.all([
     import("../src/agents/spawn-pipeline.js"),
-    import("../src/agents/subagent-registry-memory.js"),
+    import("../src/agents/subagents/registry/subagent-registry-memory.js"),
   ]);
   await resetRuntime(mode === "durable");
   const barrier = createTerminalWaitBarrier();
-  await configureSpawnRuntime(mode, barrier.callGateway);
-  const taskRegistry = await import("../src/tasks/task-registry.js");
+  registryRuntime.setCallGateway(barrier.callGateway);
   let releases = 0;
   const runIds: string[] = [];
   const params = Array.from({ length: fanout }, (_, index) => {
@@ -353,6 +266,11 @@ async function runSpawnSample(
       progressSessionKey: "agent:bench:main",
     };
   });
+  const isSettledRun = (run: SubagentRunRecord | undefined) =>
+    run?.execution.status === "terminal" &&
+    typeof run.execution.endedAt === "number" &&
+    typeof run.cleanupCompletedAt === "number" &&
+    run.execution.outcome?.status === "ok";
   let result: Sample | undefined;
   let failure: unknown;
   try {
@@ -365,12 +283,7 @@ async function runSpawnSample(
     const successful = pipelineResults.filter((pipelineResult) => pipelineResult.ok);
     const uniqueRuns = new Set(successful.map((pipelineResult) => pipelineResult.runId)).size;
     const registeredRuns = registry.subagentRuns.size;
-    const tasksWhileBlocked = await listBenchmarkTasks();
-    assertExactRunIds(
-      tasksWhileBlocked.map((task) => task.runId ?? null),
-      runIds,
-      `${mode} in-memory task rows`,
-    );
+    assertExactRunIds([...registry.subagentRuns.keys()], runIds, `${mode} native run rows`);
     if (!blocked || barrier.outstanding !== fanout) {
       throw new Error(`spawn ${mode} did not block ${fanout} agent.wait calls`);
     }
@@ -385,7 +298,6 @@ async function runSpawnSample(
       );
     }
     let durableSubagentRows = 0;
-    let durableTaskRows = 0;
     let durableStateFile = listSqliteFiles(stateDir).length > 0;
     if (mode === "durable") {
       const durable = await readDurableRows();
@@ -394,19 +306,10 @@ async function runSpawnSample(
         runIds,
         "durable subagent rows",
       );
-      assertExactRunIds(
-        durable.taskRows.map((row) => row.run_id),
-        runIds,
-        "durable task rows",
-      );
-      if (
-        durable.subagentRows.some((row) => row.ended_at !== null) ||
-        durable.taskRows.some((row) => row.status !== "running" || row.ended_at !== null)
-      ) {
+      if (durable.subagentRows.some((row) => row.ended_at !== null)) {
         throw new Error("durable rows settled before the benchmark barrier released");
       }
       durableSubagentRows = durable.subagentRows.length;
-      durableTaskRows = durable.taskRows.length;
       durableStateFile = fs.existsSync(durable.path);
       if (!durableStateFile) {
         throw new Error(`durable spawn pipeline database is missing at ${durable.path}`);
@@ -416,36 +319,22 @@ async function runSpawnSample(
     }
     for (const runId of runIds) {
       barrier.release(runId);
-      const runSettled = await waitForCondition(() => {
-        const run = registry.subagentRuns.get(runId);
-        const task = taskRegistry.findTaskByRunId(runId);
-        return (
-          run?.execution.status === "terminal" &&
-          typeof run.execution.endedAt === "number" &&
-          typeof run.cleanupCompletedAt === "number" &&
-          task?.status === "succeeded"
-        );
-      });
+      const runSettled = await waitForCondition(() =>
+        isSettledRun(registry.subagentRuns.get(runId)),
+      );
       if (!runSettled) {
         throw new Error(`spawn ${mode} did not settle released run ${runId}`);
       }
     }
-    const settledTasks = await listBenchmarkTasks();
-    const settledRuns = [...registry.subagentRuns.values()].filter(
-      (entry) =>
-        entry.execution.status === "terminal" &&
-        typeof entry.execution.endedAt === "number" &&
-        typeof entry.cleanupCompletedAt === "number",
-    ).length;
-    const succeededTasks = settledTasks.filter((task) => task.status === "succeeded").length;
-    if (settledRuns !== fanout || succeededTasks !== fanout || barrier.outstanding !== 0) {
+    const settledRuns = [...registry.subagentRuns.values()].filter(isSettledRun).length;
+    if (settledRuns !== fanout || barrier.outstanding !== 0) {
       throw new Error(
-        `spawn ${mode} settlement invariant failed: ${JSON.stringify({ fanout, settledRuns, succeededTasks, outstandingWaits: barrier.outstanding })}`,
+        `spawn ${mode} settlement invariant failed: ${JSON.stringify({ fanout, settledRuns, outstandingWaits: barrier.outstanding })}`,
       );
     }
     // Terminal rows can settle before detached cleanup and requester-wake roots.
     // Drain before reset so leaked work stays visible and cannot reach the next sample.
-    await drainSpawnSampleRootWork();
+    const postTeardownActiveRootWork = await drainSpawnSampleActiveWork();
     result = {
       durationMs,
       invariant: {
@@ -454,16 +343,12 @@ async function runSpawnSample(
         reservationsReleased: releases,
         blockedWaits: fanout,
         settledRuns,
-        settledTasks: succeededTasks,
         outstandingWaits: barrier.outstanding,
         durableSubagentRows,
-        durableTaskRows,
         durableStateFile,
         postTeardownRegistryRows: -1,
-        postTeardownTaskRows: -1,
         postTeardownDurableSubagentRows: -1,
-        postTeardownDurableTaskRows: -1,
-        postTeardownActiveRootWork: 0,
+        postTeardownActiveRootWork,
       },
     };
   } catch (error) {
@@ -481,28 +366,22 @@ async function runSpawnSample(
     }
   }
   if (failure) {
-    throw toError(failure);
+    throw toErrorObject(failure, "Agent concurrency benchmark failed");
   }
-  const postTeardownTasks = await listBenchmarkTaskMemory();
   const postTeardownRegistryRows = registry.subagentRuns.size;
-  const postTeardownTaskRows = postTeardownTasks.length;
   let postTeardownDurableSubagentRows = 0;
-  let postTeardownDurableTaskRows = 0;
   if (mode === "durable") {
     const durable = await readDurableRows();
     postTeardownDurableSubagentRows = durable.subagentRows.length;
-    postTeardownDurableTaskRows = durable.taskRows.length;
     await resetRuntime(false);
   }
   if (
     postTeardownRegistryRows !== 0 ||
-    postTeardownTaskRows !== 0 ||
     postTeardownDurableSubagentRows !== 0 ||
-    postTeardownDurableTaskRows !== 0 ||
     barrier.outstanding !== 0
   ) {
     throw new Error(
-      `spawn ${mode} teardown invariant failed: ${JSON.stringify({ postTeardownRegistryRows, postTeardownTaskRows, postTeardownDurableSubagentRows, postTeardownDurableTaskRows, outstandingWaits: barrier.outstanding })}`,
+      `spawn ${mode} teardown invariant failed: ${JSON.stringify({ postTeardownRegistryRows, postTeardownDurableSubagentRows, outstandingWaits: barrier.outstanding })}`,
     );
   }
   if (mode === "memory" && listSqliteFiles(stateDir).length > 0) {
@@ -512,9 +391,7 @@ async function runSpawnSample(
     throw new Error(`spawn ${mode} did not produce a benchmark result`);
   }
   result.invariant.postTeardownRegistryRows = postTeardownRegistryRows;
-  result.invariant.postTeardownTaskRows = postTeardownTaskRows;
   result.invariant.postTeardownDurableSubagentRows = postTeardownDurableSubagentRows;
-  result.invariant.postTeardownDurableTaskRows = postTeardownDurableTaskRows;
   return result;
 }
 
@@ -572,21 +449,16 @@ function sweepRow(child: number, generation: number, now: number): SubagentRunRe
     archiveAtMs: current ? undefined : now - 1,
     terminalOwner: current ? "interrupted-recovery" : undefined,
     endedReason: current ? "subagent-error" : undefined,
-    execution: current
-      ? {
-          status: "terminal",
-          startedAt: now - 2_000,
-          endedAt: now - 1_000,
-          outcome: { status: "error", error: "interrupted recovery replay" },
-          suppressSessionEffects: true,
-        }
-      : {
-          status: "terminal",
-          startedAt: now - 2_000,
-          endedAt: now - 1_000,
-          outcome: { status: "error", error: "retired recovery generation" },
-          suppressSessionEffects: true,
-        },
+    execution: {
+      status: "terminal",
+      startedAt: now - 2_000,
+      endedAt: now - 1_000,
+      outcome: {
+        status: "error",
+        error: current ? "interrupted recovery replay" : "retired recovery generation",
+      },
+      suppressSessionEffects: true,
+    },
   };
 }
 
@@ -595,8 +467,8 @@ async function runSweepSample(childCount: number): Promise<Sample> {
     { getSubagentRunsForChildSession, subagentRuns: runs },
     { createSubagentRegistrySweeper },
   ] = await Promise.all([
-    import("../src/agents/subagent-registry-memory.js"),
-    import("../src/agents/subagent-registry-sweeper.js"),
+    import("../src/agents/subagents/registry/subagent-registry-memory.js"),
+    import("../src/agents/subagents/registry/subagent-registry-sweeper.js"),
   ]);
   const now = Date.now();
   runs.clear();
@@ -620,15 +492,6 @@ async function runSweepSample(childCount: number): Promise<Sample> {
       lostContextCompletions += 1;
     },
     getGatewayRecoveryRuntime: () => undefined,
-    abandonSubagentRestartRecoveryLaunch: () => true,
-    clearAcceptedSubagentRestartRecovery: () => true,
-    resumeSettledSubagentRestartRecovery: () => true,
-    replaceSubagentRunAfterSteer: () => true,
-    markSubagentRestartRecoveryLaunchAttempted: () => undefined,
-    markSubagentRestartRecoveryLaunchAccepted: () => undefined,
-    markSubagentRestartRecoveryLaunchConsumed: () => undefined,
-    reserveSubagentRestartRecoveryLaunch: () => undefined,
-    resetSubagentRestartRecoveryLaunchAttempt: () => true,
     finalizeInterruptedSubagentRun: async ({ runId, expectedEntry }) => {
       if (runs.get(runId) !== expectedEntry || expectedEntry?.generation !== 3) {
         throw new Error(`unexpected recovery projection owner: ${runId}`);
@@ -638,7 +501,11 @@ async function runSweepSample(childCount: number): Promise<Sample> {
     },
     resumeRequesterSettleWake: () => {},
     startSubagentAnnounceCleanupFlow: () => true,
-    completeCleanupBookkeeping: () => {},
+    completeCleanupBookkeeping: async () => {},
+    isEndedHookOwnerCurrent: (runId, entry) => runs.get(runId) === entry || !runs.has(runId),
+    sessionEffectsHostCurrent: (entry) => entry.execution.suppressSessionEffects !== true,
+    shouldSuppressSessionEffects: async (entry) => entry.execution.suppressSessionEffects === true,
+    discardTerminalDelivery: () => {},
     shouldEmitEndedHookForRun: () => false,
     emitSubagentEndedHookForRun: async () => {},
     callGateway: (async <T>() => {
@@ -687,14 +554,14 @@ async function runSweepSample(childCount: number): Promise<Sample> {
       },
     };
   } finally {
-    sweeper.reset();
+    await sweeper.reset();
     runs.clear();
   }
 }
 
 async function runDedupeSample(childCount: number): Promise<Sample> {
   const { dedupeLatestChildCompletionRows } =
-    await import("../src/agents/subagent-announce-output.js");
+    await import("../src/agents/subagents/announce/subagent-announce-output.js");
   const rowsForOrder = (generations: number[]) =>
     Array.from({ length: childCount }, (_, child) =>
       generations.map((generation) => ({
@@ -735,16 +602,30 @@ async function runDedupeSample(childCount: number): Promise<Sample> {
   };
 }
 
-async function runScenario(options: WorkerOptions, stateDir: string): Promise<WorkerResult> {
+async function runScenario(
+  options: WorkerOptions,
+  stateDir: string,
+  rssStartBytes: number,
+  registryRuntime?: BenchmarkRegistryRuntime,
+): Promise<WorkerResult> {
   const timingsMs: number[] = [];
   let invariant: Record<string, number | boolean> = {};
-  const rssStartBytes = process.memoryUsage().rss;
   for (let index = 0; index < options.warmup + options.runs; index += 1) {
     let sample: Sample;
-    if (options.scenario === "spawnPipelineInMemory") {
-      sample = await runSpawnSample(options.size, index, "memory", stateDir);
-    } else if (options.scenario === "spawnPipelineDurable") {
-      sample = await runSpawnSample(options.size, index, "durable", stateDir);
+    if (
+      options.scenario === "spawnPipelineInMemory" ||
+      options.scenario === "spawnPipelineDurable"
+    ) {
+      if (!registryRuntime) {
+        throw new Error("spawn benchmark registry runtime is not installed");
+      }
+      sample = await runSpawnSample(
+        options.size,
+        index,
+        options.scenario === "spawnPipelineInMemory" ? "memory" : "durable",
+        stateDir,
+        registryRuntime,
+      );
     } else if (options.scenario === "admission") {
       sample = await runAdmissionSample(options.size, index);
     } else if (options.scenario === "recoverySweep") {
@@ -764,7 +645,7 @@ async function runScenario(options: WorkerOptions, stateDir: string): Promise<Wo
     memory: {
       rssStartBytes,
       rssEndBytes: process.memoryUsage().rss,
-      processMaxRssBytes: processMaxRssBytes(),
+      processMaxRssBytes: Math.max(0, Math.round(process.resourceUsage().maxRSS * 1024)),
     },
     invariant,
   };
@@ -779,10 +660,22 @@ async function main(): Promise<void> {
   let failure: unknown;
   process.env.OPENCLAW_STATE_DIR = stateDir;
   process.env.NODE_ENV = "test";
+  let registryRuntime: BenchmarkRegistryRuntime | undefined;
   try {
     const { pinRuntimePaths } = await import("../src/config/paths.js");
     pinRuntimePaths();
-    result = await runScenario(options, stateDir);
+    const rssStartBytes = process.memoryUsage().rss;
+    if (
+      options.scenario === "spawnPipelineInMemory" ||
+      options.scenario === "spawnPipelineDurable"
+    ) {
+      const { installBenchmarkRegistryRuntime } =
+        await import("./bench-agent-concurrency-runtime.mjs");
+      registryRuntime = await installBenchmarkRegistryRuntime(
+        options.scenario === "spawnPipelineInMemory" ? "memory" : "durable",
+      );
+    }
+    result = await runScenario(options, stateDir, rssStartBytes, registryRuntime);
   } catch (error) {
     failure = error;
   } finally {
@@ -791,6 +684,11 @@ async function main(): Promise<void> {
     } catch (error) {
       failure ??= error;
     } finally {
+      try {
+        registryRuntime?.close();
+      } catch (error) {
+        failure ??= error;
+      }
       if (previousStateDir === undefined) {
         delete process.env.OPENCLAW_STATE_DIR;
       } else {
@@ -809,7 +707,7 @@ async function main(): Promise<void> {
     }
   }
   if (failure) {
-    throw toError(failure);
+    throw toErrorObject(failure, "Agent concurrency benchmark failed");
   }
   if (!result) {
     throw new Error("benchmark worker completed without a result");
@@ -817,7 +715,7 @@ async function main(): Promise<void> {
   process.stdout.write(`${WORKER_RESULT_SENTINEL}${JSON.stringify(result)}\n`);
 }
 
-export const testing = { drainSpawnSampleRootWork };
+export const testing = { drainSpawnSampleActiveWork };
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   try {

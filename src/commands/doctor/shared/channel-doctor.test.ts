@@ -3,11 +3,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { normalizeResolvedSecretInputString } from "../../../config/types.secrets.js";
 import {
   collectChannelDoctorCompatibilityMutations,
-  collectChannelDoctorEmptyAllowlistExtraWarnings,
   collectChannelDoctorMutableAllowlistWarnings,
   collectChannelDoctorPreviewWarnings,
   collectChannelDoctorStaleConfigMutations,
   createChannelDoctorEmptyAllowlistPolicyHooks,
+  runChannelDoctorConfigSequences,
 } from "./channel-doctor.js";
 
 const mocks = vi.hoisted(() => ({
@@ -185,6 +185,44 @@ describe("channel doctor compatibility mutations", () => {
     expect(discordCleanup).not.toHaveBeenCalled();
   });
 
+  it("retains warning-only stale results without advancing config", async () => {
+    const cfg = {
+      channels: {
+        matrix: { enabled: true },
+        discord: { enabled: true },
+      },
+    };
+    const alternateConfig = {
+      ...cfg,
+      channels: { ...cfg.channels, matrix: { enabled: false } },
+    };
+    const matrixCleanup = vi.fn(() => ({
+      config: alternateConfig,
+      changes: [],
+      warnings: ["matrix warning"],
+    }));
+    const discordCleanup = vi.fn(({ cfg: currentCfg }: { cfg: unknown }) => ({
+      config: currentCfg,
+      changes: ["discord cleanup"],
+    }));
+    mocks.getBundledChannelSetupPlugin.mockImplementation((id: string) => ({
+      id,
+      doctor: {
+        cleanStaleConfig: id === "matrix" ? matrixCleanup : discordCleanup,
+      },
+    }));
+
+    const result = await collectChannelDoctorStaleConfigMutations(cfg as never, {
+      channelIds: ["matrix", "discord"],
+    });
+
+    expect(result).toEqual([
+      { config: cfg, changes: [], warnings: ["matrix warning"] },
+      { config: cfg, changes: ["discord cleanup"] },
+    ]);
+    expect(discordCleanup).toHaveBeenCalledWith({ cfg });
+  });
+
   it("skips plugin discovery for explicitly disabled channels", () => {
     const result = collectChannelDoctorCompatibilityMutations({
       channels: {
@@ -212,6 +250,27 @@ describe("channel doctor compatibility mutations", () => {
     expect(normalizeCompatibilityConfig).toHaveBeenCalledTimes(1);
     expectMatrixDoctorLookupCalls(cfg);
     expect(mocks.getBundledChannelSetupPlugin).not.toHaveBeenCalledWith("discord");
+  });
+
+  it("retains informational channel guidance separately from changes and warnings", async () => {
+    mockReadOnlyMatrixPlugin({
+      runConfigSequence: () => ({
+        changeNotes: ["Migrated explicit listener settings."],
+        infoNotes: ["The default listener remains available; set legacyWebhook:false to close it."],
+        warningNotes: ["The callback path requires Gateway authentication."],
+      }),
+    });
+    await expect(
+      runChannelDoctorConfigSequences({
+        cfg: createMatrixEnabledConfig(),
+        env: {},
+        shouldRepair: false,
+      }),
+    ).resolves.toEqual({
+      changeNotes: ["Migrated explicit listener settings."],
+      infoNotes: ["The default listener remains available; set legacyWebhook:false to close it."],
+      warningNotes: ["The callback path requires Gateway authentication."],
+    });
   });
 
   it("keeps unresolved SecretRef preview reads non-fatal", async () => {
@@ -353,10 +412,10 @@ describe("channel doctor compatibility mutations", () => {
       ],
     });
 
-    const result = collectChannelDoctorEmptyAllowlistExtraWarnings({
+    const hooks = createChannelDoctorEmptyAllowlistPolicyHooks({ cfg: cfg as never });
+    const result = hooks.extraWarningsForAccount({
       account: {},
       channelName: "matrix",
-      cfg: cfg as never,
       prefix: "channels.matrix",
     });
 

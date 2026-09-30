@@ -1,18 +1,13 @@
-// Doctor scanner and repair for legacy untyped toolsBySender sender keys.
+import { asNullableRecord } from "@openclaw/normalization-core/record-coerce";
 import { sanitizeForLog } from "../../../../packages/terminal-core/src/ansi.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import { parseToolsBySenderTypedKey } from "../../../config/types.tools.js";
-import { formatConfigPath, resolveConfigPathTarget } from "../../doctor-config-analysis.js";
-import { asObjectRecord } from "./object.js";
+import { formatConfigKeyPath, resolveConfigPathTarget } from "../../doctor-config-analysis.js";
 
 type LegacyToolsBySenderKeyHit = {
-  /** Path parts pointing to the containing toolsBySender object. */
   toolsBySenderPath: Array<string | number>;
-  /** Formatted config path for user-facing warnings. */
   pathLabel: string;
-  /** Original untyped sender key. */
   key: string;
-  /** Typed replacement key using the id: namespace. */
   targetKey: string;
 };
 
@@ -27,15 +22,15 @@ function collectLegacyToolsBySenderKeyHits(
     }
     return;
   }
-  const record = asObjectRecord(value);
+  const record = asNullableRecord(value);
   if (!record) {
     return;
   }
 
-  const toolsBySender = asObjectRecord(record.toolsBySender);
+  const toolsBySender = asNullableRecord(record.toolsBySender);
   if (toolsBySender) {
     const path = [...pathParts, "toolsBySender"];
-    const pathLabel = formatConfigPath(path);
+    const pathLabel = formatConfigKeyPath(path);
     for (const rawKey of Object.keys(toolsBySender)) {
       const trimmed = rawKey.trim();
       if (!trimmed || trimmed === "*" || parseToolsBySenderTypedKey(trimmed)) {
@@ -58,14 +53,12 @@ function collectLegacyToolsBySenderKeyHits(
   }
 }
 
-/** Find untyped toolsBySender keys that should be migrated to explicit id: keys. */
 export function scanLegacyToolsBySenderKeys(cfg: OpenClawConfig): LegacyToolsBySenderKeyHit[] {
   const hits: LegacyToolsBySenderKeyHit[] = [];
   collectLegacyToolsBySenderKeyHits(cfg, [], hits);
   return hits;
 }
 
-/** Format doctor warnings for legacy untyped toolsBySender keys. */
 export function collectLegacyToolsBySenderWarnings(params: {
   hits: LegacyToolsBySenderKeyHit[];
   doctorFixCommand: string;
@@ -84,7 +77,6 @@ export function collectLegacyToolsBySenderWarnings(params: {
   ];
 }
 
-/** Migrate untyped toolsBySender keys to typed id: keys where possible. */
 export function maybeRepairLegacyToolsBySenderKeys(cfg: OpenClawConfig): {
   config: OpenClawConfig;
   changes: string[];
@@ -96,10 +88,9 @@ export function maybeRepairLegacyToolsBySenderKeys(cfg: OpenClawConfig): {
 
   const next = structuredClone(cfg);
   const summary = new Map<string, { migrated: number; dropped: number; examples: string[] }>();
-  let changed = false;
 
   for (const hit of hits) {
-    const toolsBySender = asObjectRecord(resolveConfigPathTarget(next, hit.toolsBySenderPath));
+    const toolsBySender = asNullableRecord(resolveConfigPathTarget(next, hit.toolsBySenderPath));
     if (!toolsBySender || !(hit.key in toolsBySender)) {
       continue;
     }
@@ -119,10 +110,9 @@ export function maybeRepairLegacyToolsBySenderKeys(cfg: OpenClawConfig): {
     }
     delete toolsBySender[hit.key];
     summary.set(hit.pathLabel, row);
-    changed = true;
   }
 
-  if (!changed) {
+  if (summary.size === 0) {
     return { config: cfg, changes: [] };
   }
 

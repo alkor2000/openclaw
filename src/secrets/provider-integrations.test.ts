@@ -5,7 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { PluginCandidate } from "../plugins/discovery.js";
 import {
-  loadPluginManifestRegistry,
+  loadPluginManifestRegistryCore,
   type PluginManifestRegistry,
 } from "../plugins/manifest-registry.js";
 import type { PluginOrigin } from "../plugins/plugin-origin.types.js";
@@ -69,7 +69,7 @@ function loadTestRegistry(
   idHint: string,
   origin: PluginOrigin = "global",
 ): PluginManifestRegistry {
-  return loadPluginManifestRegistry({
+  return loadPluginManifestRegistryCore({
     candidates: [createCandidate(rootDir, idHint, origin)],
   });
 }
@@ -255,7 +255,7 @@ describe("secret provider integration presets", () => {
       },
     });
 
-    const registry = loadPluginManifestRegistry({
+    const registry = loadPluginManifestRegistryCore({
       candidates: [
         createCandidate(rootDir, "long-integration-secrets"),
         createCandidate(longPluginRootDir, longPluginId),
@@ -303,7 +303,7 @@ describe("secret provider integration presets", () => {
       },
     });
 
-    const registry = loadPluginManifestRegistry({
+    const registry = loadPluginManifestRegistryCore({
       candidates: [createCandidate(rootDir, "disabled-secrets", "global")],
       config: {
         plugins: {
@@ -330,39 +330,6 @@ describe("secret provider integration presets", () => {
         },
       }),
     ).toEqual([]);
-  });
-
-  it("applies plugin id aliases when filtering disabled presets", () => {
-    const rootDir = makeTempDir();
-    writeSecureFile(path.join(rootDir, "resolve.mjs"), "process.stdin.resume();\n");
-    writePluginManifest(rootDir, {
-      id: "openai",
-      secretProviderIntegrations: {
-        vault: {
-          providerAlias: "vault",
-          source: "exec",
-          command: "${node}",
-          args: ["./resolve.mjs"],
-        },
-      },
-    });
-    const config = {
-      plugins: {
-        entries: {
-          openai: {
-            enabled: false,
-          },
-        },
-      },
-    };
-    const registry = loadPluginManifestRegistry({
-      candidates: [createCandidate(rootDir, "openai", "global")],
-      config,
-    });
-
-    expect(listSecretProviderIntegrationPresets({ manifestRegistry: registry, config })).toEqual(
-      [],
-    );
   });
 
   it("exposes bundled presets enabled by platform default", () => {
@@ -392,40 +359,6 @@ describe("secret provider integration presets", () => {
       },
     ]);
   });
-
-  it.skipIf(process.platform === "win32")(
-    "materializes node presets from symlinked plugin roots",
-    () => {
-      const rootDir = makeTempDir();
-      const linkParent = makeTempDir();
-      const linkRoot = path.join(linkParent, "plugin-link");
-      writeSecureFile(path.join(rootDir, "resolve.mjs"), "process.stdin.resume();\n");
-      writePluginManifest(rootDir, {
-        id: "linked-secrets",
-        secretProviderIntegrations: {
-          vault: {
-            providerAlias: "vault",
-            source: "exec",
-            command: "${node}",
-            args: ["./resolve.mjs"],
-          },
-        },
-      });
-      fs.symlinkSync(rootDir, linkRoot);
-
-      const registry = loadTestRegistry(linkRoot, "linked-secrets", "global");
-
-      expect(listSecretProviderIntegrationPresets({ manifestRegistry: registry })).toEqual([
-        {
-          id: "vault",
-          pluginId: "linked-secrets",
-          providerAlias: "vault",
-          displayName: "vault",
-          providerConfig: pluginIntegrationProviderConfig("linked-secrets", "vault"),
-        },
-      ]);
-    },
-  );
 
   it.each<PluginOrigin>(["workspace", "config"])(
     "skips secret provider presets from %s plugin roots",
@@ -543,7 +476,7 @@ describe("secret provider integration presets", () => {
         },
       },
     };
-    const registry = loadPluginManifestRegistry({
+    const registry = loadPluginManifestRegistryCore({
       candidates: [createCandidate(rootDir, "revoked-secrets", "global")],
       config,
     });
@@ -685,7 +618,84 @@ describe("secret provider integration presets", () => {
         fs.realpathSync(path.join(realRoot, "bin", "resolve.mjs")),
       );
     }
+    const integration = registry.plugins[0]?.secretProviderIntegrations?.vault;
+    if (!integration) {
+      throw new Error("Expected the linked-root integration");
+    }
+    integration.args = ["./../real-plugin/bin/resolve.mjs"];
+    expect(
+      resolveSecretProviderIntegrationConfig({
+        manifestRegistry: registry,
+        providerAlias: "vault",
+        providerConfig: pluginIntegrationProviderConfig("linked-root-secrets", "vault"),
+      }).ok,
+    ).toBe(false);
   });
+
+  it.each([false, true])(
+    "preserves platform policy for entrypoint parent links (outside root: %s)",
+    (outsideRoot) => {
+      const rootDir = makeTempDir();
+      const targetDir = path.join(outsideRoot ? makeTempDir() : rootDir, "resolver");
+      makeSecureDir(targetDir);
+      writeSecureFile(path.join(targetDir, "resolve.mjs"), "process.stdin.resume();\n");
+      fs.symlinkSync(
+        targetDir,
+        path.join(rootDir, "bin"),
+        process.platform === "win32" ? "junction" : "dir",
+      );
+      writePluginManifest(rootDir, {
+        id: "parent-link-secrets",
+        secretProviderIntegrations: {
+          vault: {
+            source: "exec",
+            command: "${node}",
+            args: ["./bin/resolve.mjs"],
+          },
+        },
+      });
+
+      const resolved = resolveSecretProviderIntegrationConfig({
+        manifestRegistry: loadTestRegistry(rootDir, "parent-link-secrets"),
+        providerAlias: "vault",
+        providerConfig: pluginIntegrationProviderConfig("parent-link-secrets", "vault"),
+      });
+      expect(resolved.ok).toBe(process.platform === "win32" && !outsideRoot);
+      if (resolved.ok) {
+        expect(resolved.providerConfig.args?.[0]).toBe(
+          fs.realpathSync(path.join(targetDir, "resolve.mjs")),
+        );
+      }
+    },
+  );
+
+  it.each<PluginOrigin>(["global", "bundled"])(
+    "preserves the hardlinked entrypoint policy for %s plugins",
+    (origin) => {
+      const rootDir = makeTempDir();
+      const sourcePath = path.join(rootDir, "source.mjs");
+      writeSecureFile(sourcePath, "process.stdin.resume();\n");
+      fs.linkSync(sourcePath, path.join(rootDir, "resolve.mjs"));
+      writePluginManifest(rootDir, {
+        id: "hardlinked-secrets",
+        ...(origin === "bundled" ? { enabledByDefault: true } : {}),
+        secretProviderIntegrations: {
+          vault: {
+            source: "exec",
+            command: "${node}",
+            args: ["./resolve.mjs"],
+          },
+        },
+      });
+
+      const resolved = resolveSecretProviderIntegrationConfig({
+        manifestRegistry: loadTestRegistry(rootDir, "hardlinked-secrets", origin),
+        providerAlias: "vault",
+        providerConfig: pluginIntegrationProviderConfig("hardlinked-secrets", "vault"),
+      });
+      expect(resolved.ok).toBe(origin === "bundled");
+    },
+  );
 
   it.skipIf(process.platform === "win32")(
     "skips node presets whose entrypoint parent directory is writable by others",

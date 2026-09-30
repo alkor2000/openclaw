@@ -1,13 +1,15 @@
-// Telegram plugin module implements bot native command menu behavior.
 import { createHash } from "node:crypto";
 import type { Bot } from "grammy";
 import type { LanguageCode } from "grammy/types";
+import { pruneMapToMaxSize } from "openclaw/plugin-sdk/collection-runtime";
 import { logVerbose } from "openclaw/plugin-sdk/runtime-env";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
 import {
+  asOptionalObjectRecord,
   normalizeOptionalString,
-  readStringValue,
+  readStringField,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { truncateCodePoints } from "openclaw/plugin-sdk/text-utility-runtime";
 import { withTelegramApiErrorLogging } from "./api-logging.js";
 import {
   enqueueTelegramMenuSync,
@@ -46,6 +48,9 @@ type TelegramPluginCommandSpec = {
   descriptionLocalizations?: Record<string, string>;
 };
 
+type TelegramSelectedPluginMenuCommand<TSpec extends TelegramPluginCommandSpec> =
+  TelegramMenuCommand & { spec: TSpec };
+
 const TELEGRAM_COMMAND_MENU_SCOPES: readonly TelegramCommandMenuScope[] = [
   { label: "default" },
   { label: "all_group_chats", options: { scope: { type: "all_group_chats" } } },
@@ -67,24 +72,11 @@ function countTelegramCommandText(value: string): number {
 }
 
 function truncateTelegramCommandText(value: string, maxLength: number): string {
-  if (maxLength <= 0) {
-    return "";
+  const prefix = truncateCodePoints(value, maxLength);
+  if (prefix === value || maxLength <= 0) {
+    return prefix;
   }
-
-  const suffix = maxLength > 1 ? "…" : "";
-  const prefixLimit = maxLength - countTelegramCommandText(suffix);
-  let count = 0;
-  let prefixEnd = 0;
-  for (const char of value) {
-    count += 1;
-    if (count <= prefixLimit) {
-      prefixEnd += char.length;
-    }
-    if (count > maxLength) {
-      return `${value.slice(0, prefixEnd)}${suffix}`;
-    }
-  }
-  return value;
+  return maxLength > 1 ? `${truncateCodePoints(prefix, maxLength - 1)}…` : prefix;
 }
 
 function fitTelegramCommandsWithinTextBudget(
@@ -139,35 +131,16 @@ function fitTelegramCommandsWithinTextBudget(
   };
 }
 
-function readErrorTextField(value: unknown, key: "description" | "message"): string | undefined {
-  if (!value || typeof value !== "object" || !(key in value)) {
-    return undefined;
-  }
-  return readStringValue((value as Record<"description" | "message", unknown>)[key]);
-}
-
 function isBotCommandsTooMuchError(err: unknown): boolean {
-  if (!err) {
-    return false;
-  }
   const pattern = /\bBOT_COMMANDS_TOO_MUCH\b/i;
   if (typeof err === "string") {
     return pattern.test(err);
   }
-  if (err instanceof Error) {
-    if (pattern.test(err.message)) {
-      return true;
-    }
-  }
-  const description = readErrorTextField(err, "description");
-  if (description && pattern.test(description)) {
-    return true;
-  }
-  const message = readErrorTextField(err, "message");
-  if (message && pattern.test(message)) {
-    return true;
-  }
-  return false;
+  const record = asOptionalObjectRecord(err);
+  return (["description", "message"] as const).some((key) => {
+    const text = record && key in record ? readStringField(record, key) : undefined;
+    return text !== undefined && pattern.test(text);
+  });
 }
 
 function formatTelegramCommandRetrySuccessLog(params: {
@@ -182,12 +155,17 @@ function formatTelegramCommandRetrySuccessLog(params: {
   );
 }
 
-export function buildPluginTelegramMenuCommands(params: {
-  specs: TelegramPluginCommandSpec[];
+export function buildPluginTelegramMenuCommands<TSpec extends TelegramPluginCommandSpec>(params: {
+  specs: readonly TSpec[];
   existingCommands: Set<string>;
-}): { commands: TelegramMenuCommand[]; issues: string[] } {
+}): {
+  commands: TelegramMenuCommand[];
+  selectedCommands: TelegramSelectedPluginMenuCommand<TSpec>[];
+  issues: string[];
+} {
   const { specs, existingCommands } = params;
   const commands: TelegramMenuCommand[] = [];
+  const selectedCommands: TelegramSelectedPluginMenuCommand<TSpec>[] = [];
   const issues: string[] = [];
   const pluginCommandNames = new Set<string>();
 
@@ -238,14 +216,20 @@ export function buildPluginTelegramMenuCommands(params: {
     }
     pluginCommandNames.add(normalized);
     existingCommands.add(normalized);
-    const menuCommand: TelegramMenuCommand = { command: normalized, description };
+    const menuCommand: TelegramSelectedPluginMenuCommand<TSpec> = {
+      command: normalized,
+      description,
+      spec,
+    };
     if (spec.descriptionLocalizations) {
       menuCommand.descriptionLocalizations = spec.descriptionLocalizations;
     }
-    commands.push(menuCommand);
+    const { spec: _spec, ...displayCommand } = menuCommand;
+    commands.push(displayCommand);
+    selectedCommands.push(menuCommand);
   }
 
-  return { commands, issues };
+  return { commands, selectedCommands, issues };
 }
 
 export function buildCappedTelegramMenuCommands(params: {
@@ -269,7 +253,8 @@ export function buildCappedTelegramMenuCommands(params: {
     maxCommands,
     maxTotalChars,
   });
-  rememberCappedTelegramMenuResult(cacheKey, result);
+  cappedTelegramMenuCache.set(cacheKey, result);
+  pruneMapToMaxSize(cappedTelegramMenuCache, TELEGRAM_MENU_RESULT_CACHE_MAX);
   return result;
 }
 
@@ -374,20 +359,6 @@ function updateTelegramCommandLocalizationDigest(
   }
 }
 
-function rememberCappedTelegramMenuResult(
-  key: string,
-  result: ReturnType<typeof buildUncachedCappedTelegramMenuCommands>,
-): void {
-  cappedTelegramMenuCache.set(key, result);
-  if (cappedTelegramMenuCache.size <= TELEGRAM_MENU_RESULT_CACHE_MAX) {
-    return;
-  }
-  const oldestKey = cappedTelegramMenuCache.keys().next().value;
-  if (oldestKey) {
-    cappedTelegramMenuCache.delete(oldestKey);
-  }
-}
-
 function hashCommandList(commands: TelegramMenuCommand[]): string {
   const digest = createHash("sha256");
   updateTelegramCommandDigestField(digest, String(commands.length));
@@ -425,15 +396,6 @@ function buildEffectiveTelegramCommandLocalizations(
   return [...effective.entries()].toSorted(([a], [b]) => a.localeCompare(b));
 }
 
-function readLocalizedDescription(
-  localizations: Array<[LanguageCode, string]>,
-  languageCode: LanguageCode,
-): string | undefined {
-  return localizations.find(
-    ([effectiveLanguageCode]) => effectiveLanguageCode === languageCode,
-  )?.[1];
-}
-
 function toTelegramBotCommands(commands: TelegramMenuCommand[]): Array<{
   command: string;
   description: string;
@@ -452,7 +414,9 @@ function buildLocalizedCommandVariants(commands: TelegramMenuCommand[]): {
   const unsupportedLanguageCodes = new Set<string>();
   const commandsWithLocalizations = commands.map((command) => ({
     command,
-    localizations: buildEffectiveTelegramCommandLocalizations(command.descriptionLocalizations),
+    localizations: new Map(
+      buildEffectiveTelegramCommandLocalizations(command.descriptionLocalizations),
+    ),
   }));
   for (const { command, localizations } of commandsWithLocalizations) {
     for (const [languageCode] of localizations) {
@@ -472,7 +436,7 @@ function buildLocalizedCommandVariants(commands: TelegramMenuCommand[]): {
   const variants = [...locales].toSorted().map((languageCode) => {
     const localizedCommands = commandsWithLocalizations.map(({ command, localizations }) =>
       Object.assign({}, command, {
-        description: readLocalizedDescription(localizations, languageCode) ?? command.description,
+        description: localizations.get(languageCode) ?? command.description,
       }),
     );
     return {
@@ -676,9 +640,7 @@ export function syncTelegramMenuCommands(params: {
         if (!isBotCommandsTooMuchError(err)) {
           throw err;
         }
-        const nextCount = Math.floor(retryCommands.length * TELEGRAM_COMMAND_RETRY_RATIO);
-        const reducedCount =
-          nextCount < retryCommands.length ? nextCount : retryCommands.length - 1;
+        const reducedCount = Math.floor(retryCommands.length * TELEGRAM_COMMAND_RETRY_RATIO);
         const nextCommands = reduceTelegramMenuCommands(commandsToRegister, reducedCount);
         if (reducedCount <= 0 || nextCommands.length === 0) {
           runtime.error?.(

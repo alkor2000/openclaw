@@ -4,12 +4,13 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
 import { setActivePluginRegistry } from "../../plugins/runtime.js";
 import { createTestRegistry } from "../../test-utils/channel-plugins.js";
+import { MessageActionDeniedError } from "./message-action-denial.js";
 import { runMessageAction } from "./message-action-runner.js";
 import {
   forumTestPlugin,
   workspaceConfig,
   workspaceTestPlugin,
-} from "./message-action-runner.test-helpers.js";
+} from "./message-action-runner.test-support.js";
 
 const emptyConfig = {} as OpenClawConfig;
 describe("runMessageAction send validation", () => {
@@ -43,7 +44,7 @@ describe("runMessageAction send validation", () => {
       toolContext: {
         currentChannelProvider: "webchat",
       },
-      sessionKey: "agent:main",
+      sessionKey: "agent:main:main",
       sourceReplyDeliveryMode: "message_tool_only",
     });
 
@@ -140,20 +141,37 @@ describe("runMessageAction send validation", () => {
   });
 
   it("requires source address context before inferring non-webchat source sinks", async () => {
-    await expect(
-      runMessageAction({
-        cfg: emptyConfig,
-        action: "send",
-        params: {
-          message: "telegram reply",
-        },
-        toolContext: {
-          currentChannelProvider: "telegram",
-        },
-        sessionKey: "agent:main:telegram:direct:123456789",
-        sourceReplyDeliveryMode: "message_tool_only",
-      }),
-    ).rejects.toThrow(/requires a target/i);
+    const failure = runMessageAction({
+      cfg: emptyConfig,
+      action: "send",
+      params: {
+        message: "telegram reply",
+      },
+      toolContext: {
+        currentChannelProvider: "telegram",
+      },
+      sessionKey: "agent:main:telegram:direct:123456789",
+      sourceReplyDeliveryMode: "message_tool_only",
+    });
+    await expect(failure).rejects.toBeInstanceOf(MessageActionDeniedError);
+    await expect(failure).rejects.toMatchObject({
+      reasonCode: "message_target_missing",
+      policyRef: "message-target:required",
+    });
+    await expect(failure).rejects.toThrow(/requires a target/i);
+  });
+
+  it("types disabled broadcast as an outcome-owning policy denial", async () => {
+    const failure = runMessageAction({
+      cfg: { tools: { message: { broadcast: { enabled: false } } } } as OpenClawConfig,
+      action: "broadcast",
+      params: { targets: ["qa-channel:direct:one"], message: "hello" },
+    });
+    await expect(failure).rejects.toBeInstanceOf(MessageActionDeniedError);
+    await expect(failure).rejects.toMatchObject({
+      reasonCode: "message_broadcast_disabled",
+      policyRef: "message-broadcast:enabled",
+    });
   });
 
   it("strips unsupported citation control markers from internal UI source replies", async () => {
@@ -166,7 +184,7 @@ describe("runMessageAction send validation", () => {
       toolContext: {
         currentChannelProvider: "webchat",
       },
-      sessionKey: "agent:main",
+      sessionKey: "agent:main:main",
       sourceReplyDeliveryMode: "message_tool_only",
     });
 
@@ -192,7 +210,7 @@ describe("runMessageAction send validation", () => {
         toolContext: {
           currentChannelProvider: "webchat",
         },
-        sessionKey: "agent:main",
+        sessionKey: "agent:main:main",
         sourceReplyDeliveryMode: "automatic",
       }),
     ).rejects.toThrow(/requires a target/i);
@@ -213,28 +231,42 @@ describe("runMessageAction send validation", () => {
     ).rejects.toThrow(/requires a target/i);
   });
 
-  it("keeps explicit message routes on the normal outbound path", async () => {
-    const result = await runMessageAction({
-      cfg: workspaceConfig,
-      action: "send",
-      params: {
-        channel: "workspace",
-        target: "#C12345678",
-        message: "hello from codex",
-      },
-      toolContext: {
-        currentChannelProvider: "webchat",
-      },
-      sessionKey: "agent:main",
-      sourceReplyDeliveryMode: "message_tool_only",
-      dryRun: true,
-    });
+  it.each([undefined, false, true])(
+    "applies provider policy to explicit message-tool-only routes (allowed=%s)",
+    async (allowAcrossProviders) => {
+      const send = runMessageAction({
+        cfg: {
+          ...workspaceConfig,
+          tools: { message: { crossContext: { allowAcrossProviders } } },
+        },
+        action: "send",
+        params: {
+          channel: "workspace",
+          target: "#C12345678",
+          message: "hello from codex",
+        },
+        toolContext: {
+          currentChannelProvider: "webchat",
+        },
+        sessionKey: "agent:main:main",
+        sourceReplyDeliveryMode: "message_tool_only",
+        dryRun: true,
+      });
 
-    expect(result).toMatchObject({
-      kind: "send",
-      channel: "workspace",
-      handledBy: "core",
-      dryRun: true,
-    });
-  });
+      if (allowAcrossProviders === false) {
+        await expect(send).rejects.toMatchObject({
+          reasonCode: "message_cross_context_denied",
+          policyRef: "message-cross-context:provider",
+        });
+        return;
+      }
+      const result = await send;
+      expect(result).toMatchObject({
+        kind: "send",
+        channel: "workspace",
+        handledBy: "core",
+        dryRun: true,
+      });
+    },
+  );
 });

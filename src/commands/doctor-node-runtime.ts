@@ -1,5 +1,6 @@
 import { createDoctorHealthContribution } from "../flows/doctor-health-contribution.js";
 import { isSupportedNodeVersion, parseSemver } from "../infra/runtime-guard.js";
+import { resolveNodeVersionManager } from "../shared/version-manager-path.js";
 // Doctor health contribution: Node.js runtime diagnostics.
 //
 // Surfaces the Node version, install channel (version manager vs system), and
@@ -37,51 +38,6 @@ const NODE_RELEASE_SCHEDULE: NodeReleaseInfo[] = [
   { major: 26, maintenanceStart: "2027-10-20", endOfLife: "2029-04-30", isLts: true },
 ];
 
-/** Version-manager detection markers, checked against the executable path. */
-interface VersionManagerMarker {
-  name: string;
-  /** Lower-cased path fragments; any match identifies the manager. */
-  fragments: string[];
-}
-
-const VERSION_MANAGER_MARKERS: VersionManagerMarker[] = [
-  { name: "nvm", fragments: ["/.nvm/", "\\.nvm\\", "/nvm/versions/", "\\nvm\\"] },
-  {
-    name: "fnm",
-    fragments: ["/.fnm/", "\\.fnm\\", "/fnm/node-versions/", "\\fnm\\node-versions\\"],
-  },
-  { name: "volta", fragments: ["/.volta/", "\\.volta\\"] },
-  { name: "asdf", fragments: ["/.asdf/", "\\.asdf\\"] },
-  { name: "n", fragments: ["/n/versions/node/"] },
-  { name: "nodenv", fragments: ["/.nodenv/", "\\.nodenv\\"] },
-  { name: "nodebrew", fragments: ["/.nodebrew/", "\\.nodebrew\\"] },
-  { name: "nvs", fragments: ["/.nvs/", "\\.nvs\\"] },
-];
-
-/**
- * Identify a Node version manager from the executable path (case-insensitive,
- * both slash styles) or, for nvm, its well-known environment variable.
- * Returns the manager name or null when the runtime looks system-installed.
- */
-export function detectVersionManagerName(
-  env: Record<string, string | undefined>,
-  execPath: string | null,
-): string | null {
-  if (env.NVM_DIR && env.NVM_DIR.trim() !== "") {
-    return "nvm";
-  }
-  if (!execPath) {
-    return null;
-  }
-  const lowered = execPath.toLowerCase();
-  for (const marker of VERSION_MANAGER_MARKERS) {
-    if (marker.fragments.some((fragment) => lowered.includes(fragment))) {
-      return marker.name;
-    }
-  }
-  return null;
-}
-
 /** Collected facts about the current Node.js runtime. */
 export interface NodeRuntimeDiagnostics {
   version: string | null;
@@ -102,13 +58,14 @@ export function collectNodeRuntimeDiagnostics(
 ): NodeRuntimeDiagnostics {
   const version = versionRaw ? versionRaw.replace(/^v/, "") : null;
   const parsed = version ? parseSemver(version) : null;
-  const manager = detectVersionManagerName(env, execPath);
+  // An installed manager must not relabel a different selected executable.
+  const manager = execPath ? resolveNodeVersionManager(execPath, env) : "system";
   return {
     version,
     major: parsed ? parsed.major : null,
     execPath,
-    versionManaged: manager !== null,
-    versionManagerHint: manager,
+    versionManaged: manager !== "system",
+    versionManagerHint: manager === "system" || manager === "other" ? null : manager,
   };
 }
 

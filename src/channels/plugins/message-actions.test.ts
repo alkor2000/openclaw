@@ -17,7 +17,7 @@ import {
   resolveChannelMessageToolSchemaProperties,
 } from "./message-action-discovery.js";
 import type { ChannelMessageCapability } from "./message-capabilities.js";
-import type { ChannelPlugin } from "./types.public.js";
+import type { ChannelMessageToolSchemaContribution, ChannelPlugin } from "./types.public.js";
 
 const emptyRegistry = createTestRegistry([]);
 const EMPTY_PREPARED_MESSAGE_TOOL_CATALOG = {
@@ -77,6 +77,7 @@ function activateDiscoveredMessageActionPlugin(params: {
   id: ChannelPlugin["id"];
   label: string;
   describeMessageTool: NonNullable<ChannelPlugin["actions"]>["describeMessageTool"];
+  additionalPlugins?: ChannelPlugin[];
 }) {
   const plugin: ChannelPlugin = {
     ...createChannelTestPluginBase({
@@ -87,7 +88,15 @@ function activateDiscoveredMessageActionPlugin(params: {
     }),
     actions: { describeMessageTool: params.describeMessageTool },
   };
-  setActivePluginRegistry(createTestRegistry([{ pluginId: params.id, source: "test", plugin }]));
+  setActivePluginRegistry(
+    createTestRegistry(
+      [plugin, ...(params.additionalPlugins ?? [])].map((entry) => ({
+        pluginId: entry.id,
+        source: "test",
+        plugin: entry,
+      })),
+    ),
+  );
 }
 
 describe("message action capability checks", () => {
@@ -177,28 +186,43 @@ describe("message action capability checks", () => {
     ).toBe(true);
   });
 
-  it("uses unified message tool discovery for actions, capabilities, and schema", () => {
-    activateDiscoveredMessageActionPlugin({
-      id: "demo-unified",
-      label: "Demo Unified",
-      describeMessageTool: () => ({
+  it("keeps all-configured schema account-neutral from another current channel", () => {
+    const schema: ChannelMessageToolSchemaContribution[] = [
+      {
         actions: ["react"],
-        capabilities: ["presentation"],
-        schema: {
-          properties: {
-            components: Type.Array(Type.String()),
-          },
+        properties: { emoji: Type.Optional(Type.String()) },
+      },
+      {
+        actions: ["send"],
+        properties: { components: Type.Optional(Type.Object({})) },
+        visibility: "all-configured",
+      },
+    ];
+    activateDiscoveredMessageActionPlugin({
+      id: "discord",
+      label: "Discord",
+      additionalPlugins: [
+        {
+          ...createChannelTestPluginBase({ id: "slack" }),
+          actions: { describeMessageTool: () => ({ actions: [] }) },
         },
-      }),
+      ],
+      describeMessageTool: ({ accountId }) =>
+        accountId
+          ? { actions: [], schema: null }
+          : {
+              actions: ["react", "send"],
+              schema,
+            },
     });
 
-    expect(channelSupportsMessageCapability({} as OpenClawConfig, "presentation")).toBe(true);
-    expect(
-      resolveChannelMessageToolSchemaProperties({
-        cfg: {} as OpenClawConfig,
-        channel: "demo-unified",
-      }),
-    ).toHaveProperty("components");
+    const properties = resolveChannelMessageToolSchemaProperties({
+      cfg: {} as OpenClawConfig,
+      channel: "slack",
+      accountId: "slack-workspace",
+    });
+    expect(properties).toHaveProperty("components");
+    expect(properties).not.toHaveProperty("emoji");
   });
 
   it("keeps contributed schema properties optional so only action stays required", () => {

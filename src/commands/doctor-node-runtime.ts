@@ -1,3 +1,5 @@
+import { createDoctorHealthContribution } from "../flows/doctor-health-contribution.js";
+import { isSupportedNodeVersion, parseSemver } from "../infra/runtime-guard.js";
 // Doctor health contribution: Node.js runtime diagnostics.
 //
 // Surfaces the Node version, install channel (version manager vs system), and
@@ -10,11 +12,9 @@
 //
 // The default summary omits the executable path entirely so ordinary copied
 // Doctor output does not disclose local filesystem layout. Path inclusion is
-// parameterized (includeExecPath) for the verbose gate; the verbose flag
-// itself and its wiring are owned by the maintainer per the #59414 split.
+// parameterized (includeExecPath); registration and a verbose gate still
+// require integration with the existing Doctor runtime owner.
 import { shortenHomePath } from "../utils.js";
-import { isSupportedNodeVersion, parseSemver } from "../infra/runtime-guard.js";
-import { createDoctorHealthContribution } from "../flows/doctor-health-contribution.js";
 
 /**
  * Node.js release lifecycle dates (maintenance entry and end-of-life),
@@ -33,8 +33,8 @@ interface NodeReleaseInfo {
 const NODE_RELEASE_SCHEDULE: NodeReleaseInfo[] = [
   { major: 22, maintenanceStart: "2025-10-21", endOfLife: "2027-04-30", isLts: true },
   { major: 24, maintenanceStart: "2026-10-20", endOfLife: "2028-04-30", isLts: true },
-  { major: 25, maintenanceStart: "2026-10-01", endOfLife: "2027-06-01", isLts: false },
-  { major: 26, maintenanceStart: "2027-10-19", endOfLife: "2029-04-30", isLts: true },
+  { major: 25, maintenanceStart: "2026-04-01", endOfLife: "2026-06-01", isLts: false },
+  { major: 26, maintenanceStart: "2027-10-20", endOfLife: "2029-04-30", isLts: true },
 ];
 
 /** Version-manager detection markers, checked against the executable path. */
@@ -46,7 +46,10 @@ interface VersionManagerMarker {
 
 const VERSION_MANAGER_MARKERS: VersionManagerMarker[] = [
   { name: "nvm", fragments: ["/.nvm/", "\\.nvm\\", "/nvm/versions/", "\\nvm\\"] },
-  { name: "fnm", fragments: ["/.fnm/", "\\.fnm\\", "/fnm/node-versions/", "\\fnm\\node-versions\\"] },
+  {
+    name: "fnm",
+    fragments: ["/.fnm/", "\\.fnm\\", "/fnm/node-versions/", "\\fnm\\node-versions\\"],
+  },
   { name: "volta", fragments: ["/.volta/", "\\.volta\\"] },
   { name: "asdf", fragments: ["/.asdf/", "\\.asdf\\"] },
   { name: "n", fragments: ["/n/versions/node/"] },
@@ -109,10 +112,11 @@ export function collectNodeRuntimeDiagnostics(
   };
 }
 
-/** Days until an ISO date from now; negative when the date has passed. */
+/** Days until an ISO date from now, rounded up to preserve its UTC boundary. */
 function daysUntil(isoDate: string): number {
   const target = Date.parse(`${isoDate}T00:00:00Z`);
-  return Math.floor((target - Date.now()) / 86_400_000);
+  // A positive partial day must not trigger maintenance or EOL before midnight UTC.
+  return Math.ceil((target - Date.now()) / 86_400_000);
 }
 
 /** Roughly whole months represented by a day count (floored, min 0). */
@@ -191,17 +195,17 @@ export function buildNodeRuntimeSummary(
 
 /**
  * Ready-to-wire Doctor health contribution. Not yet registered in the
- * initial contribution list: the final contribution-model wiring and the
- * verbose gate (CLI flag + plumbing) are owned by the maintainer per the
- * split agreed on #59414. The default render never includes the executable
- * path; flip includeExecPath from the verbose flag when wiring it up.
+ * initial contribution list. Integration must extend the existing Doctor
+ * runtime owner and preserve its compatibility and SQLite diagnostics. The
+ * default render never includes the executable path; only a verbose gate
+ * should enable includeExecPath.
  */
 export const nodeRuntimeHealthContribution = createDoctorHealthContribution({
   id: "doctor:node-runtime",
   label: "Node.js runtime",
   run: async (ctx): Promise<void> => {
     const diag = collectNodeRuntimeDiagnostics();
-    // includeExecPath stays false until the maintainer-owned verbose gate
+    // includeExecPath stays false until a verbose gate
     // lands; ordinary Doctor output must not disclose filesystem layout.
     const summary = buildNodeRuntimeSummary(diag, { includeExecPath: false });
     ctx.runtime.log(summary);

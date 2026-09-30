@@ -43,9 +43,9 @@ describe("detectVersionManagerName", () => {
   });
 
   it("detects nvm via execPath", () => {
-    expect(
-      detectVersionManagerName({}, "/home/test/.nvm/versions/node/v24.15.0/bin/node"),
-    ).toBe("nvm");
+    expect(detectVersionManagerName({}, "/home/test/.nvm/versions/node/v24.15.0/bin/node")).toBe(
+      "nvm",
+    );
   });
 
   it("detects fnm via execPath", () => {
@@ -64,9 +64,9 @@ describe("detectVersionManagerName", () => {
   });
 
   it("detects asdf via execPath", () => {
-    expect(
-      detectVersionManagerName({}, "/home/test/.asdf/installs/nodejs/24.15.0/bin/node"),
-    ).toBe("asdf");
+    expect(detectVersionManagerName({}, "/home/test/.asdf/installs/nodejs/24.15.0/bin/node")).toBe(
+      "asdf",
+    );
   });
 
   it("detects n via execPath", () => {
@@ -138,7 +138,7 @@ describe("buildNodeRuntimeWarnings", () => {
     // Fixed reference date. Per the upstream schedule encoded in the module:
     // Node 22 is in maintenance (since 2025-10-21, EOL 2027-04-30);
     // Node 24 is fully current (maintenance starts 2026-10-20);
-    // Node 25 is supported and not yet in maintenance (starts 2026-10-01).
+    // Node 25 satisfies this branch's engines but reached upstream EOL on 2026-06-01.
     vi.setSystemTime(new Date("2026-08-10T00:00:00Z"));
   });
 
@@ -172,10 +172,50 @@ describe("buildNodeRuntimeWarnings", () => {
     expect(warnings[0]).toContain("EOL 2027-04-30");
   });
 
-  it("stays quiet for a supported release not yet in maintenance", () => {
-    // Node 25.9.0 satisfies engines; its maintenance window starts 2026-10-01.
-    expect(buildNodeRuntimeWarnings(makeDiag({ version: "25.9.0", major: 25 }))).toEqual([]);
+  it("warns when an engines-supported release has reached upstream end-of-life", () => {
+    const warnings = buildNodeRuntimeWarnings(makeDiag({ version: "25.9.0", major: 25 }));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("Node 25 reached upstream end-of-life on 2026-06-01");
+    expect(warnings[0]).toContain("no longer receives security updates");
   });
+
+  it.each([
+    ["25.9.0", 25, "2026-03-31T23:59:59.999Z", null],
+    [
+      "25.9.0",
+      25,
+      "2026-04-01T00:00:00.000Z",
+      "Node 25 is in upstream maintenance mode (EOL 2026-06-01",
+    ],
+    [
+      "25.9.0",
+      25,
+      "2026-05-31T23:59:59.999Z",
+      "Node 25 is in upstream maintenance mode (EOL 2026-06-01",
+    ],
+    [
+      "25.9.0",
+      25,
+      "2026-06-01T00:00:00.000Z",
+      "Node 25 reached upstream end-of-life on 2026-06-01",
+    ],
+    ["26.0.0", 26, "2027-10-19T23:59:59.999Z", null],
+    [
+      "26.0.0",
+      26,
+      "2027-10-20T00:00:00.000Z",
+      "Node 26 LTS is in upstream maintenance mode (EOL 2029-04-30",
+    ],
+  ] as const)(
+    "reports Node %s (major %i) lifecycle on %s",
+    (version, major, date, expectedWarning) => {
+      vi.setSystemTime(new Date(date));
+      const warnings = buildNodeRuntimeWarnings(makeDiag({ version, major }));
+      expect(warnings).toEqual(
+        expectedWarning === null ? [] : [expect.stringContaining(expectedWarning)],
+      );
+    },
+  );
 
   it("returns no warnings when the version is missing", () => {
     expect(buildNodeRuntimeWarnings(makeDiag({ version: null, major: null }))).toEqual([]);

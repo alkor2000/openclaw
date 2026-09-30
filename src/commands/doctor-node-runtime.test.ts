@@ -3,12 +3,15 @@
 // Support decisions are delegated to runtime-guard's isSupportedNodeVersion
 // (the canonical engines contract), so these tests exercise the delegation
 // boundary with engines edge versions rather than re-encoding version
-// knowledge. Redaction scenarios are NOT tested here: path redaction moved
+// knowledge. Lifecycle fixtures model an accepted runtime independently of
+// the repository's current engine range. Redaction scenarios are NOT tested
+// here: path redaction moved
 // to the shared shortenHomePath helper (#121455) which carries its own
 // regression tests. This file covers version-manager detection, diagnostics
 // collection, lifecycle advisories, and the two summary forms (default
 // without the executable path, verbose-style with it).
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as runtimeGuard from "../infra/runtime-guard.js";
 import {
   buildNodeRuntimeSummary,
   buildNodeRuntimeWarnings,
@@ -135,10 +138,6 @@ describe("collectNodeRuntimeDiagnostics", () => {
 describe("buildNodeRuntimeWarnings", () => {
   beforeEach(() => {
     vi.useFakeTimers();
-    // Fixed reference date. Per the upstream schedule encoded in the module:
-    // Node 22 is in maintenance (since 2025-10-21, EOL 2027-04-30);
-    // Node 24 is fully current (maintenance starts 2026-10-20);
-    // Node 25 satisfies this branch's engines but reached upstream EOL on 2026-06-01.
     vi.setSystemTime(new Date("2026-08-10T00:00:00Z"));
   });
 
@@ -146,76 +145,103 @@ describe("buildNodeRuntimeWarnings", () => {
     vi.useRealTimers();
   });
 
-  it("returns no warnings for a fully current supported version", () => {
-    expect(buildNodeRuntimeWarnings(makeDiag({ version: "24.15.0", major: 24 }))).toEqual([]);
-  });
-
-  it("warns via the engines contract for an unsupported major", () => {
-    // Node 20 is outside the engines range entirely.
-    const warnings = buildNodeRuntimeWarnings(makeDiag({ version: "20.18.0", major: 20 }));
+  it.each([
+    ["20.18.0", 20],
+    ["24.0.0", 24],
+  ] as const)("warns without lifecycle advice for unsupported Node %s", (version, major) => {
+    expect(runtimeGuard.isSupportedNodeVersion(version)).toBe(false);
+    const warnings = buildNodeRuntimeWarnings(makeDiag({ version, major }));
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain("outside OpenClaw's supported engine range");
     expect(warnings[0]).toContain("package.json engines");
-  });
-
-  it("warns via the engines contract for a below-floor patch of a supported major", () => {
-    // Node 24.0.0 is below the 24.15.0 engines floor.
-    const warnings = buildNodeRuntimeWarnings(makeDiag({ version: "24.0.0", major: 24 }));
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0]).toContain("outside OpenClaw's supported engine range");
-  });
-
-  it("notes maintenance mode for a supported release in upstream maintenance", () => {
-    const warnings = buildNodeRuntimeWarnings(makeDiag({ version: "22.22.3", major: 22 }));
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0]).toContain("maintenance mode");
-    expect(warnings[0]).toContain("EOL 2027-04-30");
-  });
-
-  it("warns when an engines-supported release has reached upstream end-of-life", () => {
-    const warnings = buildNodeRuntimeWarnings(makeDiag({ version: "25.9.0", major: 25 }));
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0]).toContain("Node 25 reached upstream end-of-life on 2026-06-01");
-    expect(warnings[0]).toContain("no longer receives security updates");
+    expect(warnings[0]).not.toContain("maintenance");
   });
 
   it.each([
-    ["25.9.0", 25, "2026-03-31T23:59:59.999Z", null],
-    [
-      "25.9.0",
-      25,
-      "2026-04-01T00:00:00.000Z",
-      "Node 25 is in upstream maintenance mode (EOL 2026-06-01",
-    ],
-    [
-      "25.9.0",
-      25,
-      "2026-05-31T23:59:59.999Z",
-      "Node 25 is in upstream maintenance mode (EOL 2026-06-01",
-    ],
-    [
-      "25.9.0",
-      25,
-      "2026-06-01T00:00:00.000Z",
-      "Node 25 reached upstream end-of-life on 2026-06-01",
-    ],
-    ["26.0.0", 26, "2027-10-19T23:59:59.999Z", null],
-    [
-      "26.0.0",
-      26,
-      "2027-10-20T00:00:00.000Z",
-      "Node 26 LTS is in upstream maintenance mode (EOL 2029-04-30",
-    ],
-  ] as const)(
-    "reports Node %s (major %i) lifecycle on %s",
-    (version, major, date, expectedWarning) => {
-      vi.setSystemTime(new Date(date));
-      const warnings = buildNodeRuntimeWarnings(makeDiag({ version, major }));
-      expect(warnings).toEqual(
-        expectedWarning === null ? [] : [expect.stringContaining(expectedWarning)],
-      );
-    },
-  );
+    ["22.22.3", 22],
+    ["24.15.0", 24],
+    ["24.16.0", 24],
+    ["25.9.0", 25],
+    ["26.0.0", 26],
+    ["26.1.0", 26],
+  ] as const)("delegates Node %s support to the real engines contract", (version, major) => {
+    const supported = runtimeGuard.isSupportedNodeVersion(version);
+    const warnings = buildNodeRuntimeWarnings(makeDiag({ version, major }));
+    const engineWarnings = warnings.filter((warning) =>
+      warning.includes("outside OpenClaw's supported engine range"),
+    );
+    expect(engineWarnings).toHaveLength(supported ? 0 : 1);
+    if (!supported) {
+      expect(warnings).toEqual(engineWarnings);
+    }
+  });
+
+  describe("lifecycle advice for an accepted runtime", () => {
+    beforeEach(() => {
+      // Historical release dates stay testable after the real engines contract retires a major.
+      vi.spyOn(runtimeGuard, "isSupportedNodeVersion").mockReturnValue(true);
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it("returns no warnings before upstream maintenance", () => {
+      expect(buildNodeRuntimeWarnings(makeDiag({ version: "24.15.0", major: 24 }))).toEqual([]);
+    });
+
+    it("notes maintenance mode for a release in upstream maintenance", () => {
+      const warnings = buildNodeRuntimeWarnings(makeDiag({ version: "22.22.3", major: 22 }));
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("maintenance mode");
+      expect(warnings[0]).toContain("EOL 2027-04-30");
+    });
+
+    it("warns when a release has reached upstream end-of-life", () => {
+      const warnings = buildNodeRuntimeWarnings(makeDiag({ version: "25.9.0", major: 25 }));
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("Node 25 reached upstream end-of-life on 2026-06-01");
+      expect(warnings[0]).toContain("no longer receives security updates");
+    });
+
+    it.each([
+      ["25.9.0", 25, "2026-03-31T23:59:59.999Z", null],
+      [
+        "25.9.0",
+        25,
+        "2026-04-01T00:00:00.000Z",
+        "Node 25 is in upstream maintenance mode (EOL 2026-06-01",
+      ],
+      [
+        "25.9.0",
+        25,
+        "2026-05-31T23:59:59.999Z",
+        "Node 25 is in upstream maintenance mode (EOL 2026-06-01",
+      ],
+      [
+        "25.9.0",
+        25,
+        "2026-06-01T00:00:00.000Z",
+        "Node 25 reached upstream end-of-life on 2026-06-01",
+      ],
+      ["26.0.0", 26, "2027-10-19T23:59:59.999Z", null],
+      [
+        "26.0.0",
+        26,
+        "2027-10-20T00:00:00.000Z",
+        "Node 26 LTS is in upstream maintenance mode (EOL 2029-04-30",
+      ],
+    ] as const)(
+      "reports Node %s (major %i) lifecycle on %s",
+      (version, major, date, expectedWarning) => {
+        vi.setSystemTime(new Date(date));
+        const warnings = buildNodeRuntimeWarnings(makeDiag({ version, major }));
+        expect(warnings).toEqual(
+          expectedWarning === null ? [] : [expect.stringContaining(expectedWarning)],
+        );
+      },
+    );
+  });
 
   it("returns no warnings when the version is missing", () => {
     expect(buildNodeRuntimeWarnings(makeDiag({ version: null, major: null }))).toEqual([]);
@@ -223,13 +249,6 @@ describe("buildNodeRuntimeWarnings", () => {
 
   it("returns no lifecycle note for an unknown future major", () => {
     expect(buildNodeRuntimeWarnings(makeDiag({ version: "99.0.0", major: 99 }))).toEqual([]);
-  });
-
-  it("does not stack lifecycle advice onto the engines warning", () => {
-    // Unsupported versions get exactly one warning: the engines pointer.
-    const warnings = buildNodeRuntimeWarnings(makeDiag({ version: "20.18.0", major: 20 }));
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0]).not.toContain("maintenance");
   });
 });
 

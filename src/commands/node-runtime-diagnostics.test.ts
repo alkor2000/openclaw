@@ -3,6 +3,10 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { resolveDoctorContributionHealthChecks } from "../flows/doctor-health-contributions.js";
+import {
+  createDoctorHealthFlowContext,
+  resolveDoctorHealthContributions,
+} from "../flows/doctor-health-contributions.test-support.js";
 import * as runtimeGuard from "../infra/runtime-guard.js";
 import { runDoctorLintCli } from "./doctor-lint.js";
 import { statusCommand } from "./status.command.js";
@@ -187,6 +191,54 @@ describe("Node runtime diagnostics command surfaces", () => {
       (candidate) => candidate.id === "core/doctor/node-runtime",
     );
     expect(await check?.detect({ mode: "lint", cfg: {}, runtime, env: {} })).toEqual([]);
+  });
+
+  it.each([
+    ["standalone", {}, true],
+    ["swap", { OPENCLAW_UPDATE_IN_PROGRESS: "1" }, false],
+    ["convergence", { OPENCLAW_UPDATE_POST_CORE_CONVERGENCE: "1" }, false],
+    ["shipped parent", { OPENCLAW_UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE: "1" }, false],
+  ] as const)(
+    "keeps registered Node advice scoped to %s Doctor",
+    async (_posture, env, advisory) => {
+      for (const key of [
+        "OPENCLAW_UPDATE_IN_PROGRESS",
+        "OPENCLAW_UPDATE_POST_CORE_CONVERGENCE",
+        "OPENCLAW_UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE",
+      ]) {
+        vi.stubEnv(key, undefined);
+      }
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2028-04-30T00:00:00Z"));
+      mockCliRuntime("24.19.0");
+      mocks.readCommand.mockResolvedValue(null);
+      const contribution = resolveDoctorHealthContributions().find(
+        (entry) => entry.id === "doctor:node-runtime",
+      );
+      expect(contribution).toBeDefined();
+      const ctx = createDoctorHealthFlowContext({ runtime, env });
+      await contribution!.run(ctx);
+      expect(ctx.updateWarnings ?? []).toEqual(
+        advisory ? [expect.stringContaining("upstream end-of-life on 2028-04-30")] : [],
+      );
+    },
+  );
+
+  it("retains Gateway compatibility warnings during updater Doctor", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2028-04-30T00:00:00Z"));
+    mockCliRuntime("24.19.0");
+    const contribution = resolveDoctorHealthContributions().find(
+      (entry) => entry.id === "doctor:node-runtime",
+    );
+    const ctx = createDoctorHealthFlowContext({
+      runtime,
+      env: { OPENCLAW_UPDATE_IN_PROGRESS: "1" },
+    });
+    await contribution!.run(ctx);
+    expect(ctx.updateWarnings).toEqual([
+      expect.stringContaining("Gateway service Node 22.23.2 is unsupported"),
+    ]);
   });
 
   it("does not add lifecycle advice to healthy status JSON", async () => {

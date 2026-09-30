@@ -25,7 +25,8 @@ Normal `openclaw doctor` reports upstream maintenance or end-of-life advice for
 a usable Node runtime when applicable. Maintenance is informational; an EOL
 warning points to a maintained release. These notes omit executable paths.
 `doctor --lint`, `status`, and `update status` use compatibility findings without
-the additional lifecycle advice.
+the additional lifecycle advice. Doctor passes invoked by the updater also keep
+compatibility checks without adding these standalone advisories to update results.
 
 ## Config writes and backups
 

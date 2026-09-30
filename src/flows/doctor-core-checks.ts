@@ -27,6 +27,7 @@ import {
   collectCodexRuntimeCompatibilityWarnings,
   collectDisabledCodexPluginRouteIssues,
 } from "../commands/doctor/shared/codex-route-warnings.js";
+import { isUpdateDoctorLintPass } from "../commands/doctor/shared/update-phase.js";
 import { isDefaultInstallIdentity } from "../config/paths.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { CronListPageResult } from "../cron/service/list-page-types.js";
@@ -835,7 +836,10 @@ const nodeRuntimeCheck: HealthCheck = {
   async detect(ctx) {
     const { collectNodeRuntimeFindings } = await import("../commands/node-runtime-diagnostics.js");
     // Lifecycle advice belongs to human Doctor output, not status or upgrade admission.
-    return collectNodeRuntimeFindings(ctx.env, { includeLifecycleAdvice: ctx.mode === "doctor" });
+    return collectNodeRuntimeFindings(ctx.env, {
+      includeLifecycleAdvice:
+        ctx.mode === "doctor" && !isUpdateDoctorLintPass(ctx.env ?? process.env),
+    });
   },
 };
 

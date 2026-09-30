@@ -19,6 +19,14 @@ postures and maintenance modes documented on the other pages.
 - `--lint` is stricter than `--non-interactive`: always read-only, never prompts, never applies safe migrations. Use `doctor --fix` or `doctor --repair` when you want doctor to make changes.
 - Doctor does not execute `exec` SecretRefs while checking secrets by default. Use `--allow-exec` (with or without `--lint`) only when you intentionally want doctor to run those configured secret resolvers.
 
+## Node lifecycle advice
+
+Normal `openclaw doctor` reports upstream maintenance or end-of-life advice for
+a usable Node runtime when applicable. Maintenance is informational; an EOL
+warning points to a maintained release. These notes omit executable paths.
+`doctor --lint`, `status`, and `update status` use compatibility findings without
+the additional lifecycle advice.
+
 ## Config writes and backups
 
 - On npm global installs, Doctor reports retained `.openclaw.package-backup-*.databases` directories (and `.openclaw-package-backup-*.databases`, the name a failed cleanup retires them under) beside the installed package, with their total regular-file size in bytes and human-readable units and a quoted removal command for each directory. The scan is bounded; incomplete sizes are lower bounds. If inspection is incomplete before any snapshot is found, Doctor warns and asks you to list the npm global root manually, including hidden entries. A missing global root produces no warning. This is warning-only, including with `--fix`: confirm no update is in progress and no recovery needs the snapshots before removing them manually. Updater-driven Doctor passes defer this check so they do not report the active update's snapshots; run standalone Doctor after the update settles.

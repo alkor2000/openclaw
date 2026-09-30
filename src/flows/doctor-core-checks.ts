@@ -834,7 +834,8 @@ const nodeRuntimeCheck: HealthCheck = {
   source: "doctor",
   async detect(ctx) {
     const { collectNodeRuntimeFindings } = await import("../commands/node-runtime-diagnostics.js");
-    return collectNodeRuntimeFindings(ctx.env);
+    // Lifecycle advice belongs to human Doctor output, not status or upgrade admission.
+    return collectNodeRuntimeFindings(ctx.env, { includeLifecycleAdvice: ctx.mode === "doctor" });
   },
 };
 

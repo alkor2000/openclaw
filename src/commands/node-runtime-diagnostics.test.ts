@@ -65,6 +65,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
   vi.unstubAllGlobals();
@@ -137,7 +138,7 @@ describe("Node runtime diagnostics command surfaces", () => {
     const checks = await resolveDoctorContributionHealthChecks();
     const check = checks.find((entry) => entry.id === "core/doctor/node-runtime");
     expect(check).toBeDefined();
-    const findings = await check?.detect({ mode: "lint", cfg: {}, runtime, env: {} });
+    const findings = await check?.detect({ mode: "doctor", cfg: {}, runtime, env: {} });
     expect(findings).toEqual([
       expect.objectContaining({
         message: expect.stringContaining("26.0.0"),
@@ -148,6 +149,71 @@ describe("Node runtime diagnostics command surfaces", () => {
         message: expect.stringContaining("22.23.2"),
         fixHint: expect.stringContaining("nvm install 26"),
       }),
+    ]);
+  });
+
+  it.each([
+    ["24.19.0", "2026-10-19T23:59:59.999Z", null, null],
+    ["24.19.0", "2026-10-20T00:00:00.000Z", "info", "maintenance mode"],
+    ["25.9.0", "2026-03-31T23:59:59.999Z", null, null],
+    ["25.9.0", "2026-04-01T00:00:00.000Z", "info", "maintenance mode"],
+    ["25.9.0", "2026-05-31T23:59:59.999Z", "info", "maintenance mode"],
+    ["25.9.0", "2026-06-01T00:00:00.000Z", "warning", "end-of-life on 2026-06-01"],
+    ["26.8.1", "2027-10-19T23:59:59.999Z", null, null],
+    ["26.8.1", "2027-10-20T00:00:00.000Z", "info", "maintenance mode"],
+  ] as const)("reports admitted Node %s lifecycle at %s", async (version, date, severity, text) => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(date));
+    mockCliRuntime(version);
+    mocks.readCommand.mockResolvedValue(null);
+    const check = (await resolveDoctorContributionHealthChecks()).find(
+      (candidate) => candidate.id === "core/doctor/node-runtime",
+    );
+    const findings = await check?.detect({ mode: "doctor", cfg: {}, runtime, env: {} });
+    const lifecycle = findings?.filter((finding) => finding.message.includes("upstream"));
+    expect(lifecycle).toEqual(
+      text === null
+        ? []
+        : [expect.objectContaining({ severity, message: expect.stringContaining(text) })],
+    );
+  });
+
+  it("keeps lifecycle advice out of healthy upgrade lint checks", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-20T00:00:00Z"));
+    mockCliRuntime("24.19.0");
+    mocks.readCommand.mockResolvedValue(null);
+    const check = (await resolveDoctorContributionHealthChecks()).find(
+      (candidate) => candidate.id === "core/doctor/node-runtime",
+    );
+    expect(await check?.detect({ mode: "lint", cfg: {}, runtime, env: {} })).toEqual([]);
+  });
+
+  it("does not add lifecycle advice to healthy status JSON", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-20T00:00:00Z"));
+    mockCliRuntime("24.19.0");
+    mocks.readCommand.mockResolvedValue(null);
+    await statusCommand({ json: true }, runtime);
+    expect(runtime.log).not.toHaveBeenCalled();
+    expect(runtime.error).not.toHaveBeenCalled();
+  });
+
+  it("keeps the recorded service findings while running under Bun", async () => {
+    vi.mocked(runtimeGuard.detectRuntime).mockResolvedValue({
+      kind: "bun",
+      version: "1.4.0",
+      execPath: "/fixture/bun",
+      pathEnv: "/fixture",
+      hasNodeSqlite: true,
+      sqliteVersion: "3.53.4",
+      sqliteProbe: { available: true, version: "3.53.4", text: true, blob: true, json: true },
+    });
+    const check = (await resolveDoctorContributionHealthChecks()).find(
+      (candidate) => candidate.id === "core/doctor/node-runtime",
+    );
+    expect(await check?.detect({ mode: "doctor", cfg: {}, runtime, env: {} })).toEqual([
+      expect.objectContaining({ source: "gateway-service", severity: "warning" }),
     ]);
   });
 

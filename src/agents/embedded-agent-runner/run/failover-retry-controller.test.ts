@@ -43,6 +43,7 @@ function createController(
   fallbackConfigured = false,
   abortSignal?: AbortSignal,
   onRetryWait?: ControllerInput["runParams"]["onRetryWait"],
+  hasRemainingAuthAttempt: ControllerInput["hasRemainingAuthAttempt"] = () => false,
 ) {
   return createEmbeddedRunFailoverRetryController({
     runParams: {
@@ -55,6 +56,7 @@ function createController(
     globalLane: "test",
     agentDir: "/tmp/openclaw-failover-retry-controller-test",
     fallbackConfigured,
+    hasRemainingAuthAttempt,
     profileFailureStore: { version: 1, profiles: {} },
     getLastProfileId: () => "openai:p1",
     getSessionId: () => "session:failover-retry-controller-test",
@@ -271,61 +273,84 @@ describe("createEmbeddedRunFailoverRetryController", () => {
       expect(controller.transientRetryCount).toBe(1);
     });
 
-    it("still sleeps the floor when the attempt cannot fail over", async () => {
-      // After a replay-unsafe tool action neither rotation nor fallback runs, so
-      // declining the wait would end the turn; waiting and continuing is kept.
-      const controller = createController(
-        vi.fn(async () => false),
-        true,
-      );
-      controller.observeAttempt({ providerRetryMaxRetries: 3 });
-      await expect(
-        controller.maybeRetryTransient({
-          reason: "rate_limit",
-          message: anthropicSessionWindowMessage,
-          retryAfterMs: measuredRetryAfterMs,
-          maxRetryDelayMs: 30_000,
-          failoverEligible: false,
-        }),
-      ).resolves.toBe(true);
-      expect(mocks.sleepWithAbort).toHaveBeenCalledWith(9_897_000, undefined);
-      expect(controller.transientRetryCount).toBe(1);
-    });
+    it.each(["model fallback", "auth profile"])(
+      "still sleeps the floor when %s cannot be replayed",
+      async (route) => {
+        // After a replay-unsafe tool action neither rotation nor fallback runs, so
+        // declining the wait would end the turn; waiting and continuing is kept.
+        const controller = createController(
+          vi.fn(async () => false),
+          route === "model fallback",
+          undefined,
+          undefined,
+          () => route === "auth profile",
+        );
+        controller.observeAttempt({ providerRetryMaxRetries: 3 });
+        await expect(
+          controller.maybeRetryTransient({
+            reason: "rate_limit",
+            message: anthropicSessionWindowMessage,
+            retryAfterMs: measuredRetryAfterMs,
+            maxRetryDelayMs: 30_000,
+            failoverEligible: false,
+          }),
+        ).resolves.toBe(true);
+        expect(mocks.sleepWithAbort).toHaveBeenCalledWith(9_897_000, undefined);
+        expect(controller.transientRetryCount).toBe(1);
+      },
+    );
 
-    it.each([0, undefined])("honors the floor when the cap is disabled (%s)", async (cap) => {
-      const controller = createController(
-        vi.fn(async () => false),
-        true,
-      );
-      controller.observeAttempt({ providerRetryMaxRetries: 3 });
-      await expect(
-        controller.maybeRetryTransient({
-          reason: "rate_limit",
-          message: anthropicSessionWindowMessage,
-          retryAfterMs: measuredRetryAfterMs,
-          maxRetryDelayMs: cap,
-        }),
-      ).resolves.toBe(true);
-      expect(mocks.sleepWithAbort).toHaveBeenCalledWith(9_897_000, undefined);
-    });
+    it.each([
+      { cap: 0, fallbackConfigured: true, profile: false },
+      { cap: undefined, fallbackConfigured: true, profile: false },
+      { cap: 0, fallbackConfigured: false, profile: true },
+      { cap: undefined, fallbackConfigured: false, profile: true },
+    ])(
+      "honors the floor when the cap is disabled (%j)",
+      async ({ cap, fallbackConfigured, profile }) => {
+        const controller = createController(
+          vi.fn(async () => false),
+          fallbackConfigured,
+          undefined,
+          undefined,
+          () => profile,
+        );
+        controller.observeAttempt({ providerRetryMaxRetries: 3 });
+        await expect(
+          controller.maybeRetryTransient({
+            reason: "rate_limit",
+            message: anthropicSessionWindowMessage,
+            retryAfterMs: measuredRetryAfterMs,
+            maxRetryDelayMs: cap,
+          }),
+        ).resolves.toBe(true);
+        expect(mocks.sleepWithAbort).toHaveBeenCalledWith(9_897_000, undefined);
+      },
+    );
 
-    it("keeps retrying a floor inside the cap on the same model", async () => {
-      const controller = createController(
-        vi.fn(async () => false),
-        true,
-      );
-      controller.observeAttempt({ providerRetryMaxRetries: 3 });
-      await expect(
-        controller.maybeRetryTransient({
-          reason: "rate_limit",
-          message: "429 Too Many Requests: Please try again in 20s",
-          retryAfterMs: 20_000,
-          maxRetryDelayMs: 30_000,
-        }),
-      ).resolves.toBe(true);
-      expect(mocks.sleepWithAbort).toHaveBeenCalledWith(20_000, undefined);
-      expect(controller.transientRetryCount).toBe(1);
-    });
+    it.each(["model fallback", "auth profile"])(
+      "keeps retrying a short floor before %s",
+      async (route) => {
+        const controller = createController(
+          vi.fn(async () => false),
+          route === "model fallback",
+          undefined,
+          undefined,
+          () => route === "auth profile",
+        );
+        controller.observeAttempt({ providerRetryMaxRetries: 3 });
+        await expect(
+          controller.maybeRetryTransient({
+            reason: "rate_limit",
+            message: "429 Too Many Requests: Please try again in 20s",
+            retryAfterMs: 20_000,
+            maxRetryDelayMs: 30_000,
+          }),
+        ).resolves.toBe(true);
+        expect(mocks.sleepWithAbort).toHaveBeenCalledWith(20_000, undefined);
+        expect(controller.transientRetryCount).toBe(1);
+      },
+    );
 
     it("leaves non-rate-limit floors to the transient time window", async () => {
       const controller = createController(

@@ -15,7 +15,7 @@ import { hasMultipleSessionSharingIdentities } from "../../state/user-profiles.j
 import { ADMIN_SCOPE, authorizeOperatorScopesForRequiredScope } from "../method-scopes.js";
 import { operatorSessionCap } from "../operator-role-policy.js";
 import { prepareSessionCreatorProfile } from "../session-creator.js";
-import { getSessionRowProjection } from "../session-row-projection-access.js";
+import { requireSessionRowProjection } from "../session-row-projection-access.js";
 import { resolveSessionSharingRole, resolveSessionSharingTarget } from "../session-sharing.js";
 import { createSessionCatalogRequestEntrySnapshot } from "./session-catalog-entry-snapshot.js";
 import type { GatewayClient, GatewayRequestContext } from "./types.js";
@@ -138,12 +138,9 @@ export async function resolveSessionCatalogThreadVisibility(params: {
   sourceHomeId?: string;
   threadId: string;
 }): Promise<SessionCatalogThreadVisibility | null> {
-  const projection = getSessionRowProjection(params.context);
-  if (!projection) {
-    throw new Error("Session projection is unavailable before Gateway startup completes");
-  }
-  while (projection.needsMaterialization) {
-    await projection.ensureMaterialized();
+  const projection = requireSessionRowProjection(params.context);
+  while (projection.needsSelectionPreparation()) {
+    await projection.prepareSelection();
   }
   let config = params.context.getRuntimeConfig();
   let visibility = resolveSessionCatalogVisibility(params.client, config);
@@ -179,8 +176,8 @@ export async function resolveSessionCatalogThreadVisibility(params: {
     }
     // Providers may populate planning entries before awaiting IO. Re-read privacy and caller
     // policy after enumeration, before granting read or mutation authority.
-    while (projection.needsMaterialization) {
-      await projection.ensureMaterialized();
+    while (projection.needsSelectionPreparation()) {
+      await projection.prepareSelection();
     }
     config = params.context.getRuntimeConfig();
     visibility = resolveSessionCatalogVisibility(params.client, config);

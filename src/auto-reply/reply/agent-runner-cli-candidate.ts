@@ -18,6 +18,7 @@ import {
 import { findModelInCatalog } from "../../agents/model-catalog-lookup.js";
 import { normalizeChatType } from "../../channels/chat-type.js";
 import { readConfiguredModelAuthProfileProvider } from "../../config/sessions/auth-profile-override-provenance.js";
+import { bindRuntimeAuthProfileExecution } from "../../config/sessions/session-entry-current-runtime.js";
 import { shouldPreserveUserFacingSessionStateForInputProvenance } from "../../sessions/input-provenance.js";
 import { createAgentLifecycleTerminalBackstop } from "./agent-lifecycle-terminal.js";
 import { resolveRunAuthProfile } from "./agent-runner-auth-profile.js";
@@ -196,6 +197,12 @@ export async function runCliFallbackCandidate(
           : resolveRunAuthProfile(params.candidateRun, params.cliExecutionProvider, {
               config: params.runtimeConfig,
             }).authProfileId;
+        const executionAuth = bindRuntimeAuthProfileExecution(
+          { authProfileId },
+          sessionTarget,
+          initialSessionEntry,
+          authProfileId,
+        );
         const diagnosticOwner = params.deferredLifecycle.handoffToCli();
         // A forked child carries the parent's binding with a one-shot fork marker;
         // honor it here or the child resumes inside the parent's native thread.
@@ -361,6 +368,7 @@ export async function runCliFallbackCandidate(
                   })
               : undefined,
           runParams: {
+            ...executionAuth,
             preparedTtsPreferences: turn.opts?.preparedTtsPreferences,
             preparedRunAdmission: params.preparedRunAdmission,
             messageActionTurnCapability: params.messageActionTurnCapability,
@@ -445,7 +453,6 @@ export async function runCliFallbackCandidate(
             cliSessionBinding,
             forkCliSessionOnResume,
             ...forkRunParams,
-            authProfileId,
             bootstrapContextMode: turn.opts?.bootstrapContextMode,
             bootstrapContextRunKind: params.bootstrapContextRunKind,
             bootstrapPromptWarningSignaturesSeen: params.bootstrapPromptWarningSignaturesSeen,

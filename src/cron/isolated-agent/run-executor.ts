@@ -1,10 +1,6 @@
 /** Executes isolated cron prompts with model fallbacks and interim-ack retries. */
 import { resolveGroupToolPolicy } from "../../agents/agent-tools.policy.js";
 import { resolveCliBackendConfig } from "../../agents/cli-backends.js";
-import {
-  cliBackendAcceptsAuthProfileForwarding,
-  resolveCliExecutionAuthProfileId,
-} from "../../agents/cli-execution-auth.js";
 import { resolveCliRuntimeToolsAllow } from "../../agents/cli-runner/tool-policy.js";
 import { settleCliSessionResult } from "../../agents/cli-session-store.js";
 import {
@@ -56,6 +52,7 @@ import { assertCronRuntimeAuthorityCandidate } from "./run-admission.js";
 import {
   createCronCandidateExecutionResolver,
   prepareCronCandidateAuthSelection,
+  prepareCronCliCandidateAuth,
 } from "./run-candidate-runtime.js";
 import { finalizeCronPromptForResolvedTools } from "./run-delivery-trace.js";
 import {
@@ -463,11 +460,6 @@ function createCronPromptExecutor(
               userTurnTranscriptRecorder.hasPersisted() || userTurnTranscriptRecorder.isBlocked(),
           }) satisfies Partial<Parameters<CronEmbeddedRuntime["runEmbeddedAgent"]>[0]>;
         if (cliExecution) {
-          const allowCliAuthProfileForwarding = cliBackendAcceptsAuthProfileForwarding({
-            provider: executionProvider,
-            config: params.cfgWithAgentDefaults,
-            agentId: params.agentId,
-          });
           // Keep CLI work visible to recovery until execution and settlement finish.
           const deferredLifecycle = createDeferredEmbeddedRunLifecycleManager({
             runId,
@@ -491,21 +483,19 @@ function createCronPromptExecutor(
                 const cliSessionBinding = params.cronSession.isNewSession
                   ? undefined
                   : await getCliSessionBinding(params.cronSession.sessionEntry, executionProvider);
-                const authProfileId = allowCliAuthProfileForwarding
-                  ? resolveCliExecutionAuthProfileId({
-                      cliExecutionProvider: executionProvider,
-                      authProfileProvider: providerOverride,
-                      config: params.cfgWithAgentDefaults,
-                      agentDir: params.agentDir,
-                      sessionBinding: cliSessionBinding,
-                      selected: readCandidateAuthProfile().cli,
-                    })
-                  : undefined;
                 const guardedCliSessionBinding =
                   cliSessionBinding && hasCliSessionReuseMetadata(cliSessionBinding)
                     ? cliSessionBinding
                     : undefined;
                 const candidateResult = await runCliAgent({
+                  ...prepareCronCliCandidateAuth({
+                    params,
+                    sessionTarget,
+                    executionProvider,
+                    provider: providerOverride,
+                    binding: cliSessionBinding,
+                    selected: readCandidateAuthProfile().cli,
+                  }),
                   ...buildCommonRunParams(),
                   diagnosticOwner,
                   sessionEntry: params.cronSession.sessionEntry,
@@ -522,7 +512,6 @@ function createCronPromptExecutor(
                     "image",
                   ),
                   provider: executionProvider,
-                  authProfileId,
                   cliSessionId: cliSessionBinding?.sessionId,
                   cliSessionBinding: guardedCliSessionBinding,
                   cliSessionBindingFacts: {

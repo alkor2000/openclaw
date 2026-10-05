@@ -154,6 +154,8 @@ export type PluginRuntime = PluginRuntimeCore & {
     readSessionFacts: (params: {
       sessionKeys: readonly string[];
     }) => Promise<RuntimeSessionFactsResult>;
+    /** Authorize a session read; equal opaque scopes admit reuse until published facts change. */
+    withSessionReadScope: <T>(run: (scope: string | undefined) => Promise<T>) => Promise<T>;
     /** Keyed fact invalidations; callers own unsubscribe. Broad store changes are excluded. */
     subscribeSessionChanges: (
       listener: (event: { agentId: string; sessionKey: string; factsInvalidated?: string }) => void,
@@ -256,5 +258,5 @@ export type CreatePluginRuntimeOptions = {
 /** Checked contract for both the path-loaded factory and its implementation. */
 export type PluginRuntimeFactory = (
   options?: CreatePluginRuntimeOptions,
-  base?: Pick<PluginRuntime, "config" | "state" | "system">,
+  base?: Pick<PluginRuntime, "capabilities" | "config" | "state" | "system">,
 ) => PluginRuntime;

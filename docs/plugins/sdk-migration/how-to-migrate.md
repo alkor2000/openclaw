@@ -161,6 +161,21 @@ The `session-manager-sync-context-read` record deprecates the synchronous reader
 October 4, 2026, with one warning per process and removal at the next Plugin SDK
 major. Its existing synchronous result remains compatible during that window.
 
+Actor-bound incognito sessions reject the deprecated synchronous persistence and
+context methods before native storage or loaded-view mutation. The error names
+the awaited replacement. Production incognito remains host-owned until the atomic
+worker activation; durable synchronous compatibility is unchanged. An ordinary
+`resolveCurrentTurnEntryId()` only walks the loaded view; to include omitted
+custom messages, await `openAsync(target)` and walk that complete view instead.
+
+Bundled Codex history captures `captureCodexSessionContextReader(target, signal?)`
+from `openclaw/plugin-sdk/codex-session-transcript-runtime` before yielding. When
+an actor binding exists, await the returned reader with the same target and a
+context consumer. It retains the actor through scanning, consumption, validation,
+and cleanup. Without an actor binding it returns `undefined`, preserving the
+existing host route. The synchronous Codex context reader and validators refuse
+actor-bound access; they never reopen a native incognito database.
+
 `branchAsync` can hydrate missing history through the read worker before selecting
 the branch. `resetLeafAsync(): Promise<void>` orders an in-memory navigation reset
 with queued session writes. Neither operation writes a leaf record by itself;
@@ -256,6 +271,31 @@ major. Deprecated calls emit the same once-per-method
 legacy hook for supported older consumers. The awaited Gemini helper propagates
 metadata write failures; the legacy adapter retains its historical best-effort
 metadata behavior.
+
+## Await session observer and progress visibility
+
+Use `await context.sessionObserver.handleEventAsync(event)` to join event
+admission, `await getCompanionSnapshotAsync(sessionKey, agentId?)` for a current
+companion snapshot, and `await disposeAsync()` to join accepted observer work
+during shutdown. Connection visibility and removal remain synchronous.
+
+Reply-dispatch hooks should await `event.shouldSendToolSummariesAsync()` and
+`event.shouldSendFullToolDetailsAsync()` at each visibility decision. Current
+hosts supply both methods; they remain optional in the original event type so
+external callers can still construct released boolean-only events. Plugins that
+require worker-backed visibility should report a missing capability on older
+hosts rather than substitute a cached dispatch-start boolean.
+
+Channels should register `onVerboseProgressVisibilityAsync` instead of
+`onVerboseProgressVisibility`. The callback receives `() => Promise<boolean>`;
+dispatch awaits registration before selecting commentary ownership. Await the
+getter before rendering progress and recheck cancellation after that await.
+Commentary ownership remains frozen for a turn where the existing commentary
+delivery policy requires it; ordinary live visibility reads remain fresh.
+When both callbacks are supplied, the async callback takes precedence.
+
+The deprecated methods, booleans, and synchronous callback remain available
+until the next Plugin SDK major and explicit breaking-release approval.
 
 ## Managed node workspace acquisition
 

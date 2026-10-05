@@ -516,8 +516,7 @@ const reviewedOperations = new Map([
           "hasSessionStateWatchersInDatabase",
           "isSessionStateUpstreamCurrentInDatabase",
         ],
-        evidence:
-          "session-state-events.worker.ts and session-upstream-links.worker.ts; event/head SQL retains native adopted-event callers",
+        evidence: "session-state-events.worker.ts and session-upstream-links.worker.ts",
       },
       {
         tier: "W",
@@ -527,20 +526,19 @@ const reviewedOperations = new Map([
           "pruneSessionStateEventsInDatabase.stampPrunedWatermarks",
         ],
         evidence:
-          "Seed cursors run through sessionState.record/registerWatch; periodic and restart pruning dispatch sessionState.prune; adopted-event/native-binding producers remain native",
+          "Seed cursors run through sessionState.record/registerWatch; periodic and restart pruning dispatch sessionState.prune",
       },
       {
         tier: "W",
         operations: ["readCursor", "readMaterialCursors", "updateMaterialCursor"],
         evidence:
-          "Watch calls only in session-state-events.worker.ts:40,58,95; event cursor paths gated by NOTIFY_BY_KIND at kernel:367,386; native producers are non-notifying",
+          "Watch commands and event recording execute only in session-state-events.worker.ts and subagent-registry.store.worker.ts",
       },
       {
         tier: "W",
         operations: ["recordSessionStateEventInDatabase"],
-        binding: "registeredWatcherKeys",
         evidence:
-          "Only the registeredWatcherKeys initializer at kernel:354 is notifying-only; worker record at session-state-events.worker.ts:158 / subagent-registry.store.worker.ts:65; other event sites remain T1",
+          "All producers await sessionState.record; the only direct production kernel callers are session-state-events.worker.ts and subagent-registry.store.worker.ts",
       },
     ],
   ],
@@ -991,9 +989,20 @@ const reviewedOperations = new Map([
     [
       {
         tier: "W",
-        operations: ["recordMemorySessionTombstonesInDatabase"],
+        operations: ["recordMemorySessionTombstonesInDatabase", "hasMemorySessionTombstone"],
         evidence:
-          "memory-entry-origins.worker.ts:76 -> memory-forget-kernel.ts:40 is the only production writer; manager-cpu-entrypoints.ts:38 registers the worker backend. The separate hasMemorySessionTombstone host reader stays T1.",
+          "memory-entry-origins.worker.ts -> memory-forget-kernel.ts owns tombstone writes; manager-publication.worker.ts owns every hasMemorySessionTombstone call, including the session.current predicate retained under workspace custody for shadow publication.",
+      },
+    ],
+  ],
+  [
+    "extensions/memory-core/src/memory/manager-source-state.ts",
+    [
+      {
+        tier: "W",
+        operations: ["loadMemorySourceFileState", "refreshMemorySessionSourceState"],
+        evidence:
+          "manager-publication.worker.ts source.state and manager-search.worker.ts source-state/recall-metadata are the only runtime callers. Source synchronization and inspection await MemoryIndexDatabase.readSourceState; the kernel remains directly callable only by isolated tests.",
       },
     ],
   ],
@@ -1040,11 +1049,12 @@ const reviewedOperations = new Map([
         tier: "W",
         operations: [
           "removeRegistryRowInDatabase",
+          "insertSandboxRegistryRowInDatabase",
           "insertSandboxRegistryRowIfMissingInDatabase",
           "readRegistryRows",
         ],
         evidence:
-          "Removal is only registry-write.worker.ts:15 -> writeSandboxRegistryInDatabase (:88,101,112,127); import only registry-import.worker.ts:17. List helpers (:348,357,366) are called only at src/state/openclaw-state-read-registry.ts:75,86,90 through openclaw-state-read.worker.ts:679. Native shared insert/row readers stay T1.",
+          "Registry mutations, including reservation and removal-intent selection, run only through registry-write.worker.ts -> executeSandboxRegistryCommand; import only registry-import.worker.ts. List helpers run through openclaw-state-read-registry.ts in the read worker. The row reader remains T1 for released synchronous sandbox callbacks held across provider waits and deferred process launch; see worker-access.md.",
       },
     ],
   ],
@@ -1191,9 +1201,9 @@ const reviewedOperations = new Map([
     [
       {
         tier: "W",
-        operations: ["readCuratedCandidateBatch"],
+        operations: ["readCuratedCandidateBatch", "readMemoryRecallMetadata"],
         evidence:
-          "extensions/memory-core/src/memory/manager-search.worker.ts:160,161 → curated readers → memory-recall-metadata.ts:162; SDK barrels only re-export.",
+          "extensions/memory-core/src/memory/manager-search.worker.ts owns curated and recall-metadata reads, including fused session-only keyword requests. The private-local-only memory-core-host-engine-storage facade only re-exports kernels; no host runtime reader remains.",
       },
     ],
   ],
@@ -1566,15 +1576,22 @@ const reviewedOperations = new Map([
     [
       {
         tier: "W",
-        operations: ["createSqliteAuditRecordKernel.deleteRecord"],
+        operations: [
+          "createSqliteAuditRecordKernel.deleteRecord",
+          "createSqliteAuditRecordKernel.compareAndSet",
+        ],
         evidence:
-          "src/config/config-journal-snapshot.worker.ts:11 → config-journal-snapshot.kernel.ts:38,43. Native greeting callbacks (src/system-agent/greeting.ts:424,554) never return delete, retaining their SQL T1.",
+          "src/config/config-journal-snapshot.worker.ts → config-journal-snapshot.kernel.ts; greeting comparisons use diagnostic.compareAndSet in src/infra/sqlite-audit-record.worker.ts. No native comparison adapter remains.",
       },
       {
         tier: "T2",
-        operations: ["createSqliteAuditRecordKernel.entries"],
+        operations: [
+          "createSqliteAuditRecordKernel.entries",
+          "createSqliteAuditRecordKernel.upsertPreparedRecord",
+          "createSqliteAuditRecordKernel.latest",
+        ],
         evidence:
-          "Migration readers src/infra/state-migrations.audit-checkpoints.ts:53,146, audit-recovery.ts:577, audit-logs.ts:416,436; CLI backup via backup-create.ts:350,360 → audit-backup.ts:113,141; worker diagnostics openclaw-state-read.worker.ts:401.",
+          "Native entries/upsert serve state-migrations.audit-checkpoints.ts, audit-recovery.ts, audit-logs.ts and CLI audit-backup.ts. Native latest serves readRecentConfigAuditRecords in Doctor config flow and update-immutable-protection.ts. Transcript/greeting reads and CAS, plus config-journal snapshots, use the existing workers. Native config observation still reaches register/count/next/prune, which remain T1.",
       },
     ],
   ],
@@ -1892,6 +1909,7 @@ const reviewedOperations = new Map([
   ],
 ]);
 const workerModules = new Set([
+  "src/gateway/worker-environments/local-workspace-store.kernel.ts", // Projection read/write workers and worktree retirement worker only.
   "src/skills/library/import.kernel.ts", // Upload commands execute only in the shared-state writer.
   "src/skills/library/service.kernel.ts", // Library catalog and revision reads use the shared-state read registry.
   "src/config/sessions/conversation-delivery-store.kernel.ts", // Agent execution registry writes and session transcript worker reads only.

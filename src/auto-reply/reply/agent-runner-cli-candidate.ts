@@ -17,6 +17,7 @@ import {
 } from "../../agents/media-generation-activity.js";
 import { findModelInCatalog } from "../../agents/model-catalog-lookup.js";
 import { normalizeChatType } from "../../channels/chat-type.js";
+import { readConfiguredModelAuthProfileProvider } from "../../config/sessions/auth-profile-override-provenance.js";
 import { shouldPreserveUserFacingSessionStateForInputProvenance } from "../../sessions/input-provenance.js";
 import { createAgentLifecycleTerminalBackstop } from "./agent-lifecycle-terminal.js";
 import { resolveRunAuthProfile } from "./agent-runner-auth-profile.js";
@@ -41,6 +42,10 @@ export async function runCliFallbackCandidate(
   params: AgentFallbackCandidateCommonParams & {
     cliExecutionProvider: string;
     lifecycleGeneration: string;
+    providerScopedAuthProfile: Pick<
+      AgentFallbackCandidateCommonParams["candidateRun"],
+      "authProfileId" | "authProfileIdSource"
+    >;
   },
 ): ReturnType<typeof runCliAgentWithLifecycle> {
   const turn = params.turn;
@@ -183,7 +188,9 @@ export async function runCliFallbackCandidate(
               authProfileProvider: params.provider,
               config: params.runtimeConfig,
               agentDir: params.candidateRun.agentDir,
-              selected: params.candidateRun,
+              selected: readConfiguredModelAuthProfileProvider(params.candidateRun, sessionEntry)
+                ? params.providerScopedAuthProfile
+                : params.candidateRun,
               sessionBinding: cliSessionBinding,
             })
           : resolveRunAuthProfile(params.candidateRun, params.cliExecutionProvider, {

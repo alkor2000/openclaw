@@ -32,6 +32,7 @@ import { needsThinkHydration } from "../../agents/thinking-runtime.js";
 import { resolveAgentLifecycleTerminalMetadata } from "../../auto-reply/reply/agent-lifecycle-terminal.js";
 import type { VerboseLevel } from "../../auto-reply/thinking.js";
 import type { CliSessionBinding } from "../../config/sessions.js";
+import { replaceRuntimeAuthProfileSelection } from "../../config/sessions/auth-profile-override-provenance.js";
 import { buildGenericCliContextEngineHostSupport } from "../../context-engine/host-compat.js";
 import { registerCronRunExecSource } from "../../infra/cron-run-exec-source.js";
 import {
@@ -52,7 +53,10 @@ import {
 import { resolveCronPayloadOutcome } from "./helpers.js";
 import { resolveIsolatedCronPromptCacheKey } from "./prompt-cache-key.js";
 import { assertCronRuntimeAuthorityCandidate } from "./run-admission.js";
-import { createCronCandidateExecutionResolver } from "./run-candidate-runtime.js";
+import {
+  createCronCandidateExecutionResolver,
+  prepareCronCandidateAuthSelection,
+} from "./run-candidate-runtime.js";
 import { finalizeCronPromptForResolvedTools } from "./run-delivery-trace.js";
 import {
   getCliSessionBinding,
@@ -323,6 +327,10 @@ function createCronPromptExecutor(
         if (params.abortSignal?.aborted) {
           throw new Error(params.abortReason());
         }
+        const readCandidateAuthProfile = prepareCronCandidateAuthSelection(
+          params,
+          providerOverride,
+        );
         const {
           sessionRuntimeOverride,
           executionProvider,
@@ -490,13 +498,7 @@ function createCronPromptExecutor(
                       config: params.cfgWithAgentDefaults,
                       agentDir: params.agentDir,
                       sessionBinding: cliSessionBinding,
-                      selected: params.liveSelection.authProfileId
-                        ? {
-                            authProfileId: params.liveSelection.authProfileId,
-                            authProfileIdSource:
-                              params.liveSelection.authProfileIdSource === "user" ? "user" : "auto",
-                          }
-                        : undefined,
+                      selected: readCandidateAuthProfile().cli,
                     })
                   : undefined;
                 const guardedCliSessionBinding =
@@ -604,10 +606,7 @@ function createCronPromptExecutor(
           agentHarnessRuntimeOverride: sessionRuntimeOverride,
           requestedRouteResolution: "resolved",
           modelFallbacksOverride: cronFallbacksOverride,
-          authProfileId: params.liveSelection.authProfileId,
-          authProfileIdSource: params.liveSelection.authProfileId
-            ? params.liveSelection.authProfileIdSource
-            : undefined,
+          ...readCandidateAuthProfile().embedded,
           // Cron keeps overload failures local while sharing real credential failures.
           authProfileFailurePolicy: runOptions.authProfileFailurePolicy ?? "local_transient",
           verboseLevel: params.resolvedVerboseLevel,
@@ -729,10 +728,7 @@ export async function executeCronRun(params: CronRunExecutionParams): Promise<Cr
       params.liveSelection.provider = err.provider;
       params.liveSelection.model = err.model;
       params.liveSelection.agentRuntimeOverride = err.agentRuntimeOverride;
-      params.liveSelection.authProfileId = err.authProfileId;
-      params.liveSelection.authProfileIdSource = err.authProfileId
-        ? err.authProfileIdSource
-        : undefined;
+      replaceRuntimeAuthProfileSelection(params.liveSelection, err);
       syncCronSessionLiveSelection({
         entry: params.cronSession.sessionEntry,
         liveSelection: params.liveSelection,

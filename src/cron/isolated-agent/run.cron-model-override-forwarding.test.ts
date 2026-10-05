@@ -694,6 +694,7 @@ describe("runCronIsolatedAgentTurn — cron model override (#21057)", () => {
           provider: "openai",
           modelId: "gpt-5.6-luna",
           configuredProfileId: "openai:test-profile",
+          configuredProfileIsDefault: source === "configured",
         }),
       );
     },

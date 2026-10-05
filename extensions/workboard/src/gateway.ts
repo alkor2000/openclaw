@@ -1,4 +1,4 @@
-import type { WorkboardCard } from "@openclaw/workboard-contract";
+import type { WorkboardCard, WorkboardSessionsBoardView } from "@openclaw/workboard-contract";
 import { readStringParam } from "openclaw/plugin-sdk/core";
 import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { OpenClawPluginApi } from "../api.js";
@@ -6,7 +6,6 @@ import { redactClaimToken } from "./card-redaction.js";
 import {
   assertNoCursorAdvance,
   createWorkboardDispatchHandler,
-  listWorkboardCards,
   readId,
   readExpectedUpdatedAt,
   registerWorkboardResultMethods,
@@ -27,6 +26,42 @@ import { WorkboardStore } from "./store.js";
 
 const READ_SCOPE = "operator.read" as const;
 const WRITE_SCOPE = "operator.write" as const;
+
+function sessionsBoardView(input: Record<string, unknown>): WorkboardSessionsBoardView | undefined {
+  const unknownParam = Object.keys(input).find(
+    (key) => key !== "boardId" && key !== "view" && key !== "sinceRevision",
+  );
+  if (unknownParam) {
+    throw new Error(`Unknown Sessions board read field: ${unknownParam}.`);
+  }
+  if (input.view === undefined) {
+    return undefined;
+  }
+  if (!isRecord(input.view)) {
+    throw new Error("view must be an object.");
+  }
+  const view: WorkboardSessionsBoardView = {};
+  for (const [key, value] of Object.entries(input.view)) {
+    switch (key) {
+      case "involvingMe":
+      case "includePeople":
+        if (typeof value !== "boolean") {
+          throw new Error(`view.${key} must be a boolean.`);
+        }
+        view[key] = value;
+        break;
+      case "involvingProfileId":
+        if (typeof value !== "string") {
+          throw new Error("view.involvingProfileId must be a string.");
+        }
+        view.involvingProfileId = value;
+        break;
+      default:
+        throw new Error(`Unknown Sessions board view field: ${key}.`);
+    }
+  }
+  return view;
+}
 
 /**
  * Interactive Sessions-board writes wait in the store's mutation queue, so the
@@ -84,7 +119,7 @@ function cardMutation(
 export function registerWorkboardGatewayMethods(params: {
   api: OpenClawPluginApi;
   store?: WorkboardStore;
-  sessionsBoard?: Pick<WorkboardSessionsBoardService, "read" | "update" | "move" | "refresh">;
+  sessionsBoard?: Pick<WorkboardSessionsBoardService, "read" | "update" | "move">;
 }) {
   const { api: hostApi } = params;
   const assertUploadsAllowed = (client: GatewayMethodContext["client"]) => {
@@ -131,7 +166,16 @@ export function registerWorkboardGatewayMethods(params: {
     [
       "workboard.cards.list",
       READ_SCOPE,
-      async ({ params: requestParams }) => await listWorkboardCards(store, requestParams.boardId),
+      async ({ params: requestParams }) => {
+        const result = await store.listCards(requestParams.boardId);
+        const since = requestParams.sinceRevision;
+        return isRecord(since) &&
+          since.epoch === result.revision.epoch &&
+          since.revision === result.revision.revision &&
+          since.boardId === result.revision.boardId
+          ? { unchanged: true, revision: result.revision }
+          : result;
+      },
     ],
   ]);
 
@@ -245,8 +289,22 @@ export function registerWorkboardGatewayMethods(params: {
     [
       "workboard.sessionsBoard.read",
       READ_SCOPE,
-      ({ params: input }) =>
-        sessionsBoard().read(readStringParam(input, "boardId", { required: true })),
+      async (context: GatewayMethodContext) => {
+        const result = await sessionsBoard().read(
+          readStringParam(context.params, "boardId", { required: true }),
+          sessionsBoardView(context.params),
+          sessionsBoardCaller(context),
+        );
+        const since = context.params.sinceRevision;
+        return isRecord(since) &&
+          result.revision &&
+          since.epoch === result.revision.epoch &&
+          since.revision === result.revision.revision &&
+          since.boardId === result.revision.boardId &&
+          since.scope === result.revision.scope
+          ? { unchanged: true, revision: result.revision }
+          : result;
+      },
     ],
     [
       "workboard.sessionsBoard.update",
@@ -270,15 +328,6 @@ export function registerWorkboardGatewayMethods(params: {
           readStringParam(context.params, "boardId", { required: true }),
           readStringParam(context.params, "sessionKey", { required: true }),
           readStringParam(context.params, "columnId", { required: true }),
-          sessionsBoardCaller(context),
-        ),
-    ],
-    [
-      "workboard.sessionsBoard.refresh",
-      WRITE_SCOPE,
-      (context: GatewayMethodContext) =>
-        sessionsBoard().refresh(
-          readStringParam(context.params, "boardId", { required: true }),
           sessionsBoardCaller(context),
         ),
     ],

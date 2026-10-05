@@ -4,6 +4,7 @@ import { normalizeOptionalString } from "@openclaw/normalization-core/string-coe
 import { Type } from "typebox";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { captureAmbientGatewayOperatorAuthority } from "../../gateway/operator-invocation-authority.js";
+import { providerSupportsNativePdfDocument } from "../../media-understanding/defaults.js";
 import { renderDocumentTruncationNotice } from "../../media/document-extraction-metadata.js";
 import {
   classifyMediaReferenceSource,
@@ -49,14 +50,17 @@ import {
   resolvePromptAndModelOverride,
   type MediaToolSandbox,
 } from "./media-tool-shared.js";
-import { applyAgentDefaultModelConfig, hasToolModelConfig } from "./model-config.helpers.js";
+import {
+  applyAgentDefaultModelConfig,
+  hasToolModelConfig,
+  prepareToolAuthProfileStoreSource,
+} from "./model-config.helpers.js";
 import { anthropicAnalyzePdf, geminiAnalyzePdf } from "./pdf-native-providers.js";
 import {
   buildPdfExtractionContext,
   coercePdfAssistantText,
   coercePdfModelConfig,
   parsePageRange,
-  providerSupportsNativePdf,
   resolvePdfInputs,
   resolvePdfToolMaxTokens,
 } from "./pdf-tool.helpers.js";
@@ -102,6 +106,7 @@ async function runPdfPrompt(params: {
   workspaceDir?: string;
   preparedModelRuntime?: PreparedModelRuntimeSnapshot;
   authProfileStore?: AuthProfileStore;
+  authProfileStoreSource?: boolean;
   activeModel?: PdfToolActiveModel;
   pdfModelConfig: ImageModelConfig;
   modelOverride?: string;
@@ -149,15 +154,23 @@ async function runPdfPrompt(params: {
       ? await abortable(params.signal, acquireRuntime)
       : await acquireRuntime;
   }
-  params.signal?.throwIfAborted();
-  params.assertResourcesOpen?.();
   const runtimeAgentDir = preparedRuntime.agentDir;
   const runtimeWorkspaceDir = preparedRuntime.workspaceDir ?? params.workspaceDir;
+  const authProfileStoreSource = hasExplicitPdfToolModelConfig(preparedRuntime.config)
+    ? params.authProfileStoreSource
+    : await prepareToolAuthProfileStoreSource({
+        agentDir: runtimeAgentDir,
+        authProfileStore: params.authProfileStore,
+        authProfileStoreSource: params.authProfileStoreSource,
+      });
+  params.signal?.throwIfAborted();
+  params.assertResourcesOpen?.();
   const committedPdfModelConfig = resolvePdfModelConfigForTool({
     cfg: preparedRuntime.config,
     agentDir: runtimeAgentDir,
     ...(runtimeWorkspaceDir ? { workspaceDir: runtimeWorkspaceDir } : {}),
     authStore: params.authProfileStore,
+    authProfileStoreSource,
     activeModel: params.activeModel,
   });
   if (!committedPdfModelConfig) {
@@ -245,7 +258,7 @@ async function runPdfPrompt(params: {
           ? (auth.apiKey ?? "")
           : requireApiKey(auth, model.provider);
 
-      if (providerSupportsNativePdf(provider)) {
+      if (providerSupportsNativePdfDocument({ providerId: provider })) {
         if (params.password) {
           throw new Error(
             `password is not supported with native PDF providers (${provider}/${modelId}). Remove password, or use a non-native model for encrypted PDFs.`,
@@ -359,6 +372,7 @@ export function createPdfTool(options?: {
   agentId?: string;
   agentDir?: string;
   authProfileStore?: AuthProfileStore;
+  authProfileStoreSource?: boolean;
   workspaceDir?: string;
   cwd?: string;
   preparedModelRuntime?: PreparedModelRuntimeSnapshot;
@@ -389,6 +403,7 @@ export function createPdfTool(options?: {
         agentDir,
         workspaceDir: options?.workspaceDir,
         authStore: options?.authProfileStore,
+        authProfileStoreSource: options?.authProfileStoreSource,
         activeModel: options?.activeModel,
       });
   if (!registrationPdfModelConfig && !shouldDeferAutoModelResolution) {
@@ -437,15 +452,22 @@ export function createPdfTool(options?: {
     const pageNumbers = pageSelection?.pages;
     const password = typeof record.password === "string" ? record.password : undefined;
 
-    const pdfModelConfig =
-      registrationPdfModelConfig ??
-      resolvePdfModelConfigForTool({
+    let pdfModelConfig = registrationPdfModelConfig;
+    let authProfileStoreSource = options?.authProfileStoreSource;
+    if (!pdfModelConfig) {
+      authProfileStoreSource = await prepareToolAuthProfileStoreSource(options);
+      signal?.throwIfAborted();
+      assertResourcesOpen?.();
+      operatorAuthority?.assertCurrent();
+      pdfModelConfig = resolvePdfModelConfigForTool({
         cfg: options?.config,
         agentDir,
         workspaceDir: options?.workspaceDir,
         authStore: options?.authProfileStore,
+        authProfileStoreSource,
         activeModel: options?.activeModel,
       });
+    }
     if (!pdfModelConfig) {
       throw new ToolInputError("No PDF model configured.");
     }
@@ -575,6 +597,7 @@ export function createPdfTool(options?: {
         ? { preparedModelRuntime: options.preparedModelRuntime }
         : {}),
       authProfileStore: options?.authProfileStore,
+      authProfileStoreSource,
       activeModel: options?.activeModel,
       pdfModelConfig,
       modelOverride,

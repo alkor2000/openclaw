@@ -75,8 +75,8 @@ function buildFollowupTemplateContext(turn: AdmittedFollowupTurn): TemplateConte
 export async function executeFollowupTurn(params: {
   turn: AdmittedFollowupTurn;
   defaults: FollowupRunnerParams;
-  onToolResult: (payload: ReplyPayload, execution: { runId: string }) => Promise<void>;
-  onCompactionNoticePayload: (payload: ReplyPayload, execution: { runId: string }) => Promise<void>;
+  onToolResult: (payload: ReplyPayload) => Promise<void>;
+  onCompactionNoticePayload: (payload: ReplyPayload) => Promise<void>;
 }): Promise<FollowupExecutionResult> {
   const { turn, defaults } = params;
   const sourceOpts = defaults.opts;
@@ -220,6 +220,7 @@ export async function executeFollowupTurn(params: {
     // Queue callbacks are refreshed per session, but authority belongs to the
     // queued turn. Never let a later callback widen or narrow an older item.
     operatorAuthority: turn.queued.operatorAuthority,
+    abortSignal: turn.operation.abortSignal,
     toolsAllow: turn.queued.toolsAllow,
     disableTools: turn.queued.disableTools,
     commentaryPayloadsEnabled,
@@ -285,7 +286,7 @@ export async function executeFollowupTurn(params: {
           if (!forceToolResultProgress && !verboseToolResult) {
             return false;
           }
-          await params.onToolResult(payload, { runId: turn.runId });
+          await params.onToolResult(payload);
           return true;
         }
         const verboseToolResult = !requiresDurableToolResult && shouldEmitVerboseToolResult();
@@ -303,7 +304,7 @@ export async function executeFollowupTurn(params: {
         return transientToolResultProgress && !verboseToolResult
           ? (await settleProgressVisibilityCallbackResult(transientToolResultProgress(payload)))
               .visible
-          : await params.onToolResult(payload, { runId: turn.runId }).then(() => true);
+          : await params.onToolResult(payload).then(() => true);
       });
     },
   };
@@ -392,7 +393,7 @@ export async function executeFollowupTurn(params: {
               if (!progressAllowed()) {
                 return false;
               }
-              await params.onCompactionNoticePayload(payload, { runId: turn.runId });
+              await params.onCompactionNoticePayload(payload);
               return true;
             });
           },

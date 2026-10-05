@@ -253,7 +253,7 @@ export class AppSidebarSessionNavigationElement extends AppSidebarBase {
 
   protected override willUpdate(changedProperties: PropertyValues<this>) {
     if (this.emptyGroups.reconcile() && this.sidebarMenus.sessionSortMenuPosition) {
-      this.sidebarMenus.closeSessionSortMenu();
+      this.sidebarMenus.closePositionedMenu("sessionSort");
     }
     super.willUpdate(changedProperties);
   }
@@ -412,15 +412,12 @@ export class AppSidebarSessionNavigationElement extends AppSidebarBase {
   };
 
   /** Collapsed zones keep full rows for true header counts and status dots. */
-  protected zonedVisibleSections(
-    rows: SidebarRecentSession[],
-    catalogs = this.sidebarSessionCatalogs(),
-  ): SidebarVisibleSections {
+  protected zonedVisibleSections(rows: SidebarRecentSession[]): SidebarVisibleSections {
     return memoizedSidebarSections(
       this.sectionsMemo,
       this,
       rows,
-      catalogs,
+      this.sidebarSessionCatalogs(),
       this.rosterVisibleSessionLimits,
     );
   }

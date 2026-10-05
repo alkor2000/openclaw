@@ -25,108 +25,71 @@ const NODE_RELEASE_SCHEDULE = [
   { major: 26, maintenance: "2027-10-20", eol: "2029-04-30", lts: true },
 ] as const;
 
-function unsupportedNodeFinding(
-  version: string | null,
-  capabilityError?: string,
-  ownerHint?: string,
-): HealthFinding {
-  return {
-    checkId: CHECK_ID,
-    severity: "warning",
-    source: "gateway-service",
-    message: `Gateway service Node ${version ?? "unknown"} is unsupported. Required: ${SUPPORTED_NODE_VERSIONS}.`,
-    requirement: SUPPORTED_NODE_VERSIONS,
-    fixHint:
-      ownerHint ??
-      [
-        ...(capabilityError ? [capabilityError] : []),
-        formatUnsupportedNodeVersionMessage(version),
-        "After switching Node, refresh a managed Gateway with `openclaw gateway install --force`; for an externally managed service, have its deployment owner update the launcher.",
-      ].join("\n"),
-  };
-}
-
-async function collectCurrentNodeRuntimeFindings(
-  includeLifecycleAdvice: boolean,
-): Promise<readonly HealthFinding[]> {
-  const runtime = await detectRuntime();
-  if (runtime.kind !== "node" || !runtime.sqliteProbe) {
-    return [];
-  }
-  const failure = nodeRuntimeFailure(runtime.version, runtime.sqliteProbe);
-  const message = failure ?? nodeRuntimeNote(runtime.version, runtime.sqliteProbe);
-  const major = parseNodeReleaseVersion(runtime.version)?.major;
-  const release =
-    includeLifecycleAdvice && !failure
-      ? NODE_RELEASE_SCHEDULE.find((entry) => entry.major === major)
-      : undefined;
-  const now = Date.now();
-  const endOfLife = release ? now >= Date.parse(`${release.eol}T00:00:00Z`) : false;
-  const installOwner =
-    failure || endOfLife
-      ? await readInstallOwner(
-          await resolveOpenClawPackageRoot({ moduleUrl: import.meta.url, argv1: process.argv[1] }),
-        )
-      : null;
-  const findings: HealthFinding[] = message
-    ? [
-        {
-          checkId: CHECK_ID,
-          severity: failure ? "error" : "info",
-          source: "cli",
-          message,
-          requirement: SUPPORTED_NODE_VERSIONS,
-          target: runtime.execPath ?? undefined,
-          ...(failure
-            ? {
-                fixHint: installOwner
-                  ? formatInstallOwnerMessage(installOwner)
-                  : formatUnsupportedNodeVersionMessage(runtime.version),
-              }
-            : {}),
-        },
-      ]
-    : [];
-  if (release) {
-    const label = release.lts ? `Node ${runtime.version} LTS` : `Node ${runtime.version}`;
-    if (endOfLife) {
-      findings.push({
-        checkId: CHECK_ID,
-        severity: "warning",
-        source: "cli",
-        message: `${label} reached upstream end-of-life on ${release.eol}; it no longer receives security updates.`,
-        fixHint: installOwner
-          ? formatInstallOwnerMessage(installOwner)
-          : "Consider a currently maintained release: https://nodejs.org/en/download",
-      });
-    } else if (now >= Date.parse(`${release.maintenance}T00:00:00Z`)) {
-      findings.push({
-        checkId: CHECK_ID,
-        severity: "info",
-        source: "cli",
-        message: `${label} is in upstream maintenance mode (EOL ${release.eol}).`,
-      });
-    }
-  }
-  return findings;
-}
-
 /** Inspect the CLI and recorded service without starting or repairing the service. */
 export async function collectNodeRuntimeFindings(
   env: NodeJS.ProcessEnv = process.env,
   { includeLifecycleAdvice = false }: { includeLifecycleAdvice?: boolean } = {},
 ): Promise<HealthFinding[]> {
-  return [
-    ...(await collectCurrentNodeRuntimeFindings(includeLifecycleAdvice)),
-    ...(await collectServiceNodeRuntimeFindings(env)),
-  ];
-}
-
-/** Inspect the recorded service executable without starting or repairing the service. */
-async function collectServiceNodeRuntimeFindings(
-  env: NodeJS.ProcessEnv = process.env,
-): Promise<HealthFinding[]> {
   const findings: HealthFinding[] = [];
+  const cliRuntime = await detectRuntime();
+  if (cliRuntime.kind === "node" && cliRuntime.sqliteProbe) {
+    const failure = nodeRuntimeFailure(cliRuntime.version, cliRuntime.sqliteProbe);
+    const message = failure ?? nodeRuntimeNote(cliRuntime.version, cliRuntime.sqliteProbe);
+    const major = parseNodeReleaseVersion(cliRuntime.version)?.major;
+    const release =
+      includeLifecycleAdvice && !failure
+        ? NODE_RELEASE_SCHEDULE.find((entry) => entry.major === major)
+        : undefined;
+    const now = Date.now();
+    const endOfLife = release ? now >= Date.parse(`${release.eol}T00:00:00Z`) : false;
+    const installOwner =
+      failure || endOfLife
+        ? await readInstallOwner(
+            await resolveOpenClawPackageRoot({
+              moduleUrl: import.meta.url,
+              argv1: process.argv[1],
+            }),
+          )
+        : null;
+    if (message) {
+      findings.push({
+        checkId: CHECK_ID,
+        severity: failure ? "error" : "info",
+        source: "cli",
+        message,
+        requirement: SUPPORTED_NODE_VERSIONS,
+        target: cliRuntime.execPath ?? undefined,
+        ...(failure
+          ? {
+              fixHint: installOwner
+                ? formatInstallOwnerMessage(installOwner)
+                : formatUnsupportedNodeVersionMessage(cliRuntime.version),
+            }
+          : {}),
+      });
+    }
+    if (release) {
+      const label = release.lts ? `Node ${cliRuntime.version} LTS` : `Node ${cliRuntime.version}`;
+      if (endOfLife) {
+        findings.push({
+          checkId: CHECK_ID,
+          severity: "warning",
+          source: "cli",
+          message: `${label} reached upstream end-of-life on ${release.eol}; it no longer receives security updates.`,
+          fixHint: installOwner
+            ? formatInstallOwnerMessage(installOwner)
+            : "Consider a currently maintained release: https://nodejs.org/en/download",
+        });
+      } else if (now >= Date.parse(`${release.maintenance}T00:00:00Z`)) {
+        findings.push({
+          checkId: CHECK_ID,
+          severity: "info",
+          source: "cli",
+          message: `${label} is in upstream maintenance mode (EOL ${release.eol}).`,
+        });
+      }
+    }
+  }
   if (!isDefaultInstallIdentity(env)) {
     return findings;
   }
@@ -143,13 +106,20 @@ async function collectServiceNodeRuntimeFindings(
         const owner = await readInstallOwner(
           layout?.packageRootReal ?? layout?.packageRoot ?? null,
         );
-        findings.push(
-          unsupportedNodeFinding(
-            runtime.version,
-            runtime.capabilityError,
-            owner ? formatInstallOwnerMessage(owner) : undefined,
-          ),
-        );
+        findings.push({
+          checkId: CHECK_ID,
+          severity: "warning",
+          source: "gateway-service",
+          message: `Gateway service Node ${runtime.version ?? "unknown"} is unsupported. Required: ${SUPPORTED_NODE_VERSIONS}.`,
+          requirement: SUPPORTED_NODE_VERSIONS,
+          fixHint: owner
+            ? formatInstallOwnerMessage(owner)
+            : [
+                ...(runtime.capabilityError ? [runtime.capabilityError] : []),
+                formatUnsupportedNodeVersionMessage(runtime.version),
+                "After switching Node, refresh a managed Gateway with `openclaw gateway install --force`; for an externally managed service, have its deployment owner update the launcher.",
+              ].join("\n"),
+        });
       } else if (runtime.note) {
         findings.push({
           checkId: CHECK_ID,

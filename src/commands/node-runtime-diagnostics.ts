@@ -10,7 +10,7 @@ import { isNodeRuntime } from "../daemon/runtime-binary.js";
 import { resolveNodeRuntimeInfo } from "../daemon/runtime-paths.js";
 import { summarizeGatewayServiceLayout } from "../daemon/service-layout.js";
 import { resolveGatewayService } from "../daemon/service.js";
-import type { HealthFinding } from "../flows/health-checks.js";
+import type { HealthCheckContext, HealthFinding } from "../flows/health-checks.js";
 import { formatInstallOwnerMessage, readInstallOwner } from "../infra/install-owner.js";
 import { resolveOpenClawPackageRoot } from "../infra/openclaw-root.js";
 import { detectRuntime } from "../infra/runtime-guard.js";
@@ -28,13 +28,17 @@ const NODE_RELEASE_SCHEDULE = [
 /** Inspect the CLI and recorded service without starting or repairing the service. */
 export async function collectNodeRuntimeFindings(
   env: NodeJS.ProcessEnv = process.env,
-  { includeLifecycleAdvice = false }: { includeLifecycleAdvice?: boolean } = {},
+  mode?: HealthCheckContext["mode"],
 ): Promise<HealthFinding[]> {
   const findings: HealthFinding[] = [];
   const cliRuntime = await detectRuntime();
   if (cliRuntime.kind === "node" && cliRuntime.sqliteProbe) {
     const failure = nodeRuntimeFailure(cliRuntime.version, cliRuntime.sqliteProbe);
     const message = failure ?? nodeRuntimeNote(cliRuntime.version, cliRuntime.sqliteProbe);
+    // Lifecycle advice belongs to standalone Doctor, never status or updater admission.
+    const includeLifecycleAdvice =
+      mode === "doctor" &&
+      !(await import("./doctor/shared/update-phase.js")).isUpdateDoctorLintPass(env);
     const major = parseNodeReleaseVersion(cliRuntime.version)?.major;
     const release =
       includeLifecycleAdvice && !failure

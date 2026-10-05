@@ -23,7 +23,6 @@ import {
   collectCodexRuntimeCompatibilityWarnings,
   collectDisabledCodexPluginRouteIssues,
 } from "../commands/doctor/shared/codex-route-warnings.js";
-import { isUpdateDoctorLintPass } from "../commands/doctor/shared/update-phase.js";
 import { isDefaultInstallIdentity } from "../config/paths.js";
 import type { CronListPageResult } from "../cron/service/list-page-types.js";
 import type { CronJob } from "../cron/types.js";
@@ -676,11 +675,7 @@ const nodeRuntimeCheck: CoreHealthCheck = {
     "Node SQLite capabilities and version support are represented as structured findings.",
   async detect(ctx) {
     const { collectNodeRuntimeFindings } = await import("../commands/node-runtime-diagnostics.js");
-    // Lifecycle advice belongs to human Doctor output, not status or upgrade admission.
-    return collectNodeRuntimeFindings(ctx.env, {
-      includeLifecycleAdvice:
-        ctx.mode === "doctor" && !isUpdateDoctorLintPass(ctx.env ?? process.env),
-    });
+    return collectNodeRuntimeFindings(ctx.env, ctx.mode);
   },
 };
 

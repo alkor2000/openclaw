@@ -187,7 +187,7 @@ describe("Doctor host-owned runtime diagnostics", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-10-01T00:00:00Z"));
     try {
-      const findings = await collectNodeRuntimeFindings({}, { includeLifecycleAdvice: true });
+      const findings = await collectNodeRuntimeFindings({}, "doctor");
       expect(findings.filter((finding) => finding.severity === "warning")).toEqual([
         expect.objectContaining({
           message: expect.stringContaining("upstream end-of-life"),

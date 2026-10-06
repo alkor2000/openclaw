@@ -23,6 +23,7 @@ import { sameWorkerProtocolFeatures } from "../worker/worker-build-identity.js";
 import { prepareNodeInvokeDispatch } from "./node-invoke-dispatch.js";
 import { buildNodeInvokeRequest, serializeNodeEvent } from "./node-invoke-request.js";
 import type { NodeInvokeParams, NodeInvokeResult } from "./node-invoke.types.js";
+import type { NodePairingLeaseResolution } from "./node-registry-pairing.js";
 import { NODE_INVOKE_PAIRING_CHANGED_ABORT } from "./node-registry-private-token.js";
 import type { NodeInvokeStreamController, PendingInvoke } from "./node-registry.invoke-stream.js";
 import {
@@ -52,11 +53,6 @@ export type {
 } from "./node-runner-inventory-runtime.js";
 
 type PairingBoundNodeSession = NodeRunnerRegistrySession & { pairingIdentity: string };
-type PairingLeaseResolution =
-  | { status: "current"; session: PairingBoundNodeSession }
-  | { status: "stale"; presenceInvalidated: boolean }
-  | { status: "unavailable" };
-
 type NodeWorkerPrivateCommand = (typeof NODE_WORKER_PRIVATE_COMMANDS)[number];
 
 export type NodeWorkerSupervisorTransport = {
@@ -95,7 +91,9 @@ type NodeRegistryPrivateContext = {
   listCurrentConnected: () => Promise<NodeRunnerRegistrySession[]>;
   getCurrentConnected: (nodeId: string) => Promise<NodeRunnerRegistrySession | undefined>;
   hasCurrentPairingStateResolver: boolean;
-  resolvePairingLease: (node: PairingBoundNodeSession) => Promise<PairingLeaseResolution>;
+  resolvePairingLease: (
+    node: PairingBoundNodeSession,
+  ) => Promise<NodePairingLeaseResolution<PairingBoundNodeSession>>;
   pendingInvokes: Map<string, PendingInvoke>;
   invokeStreams: NodeInvokeStreamController;
   sendEventToSession: (node: NodeRunnerRegistrySession, event: string, payload: unknown) => boolean;
@@ -116,6 +114,7 @@ type GenerationBoundPendingInvoke = {
 
 type NodeRegistryPrivateState = {
   context: NodeRegistryPrivateContext;
+  catalogRevision: number;
   runnerInventoryByConn: Map<string, NodeRunnerInventoryRecord>;
   bundleStatusByConn: Map<string, NodeWorkerBundleStatusObservation>;
   runnerState: NodeRunnerStatePublisher;
@@ -187,7 +186,9 @@ async function invokeNodeRegistryCore(
   }
   if (expectedPairingGeneration && state.context.hasCurrentPairingStateResolver) {
     const pairingNode = node;
-    let resolution: PairingLeaseResolution | typeof ABSOLUTE_DEADLINE_EXPIRED;
+    let resolution:
+      | NodePairingLeaseResolution<PairingBoundNodeSession>
+      | typeof ABSOLUTE_DEADLINE_EXPIRED;
     try {
       resolution = await awaitWithinDeadline(
         () =>
@@ -375,6 +376,7 @@ export function registerNodeRegistryPrivateRuntime(
   const runnerState = createNodeRunnerStatePublisher(context.getNode, runnerInventoryByConn);
   const state: NodeRegistryPrivateState = {
     context,
+    catalogRevision: 0,
     runnerInventoryByConn,
     bundleStatusByConn: new Map(),
     runnerState,
@@ -436,6 +438,7 @@ export function registerNodeRegistryPrivateRuntime(
           state.bundleStatusByConn.delete(node.connId);
         }
         if (!isDeepStrictEqual(previous, observation)) {
+          state.catalogRevision++;
           state.runnerState.reconcile(node.nodeId, true);
         }
         return true;
@@ -543,6 +546,15 @@ export function setNodeRunnerStateChangedListener(
   requireNodeRegistryPrivateState(nodeRegistry).runnerState.setListener(listener);
 }
 
+/** Catalog readers retain prepared rows until a registry owner changes their inputs. */
+export function invalidateNodeCatalog(registry: object): void {
+  requireNodeRegistryPrivateState(registry).catalogRevision++;
+}
+
+export function readNodeCatalogRevision(registry: object): number {
+  return requireNodeRegistryPrivateState(registry).catalogRevision;
+}
+
 export function waitForNodeWorkerSupervisor(
   nodeRegistry: object,
   nodeId: string,
@@ -607,6 +619,7 @@ export function updateNodeRunnerInventory(params: {
     const statusChanged = state.bundleStatusByConn.delete(node.connId);
     const changed = inventoryChanged || statusChanged;
     if (changed) {
+      state.catalogRevision++;
       state.context.publishActiveNodeContext();
       state.runnerState.reconcile(node.nodeId, true);
     }
@@ -636,6 +649,7 @@ export function updateNodeRunnerInventory(params: {
     !isDeepStrictEqual(previous.workerHost, next.workerHost) ||
     statusCleared;
   if (changed) {
+    state.catalogRevision++;
     state.runnerInventoryByConn.set(node.connId, next);
     state.context.publishActiveNodeContext();
     state.runnerState.reconcile(node.nodeId, true);
@@ -650,6 +664,7 @@ export function forgetNodeRunnerInventory(nodeRegistry: object, connId: string):
     return;
   }
   state.bundleStatusByConn.delete(connId);
+  state.catalogRevision++;
   state.runnerState.reconcile(declaration.nodeId, true);
 }
 
@@ -699,6 +714,7 @@ export function settleNodeRegistryPairingGenerationChange(params: {
   const inventoryChanged = state.runnerInventoryByConn.delete(params.connId);
   const statusChanged = state.bundleStatusByConn.delete(params.connId);
   if (inventoryChanged || statusChanged) {
+    state.catalogRevision++;
     state.runnerState.reconcile(params.nodeId, true);
   }
   for (const pending of state.context.pendingInvokes.values()) {

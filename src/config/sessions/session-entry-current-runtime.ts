@@ -188,10 +188,9 @@ export function bindRuntimeAuthProfileExecution<T extends RuntimeAuthProfileExec
   if (!target) {
     return params;
   }
-  const captured = captureNativeSessionEntryCurrentRead(target);
   const agentId = target.agentId ?? parseAgentSessionKey(target.sessionKey)?.agentId;
   const nativeRead =
-    captured.kind === "native" ||
+    (target.storePath && agentId && getOpenIncognitoAgentDatabase(agentId, target.storePath)) ||
     isIncognitoSessionKey(target.sessionKey) ||
     (target.storePath &&
       agentId &&
@@ -199,7 +198,7 @@ export function bindRuntimeAuthProfileExecution<T extends RuntimeAuthProfileExec
         agentId,
         env: target.env,
       }))
-      ? captured
+      ? captureNativeSessionEntryCurrentRead(target)
       : undefined;
   return Object.assign(params, {
     [runtimeAuthProfileExecution]: {

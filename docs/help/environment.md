@@ -18,11 +18,13 @@ selection settles, managed values absent from trusted dotenv files and both
 config and auth-profile references are removed from the Gateway process environment.
 
 Startup inspects auth-profile stores without migrating them or changing their
-source files. If inspection is incomplete, startup keeps inherited managed values
+source files. If a store's rows cannot be read or decoded after any required
+reader and snapshot cleanup completes, startup keeps inherited managed values
 and warns to run `openclaw doctor --fix`; ordinary agent admission still owns
 store isolation and required-agent refusal. Dev reset skips auth-store inspection
-because it deletes that state. Snapshot cleanup failures remain errors under the
-snapshot owner's cleanup contract. This does not rewrite service files or
+because it deletes that state. Database admission, reader-close, and snapshot
+cleanup failures stop startup under the database owner's lifecycle contract,
+including failures while discovering shared-store ownership. This does not rewrite service files or
 previous update records.
 
 ## Precedence (highest to lowest)

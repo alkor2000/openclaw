@@ -12,6 +12,7 @@ import type { OpenClawStateWorkerContext } from "../../state/openclaw-state-work
 import { runOpenClawStateWorkerOperation } from "../../state/openclaw-state-worker-store.js";
 import { resolveSharedMainAuthAgentDir } from "./shared-main-dir.js";
 import { SHARED_AUTH_STORE_STATE_KEY } from "./sqlite-json.js";
+import { AuthProfileStoreUnreadableError } from "./store-unreadable-error.js";
 import type { SharedAuthStoreOwnership } from "./types.js";
 
 const SHARED_AUTH_STORE_OWNERSHIP_CACHE_LIMIT = 256;
@@ -122,7 +123,11 @@ export function inspectSharedAuthStoreOwnership(
     readConfigMachineState<unknown>(
       SHARED_AUTH_STORE_STATE_KEY,
       { env },
-      { artifactPreservingReadOnly: true },
+      {
+        artifactPreservingReadOnly: true,
+        mapReadError: (cause) =>
+          new AuthProfileStoreUnreadableError(resolveOpenClawStateSqlitePath(env), { cause }),
+      },
     ),
   );
 }

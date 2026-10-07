@@ -270,16 +270,16 @@ async function guardGatewayRunSelectedConfig(
       const [
         { collectAuthProfileEnvSecretRefIds },
         { collectCandidateAgentDirs },
-        { SqliteSnapshotCleanupError },
+        { AuthProfileStoreUnreadableError },
       ] = await Promise.all([
         import("../../agents/auth-profiles/env-secret-refs.js"),
         import("../../secrets/runtime-fast-path.js"),
-        import("../../infra/sqlite-readonly-location-cleanup.js"),
+        import("../../agents/auth-profiles/store-unreadable-error.js"),
       ]);
       return {
         collectAuthProfileEnvSecretRefIds,
         collectCandidateAgentDirs,
-        SqliteSnapshotCleanupError,
+        AuthProfileStoreUnreadableError,
       };
     })(),
   ]);
@@ -372,8 +372,8 @@ async function guardGatewayRunSelectedConfig(
           preserveKeys.add(id);
         }
       } catch (error) {
-        // Failed cleanup retains native snapshot custody; it is not an unavailable auth store.
-        if (error instanceof authProfileEnv.SqliteSnapshotCleanupError) {
+        // Only settled row failures prove an unavailable store. Lifecycle failures retain custody.
+        if (!(error instanceof authProfileEnv.AuthProfileStoreUnreadableError)) {
           throw error;
         }
         // Unknown references cannot prove any inherited value stale. Agent admission owns refusal.

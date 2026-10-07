@@ -134,6 +134,23 @@ describe("Gateway config selection before migration admission", () => {
       authProfile: true,
     },
     {
+      name: "managed unreadable secondary",
+      apiKey: undefined,
+      managed: true,
+      included: false,
+      authProfile: true,
+      unreadableAuth: true,
+    },
+    {
+      name: "managed reset with unreadable secondary",
+      apiKey: undefined,
+      managed: true,
+      included: false,
+      authProfile: true,
+      unreadableAuth: true,
+      reset: true,
+    },
+    {
       name: "managed config env replacement",
       apiKey: undefined,
       managed: true,
@@ -146,6 +163,8 @@ describe("Gateway config selection before migration admission", () => {
       const { apiKey, managed, included } = scenario;
       const authProfile = "authProfile" in scenario && scenario.authProfile;
       const configEnv = "configEnv" in scenario && scenario.configEnv;
+      const unreadableAuth = "unreadableAuth" in scenario && scenario.unreadableAuth;
+      const reset = "reset" in scenario && scenario.reset;
       const root = fs.realpathSync(tempDirs.make("openclaw-managed-env-selection-"));
       const runtimeRoot = createSourceRuntime(runtimeParent);
       const stateDir = path.join(root, "state");
@@ -170,9 +189,13 @@ describe("Gateway config selection before migration admission", () => {
           messages: { responsePrefix: "$${STALE_KEY}" },
           models: { providers: included ? { $include: "providers.json" } : providers },
           ...(configEnv ? { env: { vars: { REPRO_PROVIDER_KEY: "repro-not-a-real-key" } } } : {}),
+          ...(reset ? { env: { vars: { RESET_ONLY_KEY: "synthetic-authored-reset-value" } } } : {}),
           ...(authProfile
             ? {
-                agents: { ownership: "explicit", entries: { main: {}, helper: {} } },
+                agents: {
+                  ownership: "explicit",
+                  entries: { main: {}, helper: {}, ...(unreadableAuth ? { broken: {} } : {}) },
+                },
                 auth: { profiles: { "minimax:fixture": { provider: "minimax", mode: "api_key" } } },
               }
             : {}),
@@ -205,6 +228,8 @@ describe("Gateway config selection before migration admission", () => {
         import { createHash } from "node:crypto";
         Object.defineProperty(process, "platform", { value: "linux" });
         const authProfile = ${JSON.stringify(authProfile)};
+        const unreadableAuth = ${JSON.stringify(unreadableAuth)};
+        const reset = ${JSON.stringify(reset)};
         let stateBefore;
         let profileRef;
         let agentDir;
@@ -228,9 +253,16 @@ describe("Gateway config selection before migration admission", () => {
           if (await resolveSecretRefString(profileRef, { config: {}, env: process.env }) !== "repro-not-a-real-key") {
             throw new Error("Auth-profile fixture did not resolve before startup");
           }
+          let brokenPath;
+          if (unreadableAuth) {
+            const brokenDir = path.join(process.env.OPENCLAW_STATE_DIR, "agents", "broken", "agent");
+            saveAuthProfileStore({ version: 1, profiles: {} }, brokenDir);
+            brokenPath = path.join(brokenDir, "openclaw-agent.sqlite");
+          }
           closeAuthProfileReadPool({ kind: "root", rootPath: process.env.OPENCLAW_STATE_DIR });
           await closeOpenClawAgentDatabasesAsync(process.env.OPENCLAW_STATE_DIR);
           await closeOpenClawStateDatabaseAsync();
+          if (brokenPath) fs.writeFileSync(brokenPath, "synthetic invalid secondary SQLite");
           stateBefore = Object.fromEntries(fs.readdirSync(process.env.OPENCLAW_STATE_DIR, {
             recursive: true, withFileTypes: true,
           }).filter(entry => entry.isFile()).map(entry => {
@@ -239,20 +271,23 @@ describe("Gateway config selection before migration admission", () => {
               createHash("sha256").update(fs.readFileSync(filename)).digest("hex")];
           }));
         }
-        const { selectGatewayRunEnvironment, prepareGatewayRunBootstrap, recheckGatewayRunBootstrap } = await import("./src/cli/gateway-cli/pre-bootstrap.ts");
+        const { selectGatewayRunEnvironment, prepareGatewayRunBootstrap, recheckGatewayRunBootstrap, recheckGatewayRunReset } = await import("./src/cli/gateway-cli/pre-bootstrap.ts");
         const { ExitError } = await import("./src/runtime.ts");
         if (authProfile) {
           const { readConfigFileSnapshot } = await import("./src/config/config.ts");
           const snapshot = await readConfigFileSnapshot({ isolateEnv: true, observe: false, pluginValidation: "core-only" });
           if (!snapshot.valid) throw new Error("Auth-profile fixture config was invalid: " + JSON.stringify(snapshot.issues));
         }
-        const runtime = { log() {}, error: console.error, exit(code) { throw new ExitError(code); } };
+        const warnings = [];
+        const runtime = { log() {}, error(message) { warnings.push(message); }, exit(code) { throw new ExitError(code); } };
+        const opts = reset ? { reset: true, dev: true } : {};
         let admitted = false;
         try {
-          if (await selectGatewayRunEnvironment({ opts: {}, runtime }) &&
-              await prepareGatewayRunBootstrap({ opts: {}, runtime })) {
-            admitted = await recheckGatewayRunBootstrap({ opts: {}, runtime });
-          }
+          const selected = await selectGatewayRunEnvironment({ opts, runtime });
+          const bootstrap = selected && await prepareGatewayRunBootstrap({ opts, runtime });
+          admitted = reset
+            ? selected && !bootstrap && await recheckGatewayRunReset({ opts, runtime })
+            : bootstrap && await recheckGatewayRunBootstrap({ opts, runtime });
         } catch (error) {
           if (!(error instanceof ExitError)) throw error;
         }
@@ -287,6 +322,11 @@ describe("Gateway config selection before migration admission", () => {
           keyPresent: process.env.REPRO_PROVIDER_KEY === "repro-not-a-real-key",
           stalePresent: process.env.STALE_KEY !== undefined,
           ...(authProfile ? { stateBefore, resolved, resolutionError } : {}),
+          ...(unreadableAuth ? {
+            warned: warnings.some(message => message.includes("auth-profile") && message.includes("doctor")),
+            credentialSafe: warnings.every(message => ["repro-not-a-real-key", "removed-service-value", "REPRO_PROVIDER_KEY", "STALE_KEY", process.env.OPENCLAW_STATE_DIR, agentDir].every(value => !message.includes(value))),
+            resetOnlyPresent: process.env.RESET_ONLY_KEY !== undefined,
+          } : {}),
         }));
         `,
         { runtimeRoot, timeoutMs: 60_000 },
@@ -298,8 +338,11 @@ describe("Gateway config selection before migration admission", () => {
       expect(observed, output).toEqual({
         admitted: true,
         keyPresent: true,
-        stalePresent: false,
+        stalePresent: unreadableAuth,
         ...(authProfile ? { resolved: true } : {}),
+        ...(unreadableAuth
+          ? { warned: !reset, credentialSafe: true, resetOnlyPresent: false }
+          : {}),
       });
       expect(stateManifest(stateDir)).toEqual(authProfile ? stateBefore : before);
       expect(fs.readFileSync(configPath, "utf8")).toBe(configBefore);

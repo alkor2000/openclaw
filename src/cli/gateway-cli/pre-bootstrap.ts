@@ -264,15 +264,23 @@ async function guardGatewayRunSelectedConfig(
     import("../../config/resolution-facts.js"),
     import("../../daemon/service-managed-env.js"),
     (async () => {
-      if (detectRespawnSupervisor(process.env) !== "systemd") {
+      if (params.opts.reset || detectRespawnSupervisor(process.env) !== "systemd") {
         return undefined;
       }
-      const [{ collectAuthProfileEnvSecretRefIds }, { collectCandidateAgentDirs }] =
-        await Promise.all([
-          import("../../agents/auth-profiles/env-secret-refs.js"),
-          import("../../secrets/runtime-fast-path.js"),
-        ]);
-      return { collectAuthProfileEnvSecretRefIds, collectCandidateAgentDirs };
+      const [
+        { collectAuthProfileEnvSecretRefIds },
+        { collectCandidateAgentDirs },
+        { SqliteSnapshotCleanupError },
+      ] = await Promise.all([
+        import("../../agents/auth-profiles/env-secret-refs.js"),
+        import("../../secrets/runtime-fast-path.js"),
+        import("../../infra/sqlite-readonly-location-cleanup.js"),
+      ]);
+      return {
+        collectAuthProfileEnvSecretRefIds,
+        collectCandidateAgentDirs,
+        SqliteSnapshotCleanupError,
+      };
     })(),
   ]);
   const invocationDestructiveOverride = resolveInvocationDestructiveOverride();
@@ -356,11 +364,25 @@ async function guardGatewayRunSelectedConfig(
     const preserveKeys = collectEnvSecretRefIds(snapshot.sourceConfig);
     const managedKeys = readManagedSystemdServiceEnvKeysFromEnvironment(process.env);
     if (authProfileEnv && managedKeys.size > 0) {
-      for (const id of authProfileEnv.collectAuthProfileEnvSecretRefIds({
-        agentDirs: authProfileEnv.collectCandidateAgentDirs(snapshot.sourceConfig, process.env),
-        env: process.env,
-      })) {
-        preserveKeys.add(id);
+      try {
+        for (const id of authProfileEnv.collectAuthProfileEnvSecretRefIds({
+          agentDirs: authProfileEnv.collectCandidateAgentDirs(snapshot.sourceConfig, process.env),
+          env: process.env,
+        })) {
+          preserveKeys.add(id);
+        }
+      } catch (error) {
+        // Failed cleanup retains native snapshot custody; it is not an unavailable auth store.
+        if (error instanceof authProfileEnv.SqliteSnapshotCleanupError) {
+          throw error;
+        }
+        // Unknown references cannot prove any inherited value stale. Agent admission owns refusal.
+        for (const key of managedKeys) {
+          preserveKeys.add(key);
+        }
+        params.runtime.error(
+          `Could not fully inspect saved auth-profile environment references; preserving inherited managed service values. Run ${formatCliCommand("openclaw doctor --fix")} to inspect unavailable stores.`,
+        );
       }
     }
     // Remove stale inherited values before the final config env layer supplies replacements.

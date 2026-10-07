@@ -1,14 +1,19 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { DatabaseSync } from "node:sqlite";
+import { describe, expect, it, vi, type MockInstance } from "vitest";
 import { clearMissingManagedServiceEnvKeys } from "../../daemon/service-managed-env.js";
+import * as nativeSqlite from "../../infra/node-sqlite.js";
+import { cleanupSnapshotOperations } from "../../infra/sqlite-readonly-location-cleanup.js";
+import * as snapshotSource from "../../infra/sqlite-snapshot-source.js";
 import { writeConfigMachineState } from "../../state/config-machine-state-write.js";
 import { openOpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { cleanupSessionStateForTest } from "../../test-utils/session-state-cleanup.js";
 import { collectAuthProfileEnvSecretRefIds } from "./env-secret-refs.js";
 import { resolveSharedAuthStoreOwnership } from "./path-resolve.js";
+import { closeAuthProfileReadPool } from "./sqlite-read-pool.js";
 import { resolveAuthProfileDatabasePath, writePersistedAuthProfileStoreRaw } from "./sqlite.js";
 import { AuthProfileStoreUnreadableError } from "./store-unreadable-error.js";
 
@@ -92,6 +97,82 @@ describe("auth-profile references before managed service environment cleanup", (
           }),
         ).toEqual(new Set(["AGENT_API_KEY", "SHARED_API_KEY", "SHARED_TOKEN"]));
         expect(artifactHashes(state.root)).toEqual(before);
+      });
+    },
+  );
+
+  it.each(["readable", "schema-refused"] as const)(
+    "retains the %s agent snapshot through failed native close and releases it after retirement",
+    async (kind) => {
+      await withOpenClawTestState({ prefix: "auth-env-ref-native-close-" }, async (state) => {
+        const agentDir = state.agentDir("helper");
+        writePersistedAuthProfileStoreRaw({ version: 1, profiles: {} }, agentDir);
+        await cleanupSessionStateForTest({ stateDir: state.stateDir, rootPath: state.root });
+        if (kind === "schema-refused") {
+          const database = new DatabaseSync(resolveAuthProfileDatabasePath(agentDir));
+          try {
+            database.exec("PRAGMA user_version = 2147483647");
+          } finally {
+            database.close();
+          }
+        }
+        const before = artifactHashes(state.root);
+        let snapshot:
+          | ReturnType<typeof snapshotSource.prepareSqliteReadOnlyLocationSync>
+          | undefined;
+        const prepare = snapshotSource.prepareSqliteReadOnlyLocationSync;
+        const preparation = vi
+          .spyOn(snapshotSource, "prepareSqliteReadOnlyLocationSync")
+          .mockImplementation((filename) => {
+            const prepared = prepare(filename);
+            if (filename === resolveAuthProfileDatabasePath(agentDir)) {
+              snapshot = prepared;
+            }
+            return prepared;
+          });
+        const nativeOpen = nativeSqlite.openNodeSqliteDatabase;
+        const failure = new Error("synthetic native reader close failure");
+        let failedReader: DatabaseSync | undefined;
+        let close: MockInstance<DatabaseSync["close"]> | undefined;
+        const open = vi
+          .spyOn(nativeSqlite, "openNodeSqliteDatabase")
+          .mockImplementation((filename, options) => {
+            const database = nativeOpen(filename, options);
+            if (snapshot && filename === snapshot.location) {
+              failedReader = database;
+              close = vi.spyOn(database, "close").mockImplementation(() => {
+                throw failure;
+              });
+            }
+            return database;
+          });
+        try {
+          expect(() =>
+            collectAuthProfileEnvSecretRefIds({ agentDirs: [agentDir], env: state.env }),
+          ).toThrow();
+          expect(failedReader?.isOpen).toBe(true);
+          expect(snapshot).toBeDefined();
+          expect(fs.existsSync(snapshot!.location)).toBe(true);
+          expect(snapshot!.cleanup()).toBe(false);
+          await cleanupSnapshotOperations();
+          expect(fs.existsSync(snapshot!.location)).toBe(true);
+          expect(artifactHashes(state.root)).toEqual(before);
+          close?.mockRestore();
+          closeAuthProfileReadPool({ kind: "database", databasePath: snapshot!.location });
+          expect(failedReader!.isOpen).toBe(false);
+          expect(snapshot!.cleanup()).toBe(true);
+          expect(fs.existsSync(snapshot!.cleanupRoot ?? path.dirname(snapshot!.location))).toBe(
+            false,
+          );
+        } finally {
+          close?.mockRestore();
+          preparation.mockRestore();
+          open.mockRestore();
+          if (snapshot) {
+            closeAuthProfileReadPool({ kind: "database", databasePath: snapshot.location });
+            snapshot.cleanup();
+          }
+        }
       });
     },
   );

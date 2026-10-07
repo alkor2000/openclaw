@@ -1,4 +1,5 @@
 /** Reads reference names before service-env cleanup, without activating credentials. */
+import nodePath from "node:path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import type { Result } from "@openclaw/normalization-core/result";
 import { collectEnvSecretRefIds } from "../../config/resolution-facts.js";
@@ -41,7 +42,13 @@ export function collectAuthProfileEnvSecretRefIds(params: {
               const source = prepareSqliteReadOnlyLocationSync(target.path);
               let result: Result<ReturnType<typeof readAuthProfileRowsReadOnly>["store"], unknown>;
               try {
-                result = { ok: true, value: readAuthProfileRowsReadOnly(source.location).store };
+                result = {
+                  ok: true,
+                  value: readAuthProfileRowsReadOnly(
+                    source.location,
+                    source.cleanupRoot ?? nodePath.dirname(source.location),
+                  ).store,
+                };
               } catch (error) {
                 result = { ok: false, error };
               }

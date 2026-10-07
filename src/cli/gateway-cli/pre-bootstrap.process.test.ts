@@ -126,9 +126,26 @@ describe("Gateway config selection before migration admission", () => {
       managed: true,
       included: false,
     },
+    {
+      name: "managed auth-profile-only reference",
+      apiKey: undefined,
+      managed: true,
+      included: false,
+      authProfile: true,
+    },
+    {
+      name: "managed config env replacement",
+      apiKey: undefined,
+      managed: true,
+      included: false,
+      configEnv: true,
+    },
   ])(
     "preserves $name through startup without writing config",
-    async ({ apiKey, managed, included }) => {
+    async (scenario) => {
+      const { apiKey, managed, included } = scenario;
+      const authProfile = "authProfile" in scenario && scenario.authProfile;
+      const configEnv = "configEnv" in scenario && scenario.configEnv;
       const root = fs.realpathSync(tempDirs.make("openclaw-managed-env-selection-"));
       const runtimeRoot = createSourceRuntime(runtimeParent);
       const stateDir = path.join(root, "state");
@@ -152,9 +169,17 @@ describe("Gateway config selection before migration admission", () => {
           plugins: { enabled: false },
           messages: { responsePrefix: "$${STALE_KEY}" },
           models: { providers: included ? { $include: "providers.json" } : providers },
+          ...(configEnv ? { env: { vars: { REPRO_PROVIDER_KEY: "repro-not-a-real-key" } } } : {}),
+          ...(authProfile
+            ? {
+                agents: { ownership: "explicit", entries: { main: {}, helper: {} } },
+                auth: { profiles: { "minimax:fixture": { provider: "minimax", mode: "api_key" } } },
+              }
+            : {}),
         }),
       );
       const before = stateManifest(stateDir);
+      const configBefore = fs.readFileSync(configPath, "utf8");
       const result = await runIsolatedModuleScript(
         {
           PATH: process.env.PATH,
@@ -170,14 +195,57 @@ describe("Gateway config selection before migration admission", () => {
           OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1",
           OPENCLAW_BUNDLED_PLUGINS_DIR: path.join(root, "bundled"),
           INVOCATION_ID: "repro",
-          REPRO_PROVIDER_KEY: "repro-not-a-real-key",
+          REPRO_PROVIDER_KEY: configEnv ? "stale-inherited-key" : "repro-not-a-real-key",
           STALE_KEY: "removed-service-value",
           OPENCLAW_SERVICE_MANAGED_ENV_KEYS: managed ? "REPRO_PROVIDER_KEY,STALE_KEY" : "STALE_KEY",
         },
         `
+        import fs from "node:fs";
+        import path from "node:path";
+        import { createHash } from "node:crypto";
         Object.defineProperty(process, "platform", { value: "linux" });
+        const authProfile = ${JSON.stringify(authProfile)};
+        let stateBefore;
+        let profileRef;
+        let agentDir;
+        if (authProfile) {
+          const { saveAuthProfileStore } = await import("./src/agents/auth-profiles/store-runtime.ts");
+          const { loadPersistedAuthProfileStore } = await import("./src/agents/auth-profiles/persisted.ts");
+          const { resolveSecretRefString } = await import("./src/secrets/resolve.ts");
+          const { closeOpenClawAgentDatabasesAsync } = await import("./src/state/openclaw-agent-db.ts");
+          const { closeOpenClawStateDatabaseAsync } = await import("./src/state/openclaw-state-db.ts");
+          const { closeAuthProfileReadPool } = await import("./src/agents/auth-profiles/sqlite.ts");
+          agentDir = path.join(process.env.OPENCLAW_STATE_DIR, "agents", "helper", "agent");
+          fs.mkdirSync(agentDir, { recursive: true });
+          saveAuthProfileStore({ version: 1, profiles: { "minimax:fixture": {
+            type: "api_key", provider: "minimax",
+            keyRef: { source: "env", provider: "default", id: "REPRO_PROVIDER_KEY" },
+          } } }, agentDir);
+          profileRef = loadPersistedAuthProfileStore(agentDir)?.profiles["minimax:fixture"]?.keyRef;
+          if (!profileRef || !fs.existsSync(path.join(agentDir, "openclaw-agent.sqlite"))) {
+            throw new Error("SQLite auth-profile fixture was not persisted");
+          }
+          if (await resolveSecretRefString(profileRef, { config: {}, env: process.env }) !== "repro-not-a-real-key") {
+            throw new Error("Auth-profile fixture did not resolve before startup");
+          }
+          closeAuthProfileReadPool({ kind: "root", rootPath: process.env.OPENCLAW_STATE_DIR });
+          await closeOpenClawAgentDatabasesAsync(process.env.OPENCLAW_STATE_DIR);
+          await closeOpenClawStateDatabaseAsync();
+          stateBefore = Object.fromEntries(fs.readdirSync(process.env.OPENCLAW_STATE_DIR, {
+            recursive: true, withFileTypes: true,
+          }).filter(entry => entry.isFile()).map(entry => {
+            const filename = path.join(entry.parentPath, entry.name);
+            return [path.relative(process.env.OPENCLAW_STATE_DIR, filename),
+              createHash("sha256").update(fs.readFileSync(filename)).digest("hex")];
+          }));
+        }
         const { selectGatewayRunEnvironment, prepareGatewayRunBootstrap, recheckGatewayRunBootstrap } = await import("./src/cli/gateway-cli/pre-bootstrap.ts");
         const { ExitError } = await import("./src/runtime.ts");
+        if (authProfile) {
+          const { readConfigFileSnapshot } = await import("./src/config/config.ts");
+          const snapshot = await readConfigFileSnapshot({ isolateEnv: true, observe: false, pluginValidation: "core-only" });
+          if (!snapshot.valid) throw new Error("Auth-profile fixture config was invalid: " + JSON.stringify(snapshot.issues));
+        }
         const runtime = { log() {}, error: console.error, exit(code) { throw new ExitError(code); } };
         let admitted = false;
         try {
@@ -188,9 +256,37 @@ describe("Gateway config selection before migration admission", () => {
         } catch (error) {
           if (!(error instanceof ExitError)) throw error;
         }
+        let resolved = false;
+        let resolutionError;
+        if (authProfile) {
+          const { loadPersistedAuthProfileStoreAtDatabasePath } = await import("./src/agents/auth-profiles/persisted.ts");
+          const { prepareSqliteReadOnlyLocationSync } = await import("./src/infra/sqlite-snapshot-source.ts");
+          const { resolveSecretRefString } = await import("./src/secrets/resolve.ts");
+          const source = prepareSqliteReadOnlyLocationSync(path.join(agentDir, "openclaw-agent.sqlite"));
+          let persistedRef;
+          try {
+            persistedRef = loadPersistedAuthProfileStoreAtDatabasePath(source.location, "agent")?.profiles["minimax:fixture"]?.keyRef;
+          } finally {
+            const { closeAuthProfileReadPool } = await import("./src/agents/auth-profiles/sqlite.ts");
+            closeAuthProfileReadPool({ kind: "database", databasePath: source.location });
+            if (!source.cleanup()) throw new Error("Auth-profile verification snapshot cleanup failed");
+          }
+          if (JSON.stringify(persistedRef) !== JSON.stringify(profileRef)) {
+            throw new Error("Startup changed the auth-profile reference");
+          }
+          try {
+            resolved = await resolveSecretRefString(persistedRef, { config: {}, env: process.env }) === "repro-not-a-real-key";
+          } catch (error) {
+            if (error?.code !== "SECRET_REF_NOT_FOUND") throw error;
+            resolutionError = error.code;
+          }
+          const { closeAuthProfileReadPool } = await import("./src/agents/auth-profiles/sqlite.ts");
+          closeAuthProfileReadPool({ kind: "root", rootPath: process.env.OPENCLAW_STATE_DIR });
+        }
         console.log("__RESULT__" + JSON.stringify({ admitted,
           keyPresent: process.env.REPRO_PROVIDER_KEY === "repro-not-a-real-key",
           stalePresent: process.env.STALE_KEY !== undefined,
+          ...(authProfile ? { stateBefore, resolved, resolutionError } : {}),
         }));
         `,
         { runtimeRoot, timeoutMs: 60_000 },
@@ -198,12 +294,15 @@ describe("Gateway config selection before migration admission", () => {
       const output = `${result.stdout}\n${result.stderr}`;
       const line = result.stdout.split("\n").find((entry) => entry.startsWith("__RESULT__"));
       expect(line, output).toBeDefined();
-      expect(JSON.parse(line!.slice("__RESULT__".length)), output).toEqual({
+      const { stateBefore, ...observed } = JSON.parse(line!.slice("__RESULT__".length));
+      expect(observed, output).toEqual({
         admitted: true,
         keyPresent: true,
         stalePresent: false,
+        ...(authProfile ? { resolved: true } : {}),
       });
-      expect(stateManifest(stateDir)).toEqual(before);
+      expect(stateManifest(stateDir)).toEqual(authProfile ? stateBefore : before);
+      expect(fs.readFileSync(configPath, "utf8")).toBe(configBefore);
     },
     75_000,
   );

@@ -150,10 +150,22 @@ export function reloadSharedAuthStoreOwnership(
 
 /** Resolve the canonical shared auth database path. */
 export function resolveSharedAuthStorePath(env: NodeJS.ProcessEnv = process.env): string {
-  if (resolveSharedAuthStoreOwnership(env).location === "state-db") {
-    return resolveOpenClawStateSqlitePath(env);
-  }
-  return path.join(resolveSharedMainAuthAgentDir(env), "openclaw-agent.sqlite");
+  return sharedAuthStoreTarget(resolveSharedAuthStoreOwnership(env), env).path;
+}
+
+function sharedAuthStoreTarget(ownership: SharedAuthStoreOwnership, env: NodeJS.ProcessEnv) {
+  return ownership.location === "state-db"
+    ? { kind: "shared-state" as const, path: resolveOpenClawStateSqlitePath(env), env }
+    : {
+        kind: "agent" as const,
+        path: path.join(resolveSharedMainAuthAgentDir(env), "openclaw-agent.sqlite"),
+        env,
+      };
+}
+
+/** Pre-admission inspection must not pin the runtime's shared-store owner. */
+export function inspectSharedAuthStoreDatabaseTarget(env: NodeJS.ProcessEnv) {
+  return sharedAuthStoreTarget(inspectSharedAuthStoreOwnership(env), env);
 }
 
 /**

@@ -11,10 +11,17 @@ OpenClaw pulls environment variables from multiple sources. The normal rule is *
 Workspace `.env` files are a lower-trust source: OpenClaw ignores provider credentials and protected runtime controls from workspace `.env` before applying precedence.
 
 Systemd startup preserves managed process values referenced by config, including
-`${VAR}` and `$VAR` SecretRef shorthand in `$include` files. This also covers
-values supplied by an operator `EnvironmentFile=`. Managed values absent from
-both trusted dotenv files and current config references are removed from the
-Gateway process environment.
+`${VAR}` and `$VAR` SecretRef shorthand in `$include` files, and API-key or token
+SecretRefs in the selected shared and agent auth-profile stores. This also covers
+values supplied by an operator `EnvironmentFile=`. After config and state
+selection settles, managed values absent from trusted dotenv files and both
+config and auth-profile references are removed from the Gateway process environment.
+
+Startup inspects auth-profile stores without migrating them or changing their
+source files. An unreadable store stops this cleanup before any managed value is
+deleted and reports `openclaw doctor --fix` as the next step. Inspect and repair
+the reported source before retrying; this does not rewrite service files or
+previous update records.
 
 ## Precedence (highest to lowest)
 

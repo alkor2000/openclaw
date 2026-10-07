@@ -6,10 +6,13 @@ import {
   resolveNodeExecEligibility,
   resolvePreparedExecDefaultsAsync,
 } from "../../agents/exec-defaults.js";
+import { withSandboxRuntimeStatusInWorker } from "../../agents/sandbox/runtime-status.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import { patchSessionEntryCore } from "../../config/sessions/session-accessor.js";
 import { projectCompactionAccountingPatch } from "../../config/sessions/session-entry-projection.js";
 import { readSessionEntryInWorker } from "../../config/sessions/session-entry-read-runtime.js";
+import type { SessionSourceAssertion } from "../../config/sessions/session-source-authority.js";
+import { captureSessionTranscriptStorageEnvironment } from "../../config/sessions/transcript-target-binding.js";
 import type { InternalSessionEntry } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { isFastTestRuntimeEnv } from "../../infra/env.js";
@@ -51,7 +54,9 @@ async function persistSkillSnapshot(params: {
   currentEntry: SessionEntry;
   skillsSnapshot: SessionEntry["skillsSnapshot"];
   isFirstTurnInSession: boolean;
+  assertCurrent?: SessionSourceAssertion;
 }): Promise<{ entry: SessionEntry | undefined; updated: boolean }> {
+  params.assertCurrent?.();
   const updates = {
     sessionId: params.sessionId ?? params.currentEntry.sessionId,
     updatedAt: Date.now(),
@@ -81,18 +86,27 @@ async function persistSkillSnapshot(params: {
       sessionKey: params.sessionKey,
     },
     (entry) => {
+      params.assertCurrent?.();
       updated =
         entry.sessionId === params.expectedSession?.sessionId &&
         entry.lifecycleRevision === params.expectedSession?.lifecycleRevision;
       return updated ? updates : null;
     },
-    { workerGuard: {} },
+    { workerGuard: { source: params.assertCurrent } },
   );
+  params.assertCurrent?.();
   publishSessionEntry(params, persistedEntry ?? undefined);
   return { entry: persistedEntry ?? undefined, updated: Boolean(persistedEntry) && updated };
 }
 
-/** Ensures a session entry has the reusable skill snapshot needed for reply runs. */
+function readSkillSnapshotState(entry: SessionEntry | undefined) {
+  return {
+    sessionEntry: entry,
+    skillsSnapshot: entry?.skillsSnapshot,
+    systemSent: entry?.systemSent ?? false,
+  };
+}
+
 export async function ensureSkillSnapshot(params: {
   agentId: string;
   sessionEntry?: SessionEntry;
@@ -109,6 +123,7 @@ export async function ensureSkillSnapshot(params: {
   /** If provided, only load skills with these names (for per-channel skill filtering) */
   skillFilter?: string[];
   skillOverrides?: Record<string, boolean>;
+  assertCurrent?: SessionSourceAssertion;
 }): Promise<{
   sessionEntry?: SessionEntry;
   skillsSnapshot?: SessionEntry["skillsSnapshot"];
@@ -117,11 +132,7 @@ export async function ensureSkillSnapshot(params: {
   if (isFastTestRuntimeEnv()) {
     // In fast unit-test runs we skip filesystem scanning, watchers, and session-store writes.
     // Dedicated skills tests cover snapshot generation behavior.
-    return {
-      sessionEntry: params.sessionEntry,
-      skillsSnapshot: params.sessionEntry?.skillsSnapshot,
-      systemSent: params.sessionEntry?.systemSent ?? false,
-    };
+    return readSkillSnapshotState(params.sessionEntry);
   }
 
   const {
@@ -138,6 +149,10 @@ export async function ensureSkillSnapshot(params: {
     skillFilter,
     skillOverrides,
   } = params;
+  const env = captureSessionTranscriptStorageEnvironment(process.env);
+  const cwd = process.cwd();
+  const assertCurrent = params.assertCurrent ?? (() => {});
+  assertCurrent();
 
   let nextEntry = sessionEntryHandle?.getCurrent() ?? sessionEntry;
   const expectedSession = nextEntry && {
@@ -152,29 +167,35 @@ export async function ensureSkillSnapshot(params: {
     agentId,
     execOverrides: params.execOverrides,
   };
-  const execDefaults = await resolvePreparedExecDefaultsAsync(
-    prepareExecDefaults(execParams),
-    loadExecApprovalsReadOnlyAsync,
-  );
-  const nodeSkillsEligibility = resolveNodeExecEligibility(execParams, execDefaults);
   const existingSnapshot = nextEntry?.skillsSnapshot;
   const resolveSnapshot = (snapshot: SessionEntry["skillsSnapshot"]) =>
-    resolveReusableWorkspaceSkillSnapshot({
-      workspaceDir,
-      ...resolveSessionSkillExecutionWorkspace(
-        nextEntry?.worktree?.canonicalWorkspaceDir,
-        params.executionWorkspaceDir,
-      ),
-      config: cfg,
-      agentId,
-      skillFilter,
-      skillOverrides,
-      resolveEligibility: () => ({
-        nodeSkills: nodeSkillsEligibility,
-        remote: getRemoteSkillEligibility({ advertiseExecNode: nodeSkillsEligibility.canExec }),
-      }),
-      existingSnapshot: snapshot,
-      librarySelections: nextEntry?.skillLibrarySelections,
+    withSandboxRuntimeStatusInWorker(execParams, { env, cwd, assertCurrent }, async (sandbox) => {
+      const execDefaults = await resolvePreparedExecDefaultsAsync(
+        prepareExecDefaults(execParams, sandbox),
+        () => loadExecApprovalsReadOnlyAsync({ env }),
+      );
+      assertCurrent();
+      const nodeSkillsEligibility = resolveNodeExecEligibility(execParams, execDefaults);
+      const result = await resolveReusableWorkspaceSkillSnapshot({
+        assertCurrent,
+        workspaceDir,
+        ...resolveSessionSkillExecutionWorkspace(
+          nextEntry?.worktree?.canonicalWorkspaceDir,
+          params.executionWorkspaceDir,
+        ),
+        config: cfg,
+        agentId,
+        skillFilter,
+        skillOverrides,
+        resolveEligibility: () => ({
+          nodeSkills: nodeSkillsEligibility,
+          remote: getRemoteSkillEligibility({ advertiseExecNode: nodeSkillsEligibility.canExec }),
+        }),
+        existingSnapshot: snapshot,
+        librarySelections: nextEntry?.skillLibrarySelections,
+      });
+      assertCurrent();
+      return result;
     });
   const initialSnapshotState = await resolveSnapshot(existingSnapshot);
   const shouldRefreshSnapshot = initialSnapshotState.shouldRefresh;
@@ -198,11 +219,7 @@ export async function ensureSkillSnapshot(params: {
       skillsSnapshot: skillSnapshot,
     });
     if (!updated) {
-      return {
-        sessionEntry: persistedEntry,
-        skillsSnapshot: persistedEntry?.skillsSnapshot,
-        systemSent: persistedEntry?.systemSent ?? false,
-      };
+      return readSkillSnapshotState(persistedEntry);
     }
     nextEntry = persistedEntry;
     systemSent = persistedEntry?.systemSent ?? systemSent;
@@ -232,11 +249,7 @@ export async function ensureSkillSnapshot(params: {
       skillsSnapshot,
     });
     if (!updated) {
-      return {
-        sessionEntry: persistedEntry,
-        skillsSnapshot: persistedEntry?.skillsSnapshot,
-        systemSent: persistedEntry?.systemSent ?? false,
-      };
+      return readSkillSnapshotState(persistedEntry);
     }
     nextEntry = persistedEntry;
   }
@@ -245,10 +258,11 @@ export async function ensureSkillSnapshot(params: {
     // Even a reusable snapshot crosses an await. Return the current row so the
     // reply caller cannot restore stale metadata or a retired session generation.
     const current = storePath
-      ? await readSessionEntryInWorker({ storePath, sessionKey })
+      ? await readSessionEntryInWorker({ storePath, sessionKey, env }, assertCurrent)
       : sessionEntryHandle
         ? sessionEntryHandle.get(sessionKey)
         : sessionStore?.[sessionKey];
+    assertCurrent();
     if (storePath) {
       publishSessionEntry(params, current);
     }
@@ -256,11 +270,7 @@ export async function ensureSkillSnapshot(params: {
       current?.sessionId !== expectedSession?.sessionId ||
       current?.lifecycleRevision !== expectedSession?.lifecycleRevision
     ) {
-      return {
-        sessionEntry: current,
-        skillsSnapshot: current?.skillsSnapshot,
-        systemSent: current?.systemSent ?? false,
-      };
+      return readSkillSnapshotState(current);
     }
     nextEntry = current;
     systemSent = current?.systemSent ?? false;

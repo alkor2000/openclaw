@@ -13,7 +13,7 @@ import {
   openOpenClawAgentDatabase,
   resolveOpenClawAgentSqlitePath,
   runOpenClawAgentWriteTransaction,
-  withOpenClawAgentDatabaseAsync,
+  withOpenClawAgentDatabaseRuntime,
   type OpenClawAgentDatabase,
 } from "../../state/openclaw-agent-db.js";
 import { supportsOpenClawAgentDatabaseExecution } from "../../state/openclaw-agent-execution.js";
@@ -442,12 +442,13 @@ async function patchSqliteSessionEntrySnapshot(
       providerReviewMutation: options.providerReviewMutation,
       shouldCommitIf: options.workerGuard?.shouldCommitIf,
       cliHistory: options.workerGuard?.cliHistory,
+      conversation: options.workerGuard?.conversation,
     };
   };
   const withDatabase = <T>(operation: () => T | Promise<T>) => {
     assertCurrent?.();
     return !incognito && !getOpenClawAgentDatabaseIfOpen(databaseOptions)
-      ? withOpenClawAgentDatabaseAsync(databaseOptions, operation, assertCurrent)
+      ? withOpenClawAgentDatabaseRuntime(databaseOptions, operation, assertCurrent)
       : operation();
   };
   if (incognitoBinding) {
@@ -671,7 +672,9 @@ export async function updateSessionLastRoute(
 /** Internal callers retain their captured storage owner across route preparation. */
 export async function updateSessionLastRouteInScope(
   scope: SessionAccessScope & { databaseAgentId?: string },
-  params: Omit<Parameters<typeof updateSessionLastRoute>[0], "storePath" | "sessionKey">,
+  params: Omit<Parameters<typeof updateSessionLastRoute>[0], "storePath" | "sessionKey"> & {
+    workerGuard?: SessionEntryPatchGuard;
+  },
 ): Promise<SessionEntry | null> {
   if (params.ctx) {
     normalizeInternalTurnContext(params.ctx);
@@ -703,7 +706,7 @@ export async function updateSessionLastRouteInScope(
     {
       // Route updates must not refresh activity timestamps (#49515).
       preserveActivity: true,
-      workerGuard: {},
+      workerGuard: params.workerGuard ?? {},
       ...(params.assertCommitAllowed ? { assertCommitAllowed: params.assertCommitAllowed } : {}),
       ...(createIfMissing ? { fallbackEntry: mergeSessionEntry(undefined, {}) } : {}),
     },

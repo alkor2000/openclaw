@@ -31,10 +31,7 @@ import {
 } from "../../../test-utils/openclaw-test-state.js";
 import { createSubagentRunRecord } from "../../subagent-test-fixtures.test-helpers.js";
 import { readSubagentRunAnnounceResultUsing } from "../announce/subagent-announce-result.js";
-import {
-  mutateRequesterSettleWakeBatch,
-  settleRequesterCompletionBatch,
-} from "../completion/subagent-completion-admission.store.js";
+import { mutateRequesterCompletionBatch } from "../completion/subagent-completion-admission.store.js";
 import { bindSubagentRunGatewayOwners } from "./subagent-registry-gateway-owner.js";
 import { subagentRuns } from "./subagent-registry-memory.js";
 import {
@@ -108,7 +105,7 @@ async function register(...entries: SubagentRunRecord[]) {
   );
 }
 
-it("restores bounded payload pages from one snapshot and retains their physical row versions", async () => {
+it("streams bounded restore batches in one read and retains snapshot row versions", async () => {
   const entries = [3, 1, 2].map((createdAt, index) =>
     Object.assign(entry(`paged-${index}`), {
       createdAt,
@@ -121,31 +118,29 @@ it("restores bounded payload pages from one snapshot and retains their physical 
   const payloadBytes: number[] = [];
   const observe = vi
     .spyOn(stateReads, "executeExistingOpenClawStateRead")
-    .mockImplementation(async (options, command, readOptions) => {
-      const reply = await read(options, command, readOptions);
-      if (
-        reply?.ok &&
-        reply.type === "subagents.runs" &&
-        reply.projection === undefined &&
-        reply.page
-      ) {
-        payloadBytes.push(Buffer.byteLength(JSON.stringify([...reply.runs])));
-        if (payloadBytes.length === 1) {
-          const changed = { ...entries[2]!, model: "foreign metadata" };
-          const added = entry("added-after-snapshot");
-          saveSubagentRegistryChangesToSqlite(
-            new Map([
-              [changed.runId, changed],
-              [added.runId, added],
-            ]),
-            [changed.runId, added.runId],
-          );
-        }
-      }
-      return reply;
-    });
+    .mockImplementation((options, command, readOptions) =>
+      read(options, command, {
+        ...readOptions,
+        onChunk(value) {
+          payloadBytes.push(Buffer.byteLength(JSON.stringify(value)));
+          readOptions?.onChunk?.(value);
+          if (payloadBytes.length === 1) {
+            const changed = { ...entries[2]!, model: "foreign metadata" };
+            const added = entry("added-after-snapshot");
+            saveSubagentRegistryChangesToSqlite(
+              new Map([
+                [changed.runId, changed],
+                [added.runId, added],
+              ]),
+              [changed.runId, added.runId],
+            );
+          }
+        },
+      }),
+    );
   try {
     await restoreSubagentRunsFromDisk({ runs: subagentRuns });
+    expect(observe).toHaveBeenCalledOnce();
     expect(payloadBytes.length).toBeGreaterThan(1);
     expect(Math.max(...payloadBytes)).toBeLessThanOrEqual(1024 * 1024);
     expect([...subagentRuns.keys()]).toEqual(["paged-1", "paged-2", "paged-0"]);
@@ -163,7 +158,39 @@ it("restores bounded payload pages from one snapshot and retains their physical 
   });
 });
 
-it("refuses quarantined registry pages in the worker without replacing resident publication", async () => {
+it("joins a cancelled stream without publishing partial restored rows", async () => {
+  const entries = Array.from({ length: 129 }, (_, index) => entry(`cancelled-${index}`));
+  saveSubagentRegistryChangesToSqlite(
+    new Map(entries.map((row) => [row.runId, row])),
+    entries.map((row) => row.runId),
+  );
+  const revision = getSubagentRegistryPublicationRevision();
+  const read = stateReads.executeExistingOpenClawStateRead;
+  const controller = new AbortController();
+  const failure = new Error("Synthetic restore cancellation");
+  const observe = vi
+    .spyOn(stateReads, "executeExistingOpenClawStateRead")
+    .mockImplementation((options, command, readOptions) =>
+      read(options, command, {
+        ...readOptions,
+        signal: controller.signal,
+        onChunk(value) {
+          readOptions?.onChunk?.(value);
+          controller.abort(failure);
+        },
+      }),
+    );
+  await expect(restoreSubagentRunsFromDisk({ runs: subagentRuns })).rejects.toThrow(
+    failure.message,
+  );
+  expect(subagentRuns.size).toBe(0);
+  expect(getSubagentRegistryPublicationRevision()).toBe(revision);
+  observe.mockRestore();
+  await restoreSubagentRunsFromDisk({ runs: subagentRuns });
+  expect(subagentRuns.size).toBe(entries.length);
+});
+
+it("refuses quarantined registry reads in the worker without replacing resident publication", async () => {
   const durable = entry("quarantined-durable");
   saveSubagentRegistryChangesToSqlite(new Map([[durable.runId, durable]]), [durable.runId]);
   const pathname = openOpenClawStateDatabase().path;
@@ -509,7 +536,7 @@ it("settles a requester cohort while many children finish, wake, and one is kill
     }),
   );
   const wakes = children.map((child) =>
-    mutateRequesterSettleWakeBatch({
+    mutateRequesterCompletionBatch({
       entries: [child],
       context,
       assertCurrent: () => {},
@@ -522,17 +549,17 @@ it("settles a requester cohort while many children finish, wake, and one is kill
     }),
   );
   const settlement = Promise.all(wakes).then(() =>
-    settleRequesterCompletionBatch({
+    mutateRequesterCompletionBatch({
       entries: children.map(({ runId }) => {
         const subagent = subagentRuns.get(runId);
         if (!subagent) {
           throw new Error("Requester wake lost its acknowledged child");
         }
-        return { subagent };
+        return subagent;
       }),
       context,
-      outcome: { delivered: true, path: "direct" },
-      isCurrent: () => true,
+      operation: { kind: "settle", outcome: { delivered: true, path: "direct" } },
+      assertCurrent: () => {},
     }),
   );
   const killed = manager.markSubagentRunTerminated({

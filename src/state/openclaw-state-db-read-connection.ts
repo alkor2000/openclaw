@@ -2,7 +2,9 @@ import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { isPromiseLike } from "@openclaw/normalization-core/promise-like";
 import { getSqliteRuntimeCapabilities } from "../infra/bun-sqlite-library.js";
+import { enableNodeSqliteKyselyStatementCache } from "../infra/kysely-sync-cache-state.js";
 import { openNodeSqliteDatabase } from "../infra/node-sqlite.js";
+import { isSqliteCorruptionError } from "../infra/sqlite-error-diagnostics.js";
 import { SQLITE_IDLE_HANDLE_TTL_MS } from "../infra/sqlite-handle-lifecycle.js";
 import {
   createSqliteLifecycleAggregateError,
@@ -11,9 +13,17 @@ import {
 } from "../infra/sqlite-lifecycle-errors.js";
 import { retainSnapshotTempDirectory } from "../infra/sqlite-readonly-location-cleanup.js";
 import type { PreparedSqliteReadOnlyLocation } from "../infra/sqlite-readonly-location.types.js";
-import { admitSqliteSchema, runSqliteReadOperationSync } from "../infra/sqlite-schema-facts.js";
+import {
+  admitSqliteSchema,
+  isSqliteSchemaAdmissionCold,
+  runSqliteReadOperationSync,
+} from "../infra/sqlite-schema-facts.js";
 import { acquireSqliteSnapshotReadToken } from "../infra/sqlite-snapshot-staging.js";
 import { assertTransactionUsable } from "../infra/sqlite-transaction.js";
+import {
+  createNewerSqliteSchemaVersionError,
+  readSqliteUserVersion,
+} from "../infra/sqlite-user-version.js";
 import {
   registerSqliteCacheExitClose,
   runInSqliteMaintenanceContext,
@@ -23,16 +33,26 @@ import {
   readDatabasePathIdentitySync,
   type DatabasePathIdentity,
 } from "../infra/sqlite-worker-identity.js";
+import { getSqliteWorkerStateIntegrityAdmission } from "../infra/sqlite-worker-state-context.js";
 import { openClawStateDatabaseCache } from "./openclaw-state-db-cache.js";
 import {
   OPENCLAW_SQLITE_BUSY_TIMEOUT_MS,
+  OPENCLAW_STATE_SCHEMA_VERSION,
   type OpenClawStateDatabase,
   type OpenClawStateSchemaReadAdmission,
 } from "./openclaw-state-db-contract.js";
 import { assertExistingOpenClawStateRuntimeSchema } from "./openclaw-state-db-existing-schema.js";
 import { openTrackedStateDatabaseResult } from "./openclaw-state-db-handle.js";
+import {
+  invalidateOpenClawStateRuntimeIntegrity,
+  type OpenClawStateIntegrityPolicy,
+} from "./openclaw-state-db-integrity-admission.js";
+import { normalizeOpenClawStateSchemaReadError } from "./openclaw-state-db-schema-migration-required.js";
 import { isExistingOpenClawStateSchema } from "./openclaw-state-db-schema-policy.js";
-import { assertSupportedStateSchemaVersion } from "./openclaw-state-db-schema-version.js";
+import {
+  assertSupportedStateSchemaVersion,
+  type StateSchemaContentVersionRowReader,
+} from "./openclaw-state-db-schema-version.js";
 import type { OpenClawStateReadOnlyDatabase } from "./openclaw-state-read.types.js";
 
 export type OpenClawStateReadConnection = {
@@ -167,11 +187,16 @@ export type OpenClawStateSettledRead<T> =
   | { status: "available"; value: T }
   | { status: "unavailable"; error: unknown };
 
-export function assertStateReadSchema(database: DatabaseSync, pathname: string): void {
+export function assertStateReadSchema(
+  database: DatabaseSync,
+  pathname: string,
+  integrityPolicy?: OpenClawStateIntegrityPolicy,
+): void {
   assertStateReadSchemaForPolicy(
     database,
     pathname,
     isExistingOpenClawStateSchema(pathname, database),
+    integrityPolicy,
   );
 }
 
@@ -179,11 +204,46 @@ function assertStateReadSchemaForPolicy(
   database: DatabaseSync,
   pathname: string,
   existingSchema: boolean,
+  integrityPolicy?: OpenClawStateIntegrityPolicy,
+  readContentVersionRow?: StateSchemaContentVersionRowReader,
 ): void {
   if (existingSchema) {
-    assertExistingOpenClawStateRuntimeSchema(database, pathname);
+    assertExistingOpenClawStateRuntimeSchema(
+      database,
+      pathname,
+      getSqliteWorkerStateIntegrityAdmission(),
+      integrityPolicy,
+    );
   } else {
-    assertSupportedStateSchemaVersion(database, pathname);
+    assertSupportedStateSchemaVersion(database, pathname, undefined, readContentVersionRow);
+  }
+}
+
+function admitStateReadSchemaFacts(database: DatabaseSync, pathname: string): void {
+  try {
+    admitSqliteSchema(database, (userVersion) =>
+      assertSupportedStateSchemaVersion(database, pathname, {
+        userVersion,
+        contentVersion: userVersion,
+      }),
+    );
+  } catch (error) {
+    // An unreadable newer catalog must not be mistaken for a repair this build can perform.
+    let version: number;
+    try {
+      version = readSqliteUserVersion(database);
+    } catch {
+      throw normalizeOpenClawStateSchemaReadError(error, pathname);
+    }
+    if (version > OPENCLAW_STATE_SCHEMA_VERSION) {
+      throw createNewerSqliteSchemaVersionError(
+        "OpenClaw state database",
+        pathname,
+        version,
+        OPENCLAW_STATE_SCHEMA_VERSION,
+      );
+    }
+    throw normalizeOpenClawStateSchemaReadError(error, pathname);
   }
 }
 
@@ -195,6 +255,7 @@ export function withOpenClawStateReadOnlyLocation<T>(
   expectedIdentity?: string,
   snapshotRoot?: string,
   retainConnection = false,
+  readContentVersionRow?: StateSchemaContentVersionRowReader,
 ): T {
   const result = readOpenClawStateReadOnlyLocation(
     operation,
@@ -204,6 +265,7 @@ export function withOpenClawStateReadOnlyLocation<T>(
     expectedIdentity,
     snapshotRoot,
     retainConnection,
+    readContentVersionRow,
   );
   if (result.status === "unavailable") {
     throw result.error;
@@ -220,6 +282,7 @@ export function readOpenClawStateReadOnlyLocation<T>(
   expectedIdentity?: string,
   snapshotRoot?: string,
   retainConnection = false,
+  readContentVersionRow?: StateSchemaContentVersionRowReader,
 ): OpenClawStateSettledRead<T> {
   const opening =
     retainConnection && source === pathname && !snapshotRoot
@@ -237,12 +300,42 @@ export function readOpenClawStateReadOnlyLocation<T>(
     // Scope and path policy are authority, not ordinary schema SQL failure.
     const existingSchema = isExistingOpenClawStateSchema(pathname, opened.database.db);
     try {
-      runSqliteReadOperationSync(opened.database.db, () => {
-        assertStateReadSchemaForPolicy(opened.database.db, pathname, existingSchema);
-        admitSqliteSchema(opened.database.db);
-      });
-      result = { status: "available", value: operation(opened.database) };
+      result = {
+        status: "available",
+        value: runSqliteReadOperationSync(opened.database.db, () => {
+          const coldAdmission = !existingSchema && isSqliteSchemaAdmissionCold(opened.database.db);
+          admitStateReadSchemaFacts(opened.database.db, pathname);
+          if (coldAdmission) {
+            // A peer can upgrade after catalog capture releases its SQLite snapshot.
+            return runSqliteReadOperationSync(
+              opened.database.db,
+              () => {
+                assertStateReadSchemaForPolicy(
+                  opened.database.db,
+                  pathname,
+                  existingSchema,
+                  undefined,
+                  readContentVersionRow,
+                );
+                return operation(opened.database);
+              },
+              "fresh",
+            );
+          }
+          assertStateReadSchemaForPolicy(
+            opened.database.db,
+            pathname,
+            existingSchema,
+            undefined,
+            readContentVersionRow,
+          );
+          return operation(opened.database);
+        }),
+      };
     } catch (error) {
+      if (isSqliteCorruptionError(error)) {
+        invalidateOpenClawStateRuntimeIntegrity(opened.database.db);
+      }
       result = { status: "unavailable", error };
     }
     const location = typeof source === "string" ? source : source.location;
@@ -313,8 +406,8 @@ export function openOpenClawStateReadOnlyLocation(
   const connection = openOpenClawStateReadConnection(pathname, source);
   try {
     runSqliteReadOperationSync(connection.database.db, () => {
+      admitStateReadSchemaFacts(connection.database.db, pathname);
       assertStateReadSchema(connection.database.db, pathname);
-      admitSqliteSchema(connection.database.db);
     });
   } catch (error) {
     try {
@@ -458,6 +551,7 @@ function openStateReadConnectionResult(
     },
   };
   try {
+    enableNodeSqliteKyselyStatementCache(db);
     if (expectedIdentity !== undefined) {
       assertExistingDatabaseIdentity(location, expectedIdentity);
     }

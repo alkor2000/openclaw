@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import { resolveSessionAgentIdStrict } from "openclaw/plugin-sdk/agent-scope-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { resolveOptionalIntegerOption } from "openclaw/plugin-sdk/number-runtime";
 import { resolveAgentIdFromSessionKey } from "openclaw/plugin-sdk/session-key-runtime";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
@@ -27,7 +28,6 @@ import {
   resolveBindingKey,
   setBindingRecord,
   setMatrixThreadBindingManagerEntry,
-  toMatrixBindingTargetKind,
   toSessionBindingRecord,
   type MatrixThreadBindingManager,
   type MatrixThreadBindingRecord,
@@ -37,21 +37,6 @@ const THREAD_BINDINGS_NAMESPACE = "thread-bindings";
 const THREAD_BINDINGS_MAX_ENTRIES = 10_000;
 const THREAD_BINDINGS_SWEEP_INTERVAL_MS = 60_000;
 const TOUCH_PERSIST_DELAY_MS = 30_000;
-
-async function resolveBindingsPath(params: {
-  auth: MatrixAuth;
-  accountId: string;
-  env?: NodeJS.ProcessEnv;
-  stateDir?: string;
-}): Promise<string> {
-  return resolveMatrixStateFilePath({
-    auth: params.auth,
-    accountId: params.accountId,
-    env: params.env,
-    stateDir: params.stateDir,
-    filename: "thread-bindings.json",
-  });
-}
 
 function createThreadBindingStore(params: { env?: NodeJS.ProcessEnv; stateDir?: string }) {
   return getMatrixRuntime().state.openKeyedStore<MatrixThreadBindingRecord>({
@@ -93,14 +78,8 @@ function normalizeBindingRecord(
   if (!conversationId || !targetSessionKey) {
     return null;
   }
-  const boundAt =
-    typeof record.boundAt === "number" && Number.isFinite(record.boundAt)
-      ? Math.floor(record.boundAt)
-      : Date.now();
-  const lastActivityAt =
-    typeof record.lastActivityAt === "number" && Number.isFinite(record.lastActivityAt)
-      ? Math.floor(record.lastActivityAt)
-      : boundAt;
+  const boundAt = resolveOptionalIntegerOption(record.boundAt) ?? Date.now();
+  const lastActivityAt = resolveOptionalIntegerOption(record.lastActivityAt) ?? boundAt;
   return {
     accountId,
     conversationId,
@@ -112,14 +91,8 @@ function normalizeBindingRecord(
     boundBy: normalizeOptionalString(record.boundBy) || undefined,
     boundAt,
     lastActivityAt: Math.max(lastActivityAt, boundAt),
-    idleTimeoutMs:
-      typeof record.idleTimeoutMs === "number" && Number.isFinite(record.idleTimeoutMs)
-        ? Math.max(0, Math.floor(record.idleTimeoutMs))
-        : undefined,
-    maxAgeMs:
-      typeof record.maxAgeMs === "number" && Number.isFinite(record.maxAgeMs)
-        ? Math.max(0, Math.floor(record.maxAgeMs))
-        : undefined,
+    idleTimeoutMs: resolveOptionalIntegerOption(record.idleTimeoutMs, { min: 0 }),
+    maxAgeMs: resolveOptionalIntegerOption(record.maxAgeMs, { min: 0 }),
   };
 }
 
@@ -252,7 +225,8 @@ export async function createMatrixThreadBindingManager(params: {
       `Matrix thread binding account mismatch: requested ${params.accountId}, auth resolved ${params.auth.accountId}`,
     );
   }
-  const legacyFilePath = await resolveBindingsPath({
+  const legacyFilePath = await resolveMatrixStateFilePath({
+    filename: "thread-bindings.json",
     auth: params.auth,
     accountId: params.accountId,
     env: params.env,
@@ -319,7 +293,8 @@ export async function createMatrixThreadBindingManager(params: {
   };
   const updateBindingsBySessionKey = (input: {
     targetSessionKey: string;
-    update: (entry: MatrixThreadBindingRecord, now: number) => MatrixThreadBindingRecord;
+    field: "idleTimeoutMs" | "maxAgeMs";
+    value: number;
     persistReason: string;
   }): MatrixThreadBindingRecord[] => {
     const targetSessionKey = input.targetSessionKey.trim();
@@ -329,7 +304,12 @@ export async function createMatrixThreadBindingManager(params: {
     const now = Date.now();
     const nextBindings = listBindingsForAccount(params.accountId)
       .filter((entry) => entry.targetSessionKey === targetSessionKey)
-      .map((entry) => input.update(entry, now));
+      .map((entry) =>
+        Object.assign({}, entry, {
+          [input.field]: Math.max(0, Math.floor(input.value)),
+          lastActivityAt: now,
+        }),
+      );
     if (nextBindings.length === 0) {
       return [];
     }
@@ -378,28 +358,20 @@ export async function createMatrixThreadBindingManager(params: {
       schedulePersist(TOUCH_PERSIST_DELAY_MS);
       return nextRecord;
     },
-    setIdleTimeoutBySessionKey: ({ targetSessionKey, idleTimeoutMs }) => {
-      return updateBindingsBySessionKey({
+    setIdleTimeoutBySessionKey: ({ targetSessionKey, idleTimeoutMs }) =>
+      updateBindingsBySessionKey({
         targetSessionKey,
+        field: "idleTimeoutMs",
+        value: idleTimeoutMs,
         persistReason: "idle-timeout-update",
-        update: (entry, now) => ({
-          ...entry,
-          idleTimeoutMs: Math.max(0, Math.floor(idleTimeoutMs)),
-          lastActivityAt: now,
-        }),
-      });
-    },
-    setMaxAgeBySessionKey: ({ targetSessionKey, maxAgeMs }) => {
-      return updateBindingsBySessionKey({
+      }),
+    setMaxAgeBySessionKey: ({ targetSessionKey, maxAgeMs }) =>
+      updateBindingsBySessionKey({
         targetSessionKey,
+        field: "maxAgeMs",
+        value: maxAgeMs,
         persistReason: "max-age-update",
-        update: (entry, now) => ({
-          ...entry,
-          maxAgeMs: Math.max(0, Math.floor(maxAgeMs)),
-          lastActivityAt: now,
-        }),
-      });
-    },
+      }),
     stop: async () => {
       if (sweepTimer) {
         clearInterval(sweepTimer);
@@ -439,8 +411,8 @@ export async function createMatrixThreadBindingManager(params: {
     reason: string | ((record: MatrixThreadBindingRecord) => string | undefined),
   ) => {
     await Promise.all(
-      removed.map(async (record) => {
-        await sendFarewellMessage({
+      removed.map((record) =>
+        sendFarewellMessage({
           cfg: params.cfg,
           client: params.client,
           accountId: params.accountId,
@@ -448,8 +420,8 @@ export async function createMatrixThreadBindingManager(params: {
           defaultIdleTimeoutMs: defaults.idleTimeoutMs,
           defaultMaxAgeMs: defaults.maxAgeMs,
           reason: typeof reason === "function" ? reason(record) : reason,
-        });
-      }),
+        }),
+      ),
     );
   };
   const unbindRecords = async (records: MatrixThreadBindingRecord[], reason: string) => {
@@ -502,7 +474,7 @@ export async function createMatrixThreadBindingManager(params: {
         accountId: params.accountId,
         conversationId: boundConversationId,
         ...(boundParentConversationId ? { parentConversationId: boundParentConversationId } : {}),
-        targetKind: toMatrixBindingTargetKind(input.targetKind),
+        targetKind: input.targetKind === "subagent" ? "subagent" : "acp",
         targetSessionKey,
         agentId:
           normalizeOptionalString(input.metadata?.agentId) ??
@@ -540,17 +512,14 @@ export async function createMatrixThreadBindingManager(params: {
         .listBySessionKey(targetSessionKey)
         .map((record) => toSessionBindingRecord(record, defaults)),
     resolveByConversation: (ref) => {
-      const record = manager.getByConversation({
-        conversationId: ref.conversationId,
-        parentConversationId: ref.parentConversationId,
-      });
+      const record = manager.getByConversation(ref);
       return record ? toSessionBindingRecord(record, defaults) : null;
     },
     touch: (bindingId, at) => {
       manager.touchBinding(bindingId, at);
     },
     unbind: async (input) => {
-      const removed = await unbindRecords(
+      return unbindRecords(
         listBindingsForAccount(params.accountId).filter((record) => {
           if (input.bindingId?.trim()) {
             return resolveBindingKey(record) === input.bindingId.trim();
@@ -562,7 +531,6 @@ export async function createMatrixThreadBindingManager(params: {
         }),
         input.reason,
       );
-      return removed;
     },
   };
 
@@ -581,12 +549,7 @@ export async function createMatrixThreadBindingManager(params: {
           }),
         }))
         .filter(
-          (
-            entry,
-          ): entry is {
-            record: MatrixThreadBindingRecord;
-            lifecycle: { expiresAt: number; reason: "idle-expired" | "max-age-expired" };
-          } =>
+          (entry) =>
             typeof entry.lifecycle.expiresAt === "number" &&
             entry.lifecycle.expiresAt <= now &&
             Boolean(entry.lifecycle.reason),

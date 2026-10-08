@@ -19,7 +19,7 @@ import {
   openOpenClawAgentDatabase,
   resolveIncognitoOpenClawAgentSqlitePath,
   resolveOpenClawAgentSqlitePath,
-  withOpenClawAgentDatabaseAsync,
+  withOpenClawAgentDatabaseRuntime,
   type OpenClawAgentDatabase,
   type OpenClawAgentDatabaseOptions,
 } from "../../state/openclaw-agent-db.js";
@@ -47,6 +47,7 @@ import {
   type ResolvedTranscriptScope,
 } from "./session-accessor.sqlite-scope-helpers.js";
 import type { SqliteSessionWriteOperation } from "./session-accessor.sqlite-write-operation.js";
+import type { SessionEntryReadSource } from "./session-entry-read-source.types.js";
 import { resolveUnsuffixedSqliteTargetFromSessionStorePath } from "./session-sqlite-target-paths.js";
 import {
   prepareSqliteTargetFromSessionStorePath,
@@ -129,7 +130,7 @@ export function withSqliteSessionDatabase<T>(
       diagnostics.admissionMode = "async";
     }
     // The caller keeps its FIFO section while the existing owner joins the integrity child.
-    const result = withOpenClawAgentDatabaseAsync(options, admittedOperation, assertCurrent);
+    const result = withOpenClawAgentDatabaseRuntime(options, admittedOperation, assertCurrent);
     return finishAdmission ? result.finally(finishAdmission) : result;
   } catch (error) {
     finishAdmission?.();
@@ -163,7 +164,7 @@ export async function runExclusiveSqliteSessionWrite<T>(
   fn: () => Promise<T>,
   operation: SqliteSessionWriteOperation,
   diagnostics?: SqliteSessionWriteDiagnostics,
-  writer: "foreground" | "worker" = "foreground",
+  writer: "foreground" | "foreground-reentrant" | "worker" = "foreground",
   signal?: AbortSignal,
 ): Promise<T> {
   const databaseOptions = toDatabaseOptions(scope);
@@ -188,6 +189,7 @@ export async function runExclusiveSqliteSessionWrite<T>(
           queueWaitMs: Math.round(timing.startedAt - startedAt),
           writerExecutionMs: Math.round(timing.finishedAt - timing.startedAt),
           completionDelayMs: Math.round(completedAt - timing.finishedAt),
+          reentrant: timing.reentrant,
         }
       : {}),
   });
@@ -210,28 +212,37 @@ export async function runExclusiveSqliteSessionWrite<T>(
       () =>
         writer === "worker"
           ? runOpenClawAgentWorkerWrite(databaseOptions, fn, timing, signal)
-          : runOpenClawAgentWriteAdmission(databaseOptions, fn, false, timing, signal),
+          : runOpenClawAgentWriteAdmission(
+              databaseOptions,
+              fn,
+              writer === "foreground-reentrant",
+              timing,
+              signal,
+            ),
     );
   try {
     const result = await owned();
     completedAt = performance.now();
     if (completedAt - startedAt >= SQLITE_SESSION_SLOW_WRITE_MS) {
       getChildLogger({ subsystem: "session-sqlite" }).warn(
-        "slow SQLite session write",
         logFields(completedAt),
+        "slow SQLite session write",
       );
     }
     return result;
   } catch (error) {
     outcome = "error";
     completedAt = performance.now();
-    getChildLogger({ subsystem: "session-sqlite" }).warn("SQLite session write failed", {
-      ...logFields(completedAt),
-      error: truncateUtf16Safe(
-        formatErrorMessageWithCode(error),
-        SQLITE_SESSION_WRITE_ERROR_MAX_CHARS,
-      ),
-    });
+    getChildLogger({ subsystem: "session-sqlite" }).warn(
+      {
+        ...logFields(completedAt),
+        error: truncateUtf16Safe(
+          formatErrorMessageWithCode(error),
+          SQLITE_SESSION_WRITE_ERROR_MAX_CHARS,
+        ),
+      },
+      "SQLite session write failed",
+    );
     throw error;
   } finally {
     if (sessionWriteDiagnostics.hasSubscribers) {
@@ -335,19 +346,16 @@ function resolveCachedSqliteStoreTarget(
   },
   targetCache: SessionSqliteTargetResolutionCache | undefined,
 ): ReturnType<typeof resolveSqliteTargetFromSessionStorePath> {
-  if (!targetCache) {
-    return resolveSqliteTargetFromSessionStorePath(params.storePath, {
-      agentId: params.agentId,
-      defaultAgentId: params.defaultAgentId,
-      ...(params.env ? { env: params.env } : {}),
-    });
-  }
   // Store ownership is stable for this batch. Scope the cache to the caller so later requests
   // still observe owner changes after migration, install, or doctor flows.
-  const envCache = targetCache.get(params.env) ?? new Map();
-  targetCache.set(params.env, envCache);
-  const cacheKey = JSON.stringify([params.storePath, params.agentId, params.defaultAgentId]);
-  const cached = envCache.get(cacheKey);
+  const envCache = targetCache && (targetCache.get(params.env) ?? new Map());
+  if (envCache) {
+    targetCache?.set(params.env, envCache);
+  }
+  const cacheKey = envCache
+    ? JSON.stringify([params.storePath, params.agentId, params.defaultAgentId])
+    : "";
+  const cached = envCache?.get(cacheKey);
   if (cached) {
     return cached;
   }
@@ -356,7 +364,7 @@ function resolveCachedSqliteStoreTarget(
     defaultAgentId: params.defaultAgentId,
     ...(params.env ? { env: params.env } : {}),
   });
-  envCache.set(cacheKey, resolved);
+  envCache?.set(cacheKey, resolved);
   return resolved;
 }
 
@@ -401,10 +409,15 @@ export function resolveSqliteTranscriptScope(
     SessionTranscriptWriteScope,
     "agentId" | "env" | "sessionId" | "sessionKey" | "storePath"
   >,
+  readSource?: SessionEntryReadSource,
 ): ResolvedTranscriptScope {
   assertSqliteTranscriptWriteIdentity(scope);
   return {
-    ...resolveSqliteScope({ ...scope, sessionKey: scope.sessionKey }),
+    ...resolveSqliteScope(
+      { ...scope, sessionKey: scope.sessionKey },
+      undefined,
+      readSource ? { ...readSource, shared: true } : undefined,
+    ),
     sessionId: scope.sessionId,
   };
 }

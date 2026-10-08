@@ -16,7 +16,7 @@ import {
   beginDraftQueuedFollowup,
   cleanupDrafts,
   enqueueDraftEvent,
-  handleBeforeDeliverCancelled,
+  dropQueuedAnswerBlockRotation,
   ingestDraftLaneSegments,
   prepareQueuedAnswerBlock,
   repositionLaneForNewMessage,
@@ -50,7 +50,6 @@ const TELEGRAM_MAX_CONSECUTIVE_TYPING_FAILURES = 5;
 
 export async function runTelegramDispatchTurn(turn: Turn) {
   const { context } = turn;
-  let sessionMetaTask: Promise<unknown> | undefined;
   const isRoomEvent = context.ctxPayload.InboundEventKind === "room_event";
   const toolProgressEnabled =
     turn.streamMode !== "off" &&
@@ -123,15 +122,7 @@ export async function runTelegramDispatchTurn(turn: Turn) {
             sessionKey: context.route.sessionKey,
           },
           ctxPayload: context.ctxPayload,
-          record: {
-            ...context.turn.record,
-            trackSessionMetaTask: (task) => {
-              sessionMetaTask = task;
-            },
-          },
-          afterRecord: async () => {
-            await sessionMetaTask;
-          },
+          record: context.turn.record,
           dispatchReplyFromConfig: turn.opts.dispatchReplyFromConfig,
           delivery: {
             deliverWithProviderMessageSending: async (payload, info) =>
@@ -156,7 +147,11 @@ export async function runTelegramDispatchTurn(turn: Turn) {
             humanDelay: resolveHumanDelayConfig(turn.cfg, context.route.agentId),
             beforeDeliver: async (payload) => payload,
             onBeforeDeliverCancelled: (payload, info) =>
-              handleBeforeDeliverCancelled(turn, payload, info),
+              info.kind === "block"
+                ? enqueueDraftEvent(turn, async () => {
+                    dropQueuedAnswerBlockRotation(turn, payload, info.assistantMessageIndex);
+                  })
+                : undefined,
             onSkip: (payload, info) => handleReplySkip(turn, payload, info),
           },
           replyOptions: {
@@ -277,10 +272,11 @@ export async function runTelegramDispatchTurn(turn: Turn) {
             },
             suppressDefaultToolProgressMessages:
               !turn.streamDeliveryEnabled || Boolean(turn.answerLane.stream),
+            progressRequiresReply: turn.streamMode === "progress" ? true : undefined,
             suppressToolProgressMessages: !toolProgressEnabled,
             allowProgressCallbacksWhenSourceDeliverySuppressed:
               !isRoomEvent && Boolean(turn.answerLane.stream),
-            onVerboseProgressVisibility: (isActive) => {
+            onVerboseProgressVisibilityAsync: (isActive) => {
               turn.verboseProgressActive = isActive;
             },
             commentaryProgressEnabled:
@@ -297,7 +293,7 @@ export async function runTelegramDispatchTurn(turn: Turn) {
             onItemEvent: (payload) => handleItemEvent(turn, payload),
             onPlanUpdate: (payload) => handlePlanUpdate(turn, payload),
             onApprovalEvent: async (payload) =>
-              canPushToolProgress(turn)
+              (await canPushToolProgress(turn))
                 ? await turn.progressCompositor.pushApprovalEvent(payload)
                 : false,
             onToolResult: async (payload) => {
@@ -313,7 +309,7 @@ export async function runTelegramDispatchTurn(turn: Turn) {
               if (updatedDraft) {
                 return true;
               }
-              if (isFastModeAutoProgressPayload(payload) && !canPushToolProgress(turn)) {
+              if (isFastModeAutoProgressPayload(payload) && !(await canPushToolProgress(turn))) {
                 return (await sendPayload(turn, payload)).visibleReplySent;
               }
               return false;

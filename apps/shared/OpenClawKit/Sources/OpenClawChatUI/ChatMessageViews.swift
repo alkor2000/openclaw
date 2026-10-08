@@ -4,22 +4,41 @@ import SwiftUI
 
 struct ChatSystemNoticeRow: View {
     let notice: ChatTranscriptRow.SystemNotice
+    // periphery:ignore - Read and written through $isExpanded; Xcode 27 omits the projected-binding reference.
+    @State private var isExpanded = false
 
     var body: some View {
-        VStack(spacing: 8) {
-            ChatSystemLine(
-                systemImage: self.notice.systemImage,
-                label: self.notice.label,
-                metric: nil)
-            Text(self.notice.body)
-                .font(OpenClawChatTypography.footnote)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: .infinity)
+        if self.notice.collapsesBody {
+            DisclosureGroup(isExpanded: self.$isExpanded) {
+                Text(self.notice.body)
+                    .font(OpenClawChatTypography.footnote)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, 8)
+            } label: {
+                ChatSystemLine(
+                    systemImage: self.notice.systemImage,
+                    label: self.notice.label,
+                    metric: nil)
+            }
+            .foregroundStyle(.secondary)
+            .tint(.secondary)
+            .padding(.vertical, 4)
+        } else {
+            VStack(spacing: 8) {
+                ChatSystemLine(
+                    systemImage: self.notice.systemImage,
+                    label: self.notice.label,
+                    metric: nil)
+                Text(self.notice.body)
+                    .font(OpenClawChatTypography.footnote)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+            }
+            .foregroundStyle(.secondary)
+            .padding(.vertical, 4)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(Text(verbatim: "\(self.notice.label), \(self.notice.body)"))
         }
-        .foregroundStyle(.secondary)
-        .padding(.vertical, 4)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(Text(verbatim: "\(self.notice.label), \(self.notice.body)"))
     }
 }
 
@@ -80,6 +99,8 @@ private struct ChatSystemLine: View {
             }
             .lineLimit(1)
             .minimumScaleFactor(0.75)
+            // The rules take what the label leaves; equal thirds truncated any label longer than a third of the row.
+            .layoutPriority(1)
             Rectangle()
                 .fill(OpenClawChatTheme.divider)
                 .frame(height: 1)
@@ -343,6 +364,7 @@ extension ChatMessageBubble {
         let textColor = self.textColor
         let shouldRenderBubble = self.shouldRenderBubble
         let toolActivityItems = self.toolActivityItems
+        let hasOnboardingShadow = self.style == .onboarding && !self.isUser
 
         VStack(alignment: .leading, spacing: 6) {
             if shouldRenderBubble {
@@ -352,11 +374,13 @@ extension ChatMessageBubble {
                         .padding(.horizontal, 12)
                         .background(AnyShapeStyle(self.bubbleFillColor))
                         .clipShape(self.bubbleShape)
-                        .overlay(self.bubbleBorder)
+                        .overlay(self.bubbleShape.strokeBorder(
+                            self.bubbleBorderColor,
+                            lineWidth: self.bubbleBorderWidth))
                         .shadow(
-                            color: self.bubbleShadowColor,
-                            radius: self.bubbleShadowRadius,
-                            y: self.bubbleShadowYOffset)
+                            color: hasOnboardingShadow ? Color.black.opacity(0.28) : .clear,
+                            radius: hasOnboardingShadow ? 6 : 0,
+                            y: hasOnboardingShadow ? 2 : 0)
                         .padding(.leading, self.tailPaddingLeading)
                         .padding(.trailing, self.tailPaddingTrailing)
                 } else {
@@ -547,8 +571,8 @@ extension ChatMessageBubble {
         }
         guard self.message.role.lowercased() == "assistant" else { return [] }
         return ChatToolActivity.items(
-            calls: self.toolCalls,
-            results: self.inlineToolResults,
+            calls: self.message.content.filter(\.isToolCall),
+            results: self.message.content.filter(\.isToolResult),
             activity: self.message.activity,
             liveTools: self.liveToolCalls)
     }
@@ -594,14 +618,6 @@ extension ChatMessageBubble {
             else { return nil }
             return content.preview
         }
-    }
-
-    private var toolCalls: [OpenClawChatMessageContent] {
-        self.message.content.filter(\.isToolCall)
-    }
-
-    private var inlineToolResults: [OpenClawChatMessageContent] {
-        self.message.content.filter(\.isToolResult)
     }
 
     private var usagePresentation: ChatMessageUsagePresentation? {
@@ -650,17 +666,10 @@ extension ChatMessageBubble {
         return 1
     }
 
-    private var bubbleBorder: some View {
-        self.bubbleShape.strokeBorder(self.bubbleBorderColor, lineWidth: self.bubbleBorderWidth)
-    }
-
     private var bubbleShape: ChatBubbleShape {
-        ChatBubbleShape(cornerRadius: ChatUIConstants.bubbleCorner, tail: self.bubbleTail)
-    }
-
-    private var bubbleTail: ChatBubbleShape.Tail {
-        guard self.style == .onboarding else { return .none }
-        return self.isUser ? .right : .left
+        ChatBubbleShape(
+            cornerRadius: ChatUIConstants.bubbleCorner,
+            tail: self.style == .onboarding ? (self.isUser ? .right : .left) : .none)
     }
 
     private var tailPaddingLeading: CGFloat {
@@ -669,18 +678,6 @@ extension ChatMessageBubble {
 
     private var tailPaddingTrailing: CGFloat {
         self.style == .onboarding && self.isUser ? 8 : 0
-    }
-
-    private var bubbleShadowColor: Color {
-        self.style == .onboarding && !self.isUser ? Color.black.opacity(0.28) : .clear
-    }
-
-    private var bubbleShadowRadius: CGFloat {
-        self.style == .onboarding && !self.isUser ? 6 : 0
-    }
-
-    private var bubbleShadowYOffset: CGFloat {
-        self.style == .onboarding && !self.isUser ? 2 : 0
     }
 }
 
@@ -884,61 +881,36 @@ struct ChatOutboxStatusLabel: View {
     let state: OpenClawChatOutboxMessageState
 
     var body: some View {
+        let presentation = self.presentation
         HStack(spacing: 4) {
-            Image(systemName: self.iconName)
+            Image(systemName: presentation.iconName)
                 .font(.system(size: 10, weight: .semibold))
-            Text(self.title)
+            Text(presentation.title)
                 .font(OpenClawChatTypography.caption)
         }
         .foregroundStyle(self.state.isFailed ? AnyShapeStyle(OpenClawChatTheme.danger) : AnyShapeStyle(.secondary))
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
-            Text(self.accessibilityText)
+            Text(presentation.accessibilityText)
                 .font(OpenClawChatTypography.caption))
     }
 
-    private var title: LocalizedStringResource {
+    private var presentation: (
+        title: LocalizedStringResource,
+        iconName: String,
+        accessibilityText: LocalizedStringResource)
+    {
         switch self.state {
         case .queued:
-            "Queued"
+            ("Queued", "clock", "Queued, sends when reconnected")
         case .sending:
-            "Sending…"
+            ("Sending…", "arrow.up.circle", "Sending")
         case .confirming:
-            "Confirming…"
+            ("Confirming…", "checkmark.circle", "Sent, waiting for chat history confirmation")
         case let .failed(reason) where reason == OpenClawChatSQLiteTranscriptCache.outboxUnconfirmedError:
-            "Delivery unknown"
+            ("Delivery unknown", "questionmark.circle", "Delivery unconfirmed, touch and hold to retry or delete")
         case .failed:
-            "Not sent"
-        }
-    }
-
-    private var iconName: String {
-        switch self.state {
-        case .queued:
-            "clock"
-        case .sending:
-            "arrow.up.circle"
-        case .confirming:
-            "checkmark.circle"
-        case let .failed(reason) where reason == OpenClawChatSQLiteTranscriptCache.outboxUnconfirmedError:
-            "questionmark.circle"
-        case .failed:
-            "exclamationmark.circle"
-        }
-    }
-
-    private var accessibilityText: LocalizedStringResource {
-        switch self.state {
-        case .queued:
-            "Queued, sends when reconnected"
-        case .sending:
-            "Sending"
-        case .confirming:
-            "Sent, waiting for chat history confirmation"
-        case let .failed(reason) where reason == OpenClawChatSQLiteTranscriptCache.outboxUnconfirmedError:
-            "Delivery unconfirmed, touch and hold to retry or delete"
-        case .failed:
-            "Not sent, touch and hold to retry or delete"
+            ("Not sent", "exclamationmark.circle", "Not sent, touch and hold to retry or delete")
         }
     }
 }
@@ -1015,6 +987,16 @@ extension View {
     func assistantBubbleContainerStyle(isClean: Bool, cornerRadius: CGFloat = 16) -> some View {
         modifier(AssistantBubbleContainerStyle(isClean: isClean, cornerRadius: cornerRadius))
             .focusable(false)
+    }
+}
+
+/// Defers action construction until SwiftUI evaluates this body, instead of eagerly assembling actions
+/// in every parent-row update. SwiftUI owns when menu content is evaluated.
+struct ChatDeferredContent<Content: View>: View {
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        self.content()
     }
 }
 
@@ -1217,17 +1199,12 @@ private struct ChatStreamingAssistantTextBody: View {
         let now = Date.timeIntervalSinceReferenceDate
         let nextSnapshot = self.inputSnapshot
         let nextLocation = nextSnapshot.lastProseLocation
-        let nextRevealState: ChatStreamingRevealState
-        if let nextLocation {
-            let nextText = nextSnapshot.prose(at: nextLocation).plainText
-            if nextLocation == self.revealLocation {
-                nextRevealState = step(state: self.revealState, newText: nextText, now: now)
-            } else {
-                nextRevealState = step(state: ChatStreamingRevealState(), newText: nextText, now: now)
-            }
-        } else {
-            nextRevealState = ChatStreamingRevealState()
-        }
+        let nextRevealState = nextLocation.map { location in
+            step(
+                state: location == self.revealLocation ? self.revealState : ChatStreamingRevealState(),
+                newText: nextSnapshot.prose(at: location).plainText,
+                now: now)
+        } ?? ChatStreamingRevealState()
 
         self.snapshot = nextSnapshot
         self.revealLocation = nextLocation

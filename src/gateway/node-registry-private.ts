@@ -164,23 +164,20 @@ async function invokeNodeRegistryCore(
   if (!node) {
     return { ok: false, error: { code: "NOT_CONNECTED", message: "node not connected" } };
   }
-  if (node.client.invalidated === true) {
+  const expectedPairingGeneration = params.expectedPairingGeneration ?? node.pairingGeneration;
+  if (
+    node.client.invalidated === true ||
+    (expectedPairingGeneration && node.pairingGeneration !== expectedPairingGeneration)
+  ) {
     return {
       ok: false,
       error: { code: "PAIRING_CHANGED", message: "node pairing changed before dispatch" },
     };
   }
-  const expectedPairingGeneration = params.expectedPairingGeneration ?? node.pairingGeneration;
   if (state.context.hasCurrentPairingStateResolver && !expectedPairingGeneration) {
     return {
       ok: false,
       error: { code: "PAIRING_CHANGED", message: "node pairing generation unavailable" },
-    };
-  }
-  if (expectedPairingGeneration && node.pairingGeneration !== expectedPairingGeneration) {
-    return {
-      ok: false,
-      error: { code: "PAIRING_CHANGED", message: "node pairing changed before dispatch" },
     };
   }
   if (params.expectedConnId && node.connId !== params.expectedConnId) {
@@ -268,10 +265,7 @@ async function invokeNodeRegistryCore(
       deadlineAtMs,
       expectedPairingGeneration,
     });
-    if (!prepared.ok) {
-      return prepared.result;
-    }
-    const completion = prepared.complete();
+    const completion = prepared.ok ? prepared.complete() : prepared;
     if (!completion.ok) {
       return completion.result;
     }

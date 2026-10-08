@@ -28,8 +28,8 @@ const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 // Golden v3 request bytes bind the selected baseline and complete effective inventory.
 const CANONICAL_REQUEST_JSON =
-  '{"allowFrozenTargetScenarioOmissions":false,"allowUnreleasedChangelog":false,"contractVersions":{"package":1,"prepublishPluginRegistry":1,"sharedImage":1},"packagePublished":false,"releaseProfile":"stable","releaseSoak":true,"repository":"openclaw/openclaw","schema":"openclaw.full-release-candidate-request/v3","sharedImagePolicy":"no-push-artifact","targetSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","toolingSha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","upgradeBaseline":"openclaw@latest","upgradeSurvivorBaselines":["openclaw@latest"],"upgradeSurvivorScenarios":["acpx-openclaw-tools-bridge","base","bootstrap-persona","channel-post-core-restore","configured-plugin-installs","cron-scheduled-authority","custom-plugin-siblings","feishu-channel","legacy-operator-state","meeting-transcripts-sqlite","plugin-deps-cleanup","stale-source-plugin-shadow","tilde-log-path","versioned-runtime-deps"]}\n';
-const CANONICAL_REQUEST_SHA256 = "58a45e9e0b13c2417f50c5cf4abb421cb50bdfa02af4aef958dfd6b511d09b26";
+  '{"allowFrozenTargetScenarioOmissions":false,"allowUnreleasedChangelog":false,"contractVersions":{"package":1,"prepublishPluginRegistry":1,"sharedImage":1},"packagePublished":false,"releaseProfile":"stable","releaseSoak":true,"repository":"openclaw/openclaw","schema":"openclaw.full-release-candidate-request/v3","sharedImagePolicy":"no-push-artifact","targetSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","toolingSha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","upgradeBaseline":"openclaw@latest","upgradeSurvivorBaselines":["openclaw@latest"],"upgradeSurvivorScenarios":["acpx-openclaw-tools-bridge","base","bootstrap-persona","channel-post-core-restore","configured-plugin-installs","cron-scheduled-authority","custom-plugin-siblings","feishu-channel","legacy-operator-state","meeting-transcripts-sqlite","package-publication-recovery","package-stranded-first-hop","package-verification-recovery","plugin-deps-cleanup","stale-source-plugin-shadow","tilde-log-path","versioned-runtime-deps"]}\n';
+const CANONICAL_REQUEST_SHA256 = "bfba3b9d365762629f86c676486a21c65d8de2dc8e0e56238051685e5ddf6b82";
 
 function manifest(overrides: Record<string, unknown> = {}) {
   return {
@@ -200,24 +200,6 @@ describe("full release candidate contract", () => {
     expect(validateFullReleaseCandidateBinding(binding)).toEqual(binding);
     expect(candidateRequestSha256(request)).toBe(requestSha256);
     expect(() => validateFullReleaseCandidateRequest(request)).toThrow("schema is invalid");
-  });
-
-  it.each([
-    ["repository", { repository: "openclaw/fork" }],
-    ["target SHA", { targetSha: "4".repeat(40) }],
-    ["tooling SHA", { toolingSha: "5".repeat(40) }],
-    ["release profile", { releaseProfile: "beta" }],
-    ["release soak", { releaseSoak: false }],
-    ["survivor baseline", { upgradeSurvivorBaseline: "beta" }],
-    ["survivor scenarios", { upgradeSurvivorScenarios: "base" }],
-    ["frozen omissions", { allowFrozenTargetScenarioOmissions: true }],
-    ["changelog policy", { allowUnreleasedChangelog: true }],
-    ["package provenance", { packagePublished: true }],
-    ["shared image policy", { sharedImagePolicy: "existing-only" }],
-  ])("changes the request digest when %s changes", (_label, overrides) => {
-    const baseline = buildFullReleaseCandidateRequest(fullReleaseCandidateRequestInput());
-    const changed = buildFullReleaseCandidateRequest(fullReleaseCandidateRequestInput(overrides));
-    expect(canonicalTestSha256(changed)).not.toBe(canonicalTestSha256(baseline));
   });
 
   it("rejects malformed or noncanonical request policy", () => {

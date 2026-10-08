@@ -7,6 +7,7 @@ import { clearMissingManagedServiceEnvKeys } from "../../daemon/service-managed-
 import * as nativeSqlite from "../../infra/node-sqlite.js";
 import { cleanupSnapshotOperations } from "../../infra/sqlite-readonly-location-cleanup.js";
 import * as snapshotSource from "../../infra/sqlite-snapshot-source.js";
+import { withArtifactPreservingStateReads } from "../../state/artifact-preserving-state-reads.js";
 import { writeConfigMachineState } from "../../state/config-machine-state-write.js";
 import { openOpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
@@ -101,9 +102,14 @@ describe("auth-profile references before managed service environment cleanup", (
     },
   );
 
-  it.each(["readable", "schema-refused"] as const)(
-    "retains the %s agent snapshot through failed native close and releases it after retirement",
-    async (kind) => {
+  it.each([
+    { kind: "readable", inspection: false },
+    { kind: "schema-refused", inspection: false },
+    { kind: "readable", inspection: true },
+    { kind: "schema-refused", inspection: true },
+  ] as const)(
+    "retains the $kind snapshot through failed native close (inspection=$inspection)",
+    async ({ kind, inspection }) => {
       await withOpenClawTestState({ prefix: "auth-env-ref-native-close-" }, async (state) => {
         const agentDir = state.agentDir("helper");
         writePersistedAuthProfileStoreRaw({ version: 1, profiles: {} }, agentDir);
@@ -120,57 +126,89 @@ describe("auth-profile references before managed service environment cleanup", (
         let snapshot:
           | ReturnType<typeof snapshotSource.prepareSqliteReadOnlyLocationSync>
           | undefined;
+        const snapshots: Array<NonNullable<typeof snapshot>> = [];
         const prepare = snapshotSource.prepareSqliteReadOnlyLocationSync;
         const preparation = vi
           .spyOn(snapshotSource, "prepareSqliteReadOnlyLocationSync")
           .mockImplementation((filename) => {
             const prepared = prepare(filename);
-            if (filename === resolveAuthProfileDatabasePath(agentDir)) {
+            if (
+              filename === resolveAuthProfileDatabasePath(agentDir) ||
+              filename === snapshot?.location
+            ) {
               snapshot = prepared;
+              snapshots.push(prepared);
             }
             return prepared;
           });
         const nativeOpen = nativeSqlite.openNodeSqliteDatabase;
         const failure = new Error("synthetic native reader close failure");
         let failedReader: DatabaseSync | undefined;
+        let readerPath: string | undefined;
         let close: MockInstance<DatabaseSync["close"]> | undefined;
+        let closeAllowed = false;
         const open = vi
           .spyOn(nativeSqlite, "openNodeSqliteDatabase")
           .mockImplementation((filename, options) => {
             const database = nativeOpen(filename, options);
-            if (snapshot && filename === snapshot.location) {
+            if (snapshot && options?.readOnly && (filename === snapshot.location || inspection)) {
               failedReader = database;
+              readerPath = filename;
+              const nativeClose = database.close.bind(database);
               close = vi.spyOn(database, "close").mockImplementation(() => {
-                throw failure;
+                if (!closeAllowed) {
+                  throw failure;
+                }
+                nativeClose();
               });
             }
             return database;
           });
         try {
           expect(() =>
-            collectAuthProfileEnvSecretRefIds({ agentDirs: [agentDir], env: state.env }),
+            withArtifactPreservingStateReads(
+              () => collectAuthProfileEnvSecretRefIds({ agentDirs: [agentDir], env: state.env }),
+              inspection ? { agentDatabases: true } : {},
+            ),
           ).toThrow();
           expect(failedReader?.isOpen).toBe(true);
           expect(snapshot).toBeDefined();
-          expect(fs.existsSync(snapshot!.location)).toBe(true);
-          expect(snapshot!.cleanup()).toBe(false);
+          expect(fs.existsSync(readerPath!)).toBe(true);
+          if (!inspection) {
+            expect(snapshot!.cleanup()).toBe(false);
+          }
           await cleanupSnapshotOperations();
-          expect(fs.existsSync(snapshot!.location)).toBe(true);
+          expect(fs.existsSync(readerPath!)).toBe(true);
           expect(artifactHashes(state.root)).toEqual(before);
-          close?.mockRestore();
-          closeAuthProfileReadPool({ kind: "database", databasePath: snapshot!.location });
+          closeAllowed = true;
+          if (inspection) {
+            failedReader!.close();
+          } else {
+            closeAuthProfileReadPool({ kind: "database", databasePath: snapshot!.location });
+          }
           expect(failedReader!.isOpen).toBe(false);
-          expect(snapshot!.cleanup()).toBe(true);
+          for (const prepared of snapshots) {
+            expect(prepared.cleanup()).toBe(true);
+          }
           expect(fs.existsSync(snapshot!.cleanupRoot ?? path.dirname(snapshot!.location))).toBe(
             false,
           );
         } finally {
-          close?.mockRestore();
+          closeAllowed = true;
+          if (failedReader?.isOpen && inspection) {
+            failedReader.close();
+          }
+          if (!inspection && snapshot) {
+            closeAuthProfileReadPool({ kind: "database", databasePath: snapshot.location });
+          }
+          // Inspection installs a lifecycle wrapper over the original native close spy.
+          if (!inspection) {
+            close?.mockRestore();
+          }
           preparation.mockRestore();
           open.mockRestore();
-          if (snapshot) {
-            closeAuthProfileReadPool({ kind: "database", databasePath: snapshot.location });
-            snapshot.cleanup();
+          for (const prepared of snapshots) {
+            prepared.cleanup();
           }
         }
       });

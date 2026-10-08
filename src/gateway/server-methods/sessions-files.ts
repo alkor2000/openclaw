@@ -1,3 +1,4 @@
+import { setImmediate as nextTurn } from "node:timers/promises";
 import { asOptionalObjectRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import {
@@ -142,14 +143,6 @@ function addStructuredPatchFiles(files: Map<string, TouchedFile>, changes: unkno
   }
 }
 
-function isToolCallBlockType(value: unknown): boolean {
-  if (typeof value !== "string") {
-    return false;
-  }
-  const normalized = value.toLowerCase().replace(/[_-]/g, "");
-  return normalized === "toolcall" || normalized === "tooluse";
-}
-
 function collectTouchedFilesFromMessage(message: unknown, files: Map<string, TouchedFile>) {
   const record = asOptionalObjectRecord(message);
   if (record?.role !== "assistant" || !Array.isArray(record.content)) {
@@ -157,7 +150,11 @@ function collectTouchedFilesFromMessage(message: unknown, files: Map<string, Tou
   }
   for (const blockValue of record.content) {
     const block = asOptionalObjectRecord(blockValue);
-    if (!block || !isToolCallBlockType(block.type)) {
+    if (!block || typeof block.type !== "string") {
+      continue;
+    }
+    const type = block.type.toLowerCase().replace(/[_-]/g, "");
+    if (type !== "toolcall" && type !== "tooluse") {
       continue;
     }
     const toolName = normalizeOptionalString(block.name)?.toLowerCase();
@@ -218,9 +215,7 @@ async function foldSqliteTouchedFiles(
     if (delta.requiredBytes !== undefined) {
       maxBytes = delta.requiredBytes;
     }
-    await new Promise<void>((resolve) => {
-      setImmediate(resolve);
-    });
+    await nextTurn();
   }
 }
 
@@ -276,15 +271,12 @@ export function resolveLocalSessionWorkspaceRoot(params: {
     : loaded.root;
 }
 
-async function loadSessionFiles(params: {
-  sessionKey: string;
-  agentId?: string;
-  context: GatewayRequestContext;
-  source?: ReturnType<typeof loadSessionFileRoot>;
-}): Promise<
+async function loadSessionFiles(
+  loaded: ReturnType<typeof loadSessionFileRoot>,
+  context: GatewayRequestContext,
+): Promise<
   LoadedSessionFiles & { repository?: Awaited<ReturnType<typeof resolveRepositoryWorkspaceAccess>> }
 > {
-  const loaded = params.source ?? loadSessionFileRoot(params);
   const { storePath, entry, canonicalKey, agentId } = loaded;
   if (!entry?.sessionId || !storePath || !agentId) {
     return { files: [] };
@@ -309,7 +301,7 @@ async function loadSessionFiles(params: {
       async () => {},
     );
   }
-  const repository = await resolveRepositoryWorkspaceAccess(loaded, params.context);
+  const repository = await resolveRepositoryWorkspaceAccess(loaded, context);
   const scope = {
     agentId,
     sessionEntry: entry,
@@ -403,8 +395,16 @@ async function handleSessionFilesRead(
   const source = loadSessionFileRoot({ ...params, agentId });
   const hostRead = createSessionFileReadAuthority(options, { ...source, agentId });
   try {
-    const loaded = await loadSessionFiles({ ...params, agentId, context, source });
+    const loaded = await loadSessionFiles(source, context);
     read?.assertCurrent();
+    if (
+      request.kind !== "list" &&
+      loaded.repository?.kind === "stored" &&
+      resolveRepositoryArtifactPath(request.params.path) === undefined
+    ) {
+      respondSessionFileNotFound(respond, request.params.path, "outside_session_boundary");
+      return;
+    }
     let result:
       | Awaited<ReturnType<typeof listSessionWorkspaceFiles>>
       | Awaited<ReturnType<typeof getSessionWorkspaceFile>>
@@ -430,13 +430,6 @@ async function handleSessionFilesRead(
       read?.assertCurrent();
     } else if (request.kind === "assets") {
       const repository = loaded.repository;
-      if (
-        repository?.kind === "stored" &&
-        resolveRepositoryArtifactPath(request.params.path) === undefined
-      ) {
-        respondSessionFileNotFound(respond, request.params.path, "outside_session_boundary");
-        return;
-      }
       result = await getSessionWorkspaceAssets({
         ...loaded,
         path: request.params.path,
@@ -457,13 +450,6 @@ async function handleSessionFilesRead(
       });
       read?.assertCurrent();
     } else {
-      if (
-        loaded.repository?.kind === "stored" &&
-        resolveRepositoryArtifactPath(request.params.path) === undefined
-      ) {
-        respondSessionFileNotFound(respond, request.params.path, "outside_session_boundary");
-        return;
-      }
       const query = { files: loaded.files, path: request.params.path };
       const fileResult =
         loaded.repository?.kind === "stored"

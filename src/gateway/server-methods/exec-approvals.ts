@@ -42,36 +42,18 @@ function requireApprovalsBaseHash(
   // Approval allowlists are admin-editable state. Require the caller's last
   // observed hash before writing so stale UI tabs cannot overwrite changes.
   const baseHash = resolveBaseHashParam(params);
-  if (!snapshot.exists) {
-    if (baseHash && baseHash !== snapshot.hash) {
-      respondApprovalsChanged(respond);
-      return false;
-    }
-    return true;
-  }
-  if (!snapshot.hash) {
+  if (snapshot.exists && (!snapshot.hash || !baseHash)) {
     respond(
       false,
       undefined,
       errorShape(
         ErrorCodes.INVALID_REQUEST,
-        "exec approvals base hash unavailable; re-run exec.approvals.get and retry",
+        `exec approvals base hash ${snapshot.hash ? "required" : "unavailable"}; re-run exec.approvals.get and retry`,
       ),
     );
     return false;
   }
-  if (!baseHash) {
-    respond(
-      false,
-      undefined,
-      errorShape(
-        ErrorCodes.INVALID_REQUEST,
-        "exec approvals base hash required; re-run exec.approvals.get and retry",
-      ),
-    );
-    return false;
-  }
-  if (baseHash !== snapshot.hash) {
+  if (baseHash && baseHash !== snapshot.hash) {
     respondApprovalsChanged(respond);
     return false;
   }

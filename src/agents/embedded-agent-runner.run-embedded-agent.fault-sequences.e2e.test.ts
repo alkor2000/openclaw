@@ -75,6 +75,7 @@ let captureRoutingDecisionWork: typeof import("./test-helpers/model-routing-deci
 let createModelRoutingTestAdmission: typeof import("./test-helpers/model-routing-decision-e2e-fixtures.js").createModelRoutingTestAdmission;
 let ensureAuthProfileStore: typeof import("./auth-profiles/store-runtime.js").ensureAuthProfileStore;
 let saveAuthProfileStore: typeof import("./auth-profiles/store-runtime.js").saveAuthProfileStore;
+let createOpenClawDatabaseMaintenanceScope: typeof import("../state/openclaw-state-db-async-lifecycle.js").createOpenClawDatabaseMaintenanceScope;
 
 beforeAll(async () => {
   vi.resetModules();
@@ -98,6 +99,8 @@ beforeAll(async () => {
     await import("./test-helpers/model-routing-decision-e2e-fixtures.js"));
   ({ ensureAuthProfileStore, saveAuthProfileStore } =
     await import("./auth-profiles/store-runtime.js"));
+  ({ createOpenClawDatabaseMaintenanceScope } =
+    await import("../state/openclaw-state-db-async-lifecycle.js"));
 });
 
 beforeEach(() => {
@@ -314,6 +317,7 @@ async function runScenario(params: {
     agentId: sessionTarget.agentId,
     boundary: "provider-fault-sequence",
   });
+  const maintenance = createOpenClawDatabaseMaintenanceScope();
   try {
     // The synthetic attempt skips transcript creation; seed the real row so the
     // runner claims its writer normally before entering compaction recovery.
@@ -321,42 +325,44 @@ async function runScenario(params: {
       sessionId: sessionTarget.sessionId,
       updatedAt: Date.now(),
     });
-    const outcome = await runWithModelFallback<EmbeddedAgentRunResult>({
-      cfg: params.config,
-      provider: "openai",
-      model: "mock-1",
-      runId: params.runId,
-      sessionId: sessionTarget.sessionId,
-      sessionKey: sessionTarget.sessionKey,
-      agentDir: params.agentDir,
-      classifyResult: ({ provider, model, result }) =>
-        classifyEmbeddedAgentRunResultForModelFallback({ provider, model, result }),
-      mergeExhaustedResult: ({ latestResult, preferredResult }) =>
-        mergeEmbeddedAgentRunResultForModelFallbackExhaustion({
-          latestResult,
-          preferredResult,
-        }),
-      run: async (provider, model, options) =>
-        await runEmbeddedAgentWithPreparedAdmission({
-          preparedRunAdmission,
-          agentId: sessionTarget.agentId,
-          sessionId: sessionTarget.sessionId,
-          sessionKey: sessionTarget.sessionKey,
-          sessionTarget,
-          workspaceDir: params.workspaceDir,
-          agentDir: params.agentDir,
-          config: params.config,
-          prompt: "hello",
-          provider,
-          model,
-          authProfileIdSource: "auto",
-          allowTransientCooldownProbe: options?.allowTransientCooldownProbe,
-          isFinalFallbackAttempt: options?.isFinalFallbackAttempt,
-          timeoutMs: 250,
-          runId: params.runId,
-          enqueue: async (task) => await task(),
-        }),
-    });
+    const outcome = await maintenance.run(() =>
+      runWithModelFallback<EmbeddedAgentRunResult>({
+        cfg: params.config,
+        provider: "openai",
+        model: "mock-1",
+        runId: params.runId,
+        sessionId: sessionTarget.sessionId,
+        sessionKey: sessionTarget.sessionKey,
+        agentDir: params.agentDir,
+        classifyResult: ({ provider, model, result }) =>
+          classifyEmbeddedAgentRunResultForModelFallback({ provider, model, result }),
+        mergeExhaustedResult: ({ latestResult, preferredResult }) =>
+          mergeEmbeddedAgentRunResultForModelFallbackExhaustion({
+            latestResult,
+            preferredResult,
+          }),
+        run: async (provider, model, options) =>
+          await runEmbeddedAgentWithPreparedAdmission({
+            preparedRunAdmission,
+            agentId: sessionTarget.agentId,
+            sessionId: sessionTarget.sessionId,
+            sessionKey: sessionTarget.sessionKey,
+            sessionTarget,
+            workspaceDir: params.workspaceDir,
+            agentDir: params.agentDir,
+            config: params.config,
+            prompt: "hello",
+            provider,
+            model,
+            authProfileIdSource: "auto",
+            allowTransientCooldownProbe: options?.allowTransientCooldownProbe,
+            isFinalFallbackAttempt: options?.isFinalFallbackAttempt,
+            timeoutMs: 250,
+            runId: params.runId,
+            enqueue: async (task) => await task(),
+          }),
+      }),
+    );
     return {
       kind: "result",
       provider: outcome.provider,
@@ -370,7 +376,12 @@ async function runScenario(params: {
     }
     return { kind: "error", error };
   } finally {
-    preparedRunAdmission.close();
+    try {
+      // The runner may return before profile bookkeeping settles.
+      await maintenance.close();
+    } finally {
+      preparedRunAdmission.close();
+    }
   }
 }
 
@@ -471,7 +482,9 @@ async function expectPreparationInvalidationToDropRoutingWork(
           await replacementAdmission.admit("embedded");
         }
         releasePreparation.resolve();
-        await expect(run).rejects.toThrow("admitted run authority is no longer active");
+        await expect(run).rejects.toThrow(
+          "embedded attempt reached dispatch without an active admitted run",
+        );
       });
 
       expect(decisionWork).toHaveLength(0);

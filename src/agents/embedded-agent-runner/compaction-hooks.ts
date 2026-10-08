@@ -30,15 +30,10 @@ type PostCompactionSession = {
   assertActive?: () => void | Promise<void>;
 };
 
-async function runPostCompactionSessionMemorySync(params: PostCompactionSession): Promise<void> {
-  if (!params.config) {
-    return;
-  }
+async function runPostCompactionSessionMemorySync(
+  params: PostCompactionSession & { config: OpenClawConfig },
+): Promise<void> {
   try {
-    const sessionFile = params.sessionFile.trim();
-    if (!sessionFile) {
-      return;
-    }
     const agentId = resolveSessionAgentId({
       sessionKey: params.sessionKey,
       config: params.config,
@@ -124,7 +119,7 @@ async function runPostCompactionSessionMemorySync(params: PostCompactionSession)
               },
             ],
           }
-        : { archiveFiles: [sessionFile] }),
+        : { archiveFiles: [params.sessionFile] }),
     });
   } catch (err) {
     await params.assertActive?.();
@@ -148,7 +143,7 @@ export async function runPostCompactionSideEffects(params: PostCompactionSession
   const mode = params.config?.agents?.defaults?.compaction?.postIndexSync ?? "async";
   const syncTask =
     mode !== "off" && params.config
-      ? runPostCompactionSessionMemorySync({ ...params, sessionFile })
+      ? runPostCompactionSessionMemorySync({ ...params, config: params.config, sessionFile })
       : undefined;
   if (mode !== "await") {
     // Async indexing cannot leak an abort rejection after foreground settlement.
@@ -252,6 +247,13 @@ type CompactionHookParams = {
 /** Internal hooks settle and forward messages before plugin hooks see the same phase. */
 export async function runCompactionHooks(params: CompactionHookParams): Promise<void> {
   params.assertActive?.();
+  const logHookFailure = (hookName: string, error: unknown) => {
+    params.assertActive?.();
+    log.warn(`${hookName} hook failed`, {
+      errorMessage: formatErrorMessage(error),
+      errorStack: error instanceof Error ? error.stack : undefined,
+    });
+  };
   try {
     const hookEvent = createInternalHookEvent(
       "session",
@@ -289,11 +291,7 @@ export async function runCompactionHooks(params: CompactionHookParams): Promise<
       });
     }
   } catch (err) {
-    params.assertActive?.();
-    log.warn(`session:compact:${params.phase} hook failed`, {
-      errorMessage: formatErrorMessage(err),
-      errorStack: err instanceof Error ? err.stack : undefined,
-    });
+    logHookFailure(`session:compact:${params.phase}`, err);
   }
   params.assertActive?.();
   if (params.hookRunner?.hasHooks?.(`${params.phase}_compaction`)) {
@@ -326,11 +324,7 @@ export async function runCompactionHooks(params: CompactionHookParams): Promise<
         );
       }
     } catch (err) {
-      params.assertActive?.();
-      log.warn(`${params.phase}_compaction hook failed`, {
-        errorMessage: formatErrorMessage(err),
-        errorStack: err instanceof Error ? err.stack : undefined,
-      });
+      logHookFailure(`${params.phase}_compaction`, err);
     }
   }
   params.assertActive?.();

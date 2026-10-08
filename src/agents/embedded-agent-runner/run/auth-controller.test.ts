@@ -43,6 +43,7 @@ vi.mock("../../model-auth.js", async () => {
 });
 
 import {
+  createEmbeddedAuthProfileAdmission,
   createEmbeddedRunAuthController,
   resolveEmbeddedAuthCooldownProbePolicy,
   type EmbeddedRunAuthState,
@@ -691,6 +692,28 @@ describe("createEmbeddedRunAuthController", () => {
     );
     expect([...rateLimited.probeProfileIds]).toEqual(["first", "second"]);
     expect(rateLimited.unavailableReason).toBe("rate_limit");
+
+    const warn = vi.fn();
+    const admission = createEmbeddedAuthProfileAdmission({
+      authStore: createStore({
+        first: { disabledUntil: now + 60_000, disabledReason: "rate_limit" },
+        second: { disabledUntil: now + 60_000, disabledReason: "rate_limit" },
+      }),
+      profileCandidates: ["first", "second"],
+      modelId: "test-model",
+      provider: "custom-openai",
+      allowTransientCooldownProbe: true,
+      log: { warn },
+    });
+    const scan = admission.preview();
+    expect(scan("first")).toBe(true);
+    expect(scan("second")).toBe(false);
+    expect(admission.preview()("second")).toBe(true);
+    expect(warn).not.toHaveBeenCalled();
+    expect(admission.admit("first")).toBe(true);
+    expect(admission.preview()("second")).toBe(false);
+    expect(admission.admit("second")).toBe(false);
+    expect(warn).toHaveBeenCalledOnce();
 
     const mixedPinnedState = resolveEmbeddedAuthCooldownProbePolicy({
       authStore: createStore({

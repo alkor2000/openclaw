@@ -2,7 +2,7 @@ import { expect, it, vi } from "vitest";
 import { awaitGateBeforeSettlement, createDeferred } from "../../../test/helpers/promise.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import { readConfiguredModelAuthProfileProvider } from "../../config/sessions/auth-profile-override-provenance.js";
-import { runReplyAgent } from "./agent-runner.runtime.js";
+import { runReplyAgent } from "./agent-runner-run.js";
 import { shouldUseReplyFastTestRuntime } from "./get-reply-fast-path.js";
 import { runPreparedReply } from "./get-reply-run.js";
 import { baseParams } from "./get-reply-run.test-support.js";

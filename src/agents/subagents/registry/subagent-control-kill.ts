@@ -24,7 +24,6 @@ import {
   type SubagentKillSession,
 } from "./subagent-control-session.js";
 import type { SubagentAdminKillParams, SubagentAdminKillResult } from "./subagent-control.types.js";
-import { SUBAGENT_KILL_TASK_ERROR } from "./subagent-control.types.js";
 import { resolveSubagentKillTargetState } from "./subagent-registry-completion.js";
 import {
   captureSubagentExecution,
@@ -140,7 +139,6 @@ async function killSubagentRun(
 }
 
 async function killLatestSubagentRun(params: {
-  cfg: OpenClawConfig;
   tree: KillTree;
   scope: KillScope;
   suppressTaskDelivery?: boolean;
@@ -240,7 +238,6 @@ function collectKillErrors(trees: KillTree[], unlabeledRoot?: KillTree) {
 }
 
 type KillTraversal = {
-  cfg: OpenClawConfig;
   scope: KillScope;
   suppressTaskDelivery?: boolean;
 };
@@ -352,7 +349,6 @@ async function killSubagentRoot(params: Parameters<typeof killLatestSubagentRun>
     if (!stopped.result.superseded && !stopped.result.declined && params.tree.canTraverse()) {
       // Exact admin constraints belong only to its selected root, not each descendant.
       cascade = await killSubagentRunTree({
-        cfg: params.cfg,
         suppressTaskDelivery: params.suppressTaskDelivery,
         suppressCompletedWakes: !stopped.result.error && !stopped.result.completedCleanupError,
         scope: params.scope,
@@ -429,7 +425,6 @@ async function killSelectedSubagentRuns(
     const acceptedTrees = accepted ? trees : [];
     // The bulk signal was consumed above; never forward caller hooks into child kills.
     const stopped = await killSubagentRunTree({
-      cfg: params.cfg,
       suppressTaskDelivery: params.suppressTaskDelivery,
       trees: acceptedTrees,
       scope,
@@ -476,11 +471,7 @@ export async function killSubagentRunAdmin(
   const expectedTaskRunId = params.expectedTaskRunId?.trim();
   if (
     (expectedRunId && entry.runId !== expectedRunId) ||
-    (expectedTaskRunId && (entry.taskRunId ?? entry.runId) !== expectedTaskRunId)
-  ) {
-    return publish({ found: false as const, killed: false as const });
-  }
-  if (
+    (expectedTaskRunId && (entry.taskRunId ?? entry.runId) !== expectedTaskRunId) ||
     (params.expectedGeneration !== undefined && entry.generation !== params.expectedGeneration) ||
     (params.expectedOwnerKey?.trim() &&
       entry.requesterSessionKey !== params.expectedOwnerKey.trim())
@@ -501,7 +492,6 @@ export async function killSubagentRunAdmin(
         return { found: false as const, killed: false as const };
       }
       const stopped = await killSubagentRoot({
-        cfg: params.cfg,
         tree,
         scope,
         beforeSessionKill: control?.beforeSessionKill,
@@ -514,24 +504,18 @@ export async function killSubagentRunAdmin(
       // Return the freshest registry state so task cancellation cannot make a stale kill sticky.
       const targetState = resolveSubagentKillTargetState(tree.entry) ?? stopResult.targetState;
       const killedTarget =
-        targetState?.state === "terminal" &&
-        targetState.task.status === "cancelled" &&
-        targetState.task.error === SUBAGENT_KILL_TASK_ERROR;
+        targetState?.state === "terminal" && targetState.task.status === "cancelled";
       const stopResultAlreadyClearedAbort =
         stopResult.targetState !== undefined &&
         !(
           stopResult.targetState.state === "terminal" &&
-          stopResult.targetState.task.status === "cancelled" &&
-          stopResult.targetState.task.error === SUBAGENT_KILL_TASK_ERROR
+          stopResult.targetState.task.status === "cancelled"
         );
       const resolved = stopped.session;
       if (targetState && !killedTarget && !stopResultAlreadyClearedAbort && resolved) {
         await persistSubagentAbortedLastRun({
           childSessionKey: targetSessionKey,
-          storePath: resolved.storePath,
-          hasSessionEntry: resolved.entry !== undefined,
-          expectedSessionId: resolved.entry?.sessionId,
-          expectedLifecycleRevision: resolved.entry?.lifecycleRevision,
+          session: resolved,
           abortedLastRun: false,
           isCurrent: () => tree.isCurrent(stopped.entry),
         });

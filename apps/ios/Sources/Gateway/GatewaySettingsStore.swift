@@ -51,37 +51,6 @@ enum GatewaySettingsStore {
     private static let lastGatewayConnectionAccount = "lastConnection"
     private static let gatewayCustomHeadersService = "ai.openclawfoundation.app.gateway.custom-headers"
 
-    struct GatewayRegistryEntry: Codable, Equatable, Identifiable, Sendable {
-        enum Kind: String, Codable, Sendable {
-            case manual
-            case discovered
-        }
-
-        var stableID: String
-        var kind: Kind
-        var name: String
-        var host: String?
-        var port: Int?
-        var useTLS: Bool
-        var contextPath: String?
-        var lastConnectedAtMs: Int?
-
-        var id: GatewayStableIdentifier.Key {
-            GatewayStableIdentifier.Key(self.stableID)
-        }
-
-        static func == (lhs: Self, rhs: Self) -> Bool {
-            GatewayStableIdentifier.matches(lhs.stableID, rhs.stableID) &&
-                lhs.kind == rhs.kind &&
-                lhs.name == rhs.name &&
-                lhs.host == rhs.host &&
-                lhs.port == rhs.port &&
-                lhs.useTLS == rhs.useTLS &&
-                lhs.contextPath == rhs.contextPath &&
-                lhs.lastConnectedAtMs == rhs.lastConnectedAtMs
-        }
-    }
-
     struct GatewayCredentialMetadata: Codable, Equatable {
         let gatewayStableID: String
         let suppressStoredDeviceAuth: Bool
@@ -280,8 +249,7 @@ enum GatewaySettingsStore {
             ? GenericPasswordKeychainStore.loadString(service: service, account: legacyAccount)
             : nil
         guard let json = canonicalJSON ?? legacyJSON,
-              let data = json.data(using: .utf8),
-              let headers = try? JSONDecoder().decode([String: String].self, from: data)
+              let headers = try? JSONDecoder().decode([String: String].self, from: Data(json.utf8))
         else { return [:] }
         if canonicalJSON == nil,
            GenericPasswordKeychainStore.saveString(json, service: service, account: account)
@@ -422,8 +390,7 @@ enum GatewaySettingsStore {
         guard let json = GenericPasswordKeychainStore.loadString(
             service: self.gatewayService,
             account: self.gatewayRegistryAccount),
-            let data = json.data(using: .utf8),
-            let registry = try? JSONDecoder().decode(GatewayRegistry.self, from: data),
+            let registry = try? JSONDecoder().decode(GatewayRegistry.self, from: Data(json.utf8)),
             (1...2).contains(registry.version)
         else { return .empty }
         return self.normalizedGatewayRegistry(registry)
@@ -437,6 +404,9 @@ enum GatewaySettingsStore {
             GatewayStableIdentifier.matches($0.stableID, normalized.stableID)
         }) {
             var replacement = normalized
+            // Connection/Bonjour updates do not own ingress identity. Retain the
+            // last admitted origin until its owner retires or replaces the grant.
+            replacement.accessOrigin = replacement.accessOrigin ?? registry.entries[index].accessOrigin
             if replacement.lastConnectedAtMs == nil {
                 replacement.lastConnectedAtMs = registry.entries[index].lastConnectedAtMs
             }
@@ -452,6 +422,16 @@ enum GatewaySettingsStore {
                 registry.connectedStableIDs.append(normalized.stableID)
             }
         }
+        return self.saveGatewayRegistry(registry)
+    }
+
+    @discardableResult
+    static func saveGatewayAccessOrigin(stableID: String, origin: CloudflareAccessOrigin?) -> Bool {
+        var registry = self.loadGatewayRegistry()
+        guard let index = registry.entries.firstIndex(where: {
+            GatewayStableIdentifier.matches($0.stableID, stableID)
+        }) else { return false }
+        registry.entries[index].accessOrigin = origin
         return self.saveGatewayRegistry(registry)
     }
 
@@ -505,8 +485,7 @@ enum GatewaySettingsStore {
             service: self.gatewayService,
             account: self.gatewayRegistryAccount)
         else { return true }
-        guard let data = json.data(using: .utf8),
-              let registry = try? JSONDecoder().decode(GatewayRegistry.self, from: data)
+        guard let registry = try? JSONDecoder().decode(GatewayRegistry.self, from: Data(json.utf8))
         else { return false }
         return (1...2).contains(registry.version)
     }
@@ -571,8 +550,7 @@ enum GatewaySettingsStore {
             service: self.gatewayService,
             account: self.gatewayRegistryAccount)
         {
-            guard let data = json.data(using: .utf8),
-                  let registry = try? JSONDecoder().decode(GatewayRegistry.self, from: data),
+            guard let registry = try? JSONDecoder().decode(GatewayRegistry.self, from: Data(json.utf8)),
                   (1...2).contains(registry.version)
             else { return }
             _ = self.saveGatewayRegistry(registry)
@@ -597,10 +575,9 @@ enum GatewaySettingsStore {
     private static func loadLegacyLastGatewayConnection() -> LegacyLastGatewayConnectionData? {
         guard let json = GenericPasswordKeychainStore.loadString(
             service: self.gatewayService,
-            account: self.lastGatewayConnectionAccount),
-            let data = json.data(using: .utf8)
+            account: self.lastGatewayConnectionAccount)
         else { return nil }
-        return try? JSONDecoder().decode(LegacyLastGatewayConnectionData.self, from: data)
+        return try? JSONDecoder().decode(LegacyLastGatewayConnectionData.self, from: Data(json.utf8))
     }
 
     private static func gatewayRegistryEntry(
@@ -742,8 +719,7 @@ enum GatewaySettingsStore {
         guard let json = canonicalJSON ?? GenericPasswordKeychainStore.loadString(
             service: self.gatewayService,
             account: legacyAccount),
-            let data = json.data(using: .utf8),
-            let decoded = try? JSONDecoder().decode(GatewayCredentialBundle.self, from: data)
+            let decoded = try? JSONDecoder().decode(GatewayCredentialBundle.self, from: Data(json.utf8))
         else { return nil }
         guard let decodedStableID = GatewayStableIdentifier.exact(decoded.gatewayStableID),
               GatewayStableIdentifier.matches(decodedStableID, stableID)
@@ -769,8 +745,7 @@ enum GatewaySettingsStore {
         guard !instanceID.isEmpty else { return }
         let legacyAccount = self.legacyGatewayCredentialBundleAccount(instanceId: instanceID)
         guard let json = GenericPasswordKeychainStore.loadString(service: self.gatewayService, account: legacyAccount),
-              let data = json.data(using: .utf8),
-              let legacy = try? JSONDecoder().decode(GatewayCredentialBundle.self, from: data)
+              let legacy = try? JSONDecoder().decode(GatewayCredentialBundle.self, from: Data(json.utf8))
         else { return }
         guard let stableID = GatewayStableIdentifier.exact(legacy.gatewayStableID) else { return }
         let scopedAccount = self.gatewayCredentialBundleAccount(instanceId: instanceID, stableID: stableID)
@@ -794,8 +769,7 @@ enum GatewaySettingsStore {
             instanceId: instanceId,
             stableID: stableID)
         guard let json = GenericPasswordKeychainStore.loadString(service: self.gatewayService, account: account),
-              let data = json.data(using: .utf8),
-              let bundle = try? JSONDecoder().decode(GatewayCredentialBundle.self, from: data),
+              let bundle = try? JSONDecoder().decode(GatewayCredentialBundle.self, from: Data(json.utf8)),
               GatewayStableIdentifier.matches(bundle.gatewayStableID, stableID)
         else { return }
         _ = GenericPasswordKeychainStore.delete(service: self.gatewayService, account: account)
@@ -895,6 +869,61 @@ extension GatewaySettingsStore {
 }
 
 extension GatewaySettingsStore {
+    struct GatewayRegistryEntry: Codable, Equatable, Identifiable, Sendable {
+        enum Kind: String, Codable, Sendable {
+            case manual
+            case discovered
+        }
+
+        var stableID: String
+        var kind: Kind
+        var name: String
+        var host: String?
+        var port: Int?
+        var useTLS: Bool
+        var contextPath: String?
+        var accessOrigin: CloudflareAccessOrigin?
+        var lastConnectedAtMs: Int?
+
+        init(
+            stableID: String,
+            kind: Kind,
+            name: String,
+            host: String?,
+            port: Int?,
+            useTLS: Bool,
+            contextPath: String? = nil,
+            accessOrigin: CloudflareAccessOrigin? = nil,
+            lastConnectedAtMs: Int?)
+        {
+            self.stableID = stableID
+            self.kind = kind
+            self.name = name
+            self.host = host
+            self.port = port
+            self.useTLS = useTLS
+            self.contextPath = contextPath
+            self.accessOrigin = accessOrigin
+            self.lastConnectedAtMs = lastConnectedAtMs
+        }
+
+        var id: GatewayStableIdentifier.Key {
+            GatewayStableIdentifier.Key(self.stableID)
+        }
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            GatewayStableIdentifier.matches(lhs.stableID, rhs.stableID) &&
+                lhs.kind == rhs.kind &&
+                lhs.name == rhs.name &&
+                lhs.host == rhs.host &&
+                lhs.port == rhs.port &&
+                lhs.useTLS == rhs.useTLS &&
+                lhs.contextPath == rhs.contextPath &&
+                lhs.accessOrigin == rhs.accessOrigin &&
+                lhs.lastConnectedAtMs == rhs.lastConnectedAtMs
+        }
+    }
+
     @discardableResult
     static func completeGatewayCredentialHandoff(
         instanceId: String,
@@ -921,9 +950,6 @@ extension GatewaySettingsStore {
             bootstrapToken: nil,
             password: bundle.password)
         let trimmedInstanceID = instanceId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !stableID.isEmpty, !trimmedInstanceID.isEmpty else {
-            throw GatewayCredentialPersistenceError.invalidOwner
-        }
         let account = self.gatewayCredentialBundleAccount(
             instanceId: trimmedInstanceID,
             stableID: stableID)
@@ -1131,10 +1157,8 @@ enum GatewayDiagnostics {
             self.truncateLogIfNeeded(url: url)
             let timestamp = self.isoTimestamp(date)
             let line = "[\(timestamp)] gateway diagnostics started\n"
-            if let data = line.data(using: .utf8) {
-                self.appendToLog(url: url, data: data)
-                self.applyFileProtection(url: url)
-            }
+            self.appendToLog(url: url, data: Data(line.utf8))
+            self.applyFileProtection(url: url)
         }
     }
 
@@ -1157,9 +1181,7 @@ enum GatewayDiagnostics {
                 self.truncateLogIfNeeded(url: url)
             }
             let entry = line + "\n"
-            if let data = entry.data(using: .utf8) {
-                self.appendToLog(url: url, data: data)
-            }
+            self.appendToLog(url: url, data: Data(entry.utf8))
         }
     }
 }

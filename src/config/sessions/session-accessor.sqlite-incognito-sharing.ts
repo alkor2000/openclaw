@@ -169,7 +169,9 @@ export function readCommittedIncognitoSessionAuthProfile(
   return current?.authProfile;
 }
 
-function projectIncognitoSessionAuthProfile(entry: SessionEntry): IncognitoSessionAuthProfileFacts {
+export function projectIncognitoSessionAuthProfile(
+  entry: SessionEntry,
+): IncognitoSessionAuthProfileFacts {
   return {
     sessionId: entry.sessionId,
     lifecycleRevision: entry.lifecycleRevision,

@@ -25,7 +25,11 @@ import { buildNodeInvokeRequest, serializeNodeEvent } from "./node-invoke-reques
 import type { NodeInvokeParams, NodeInvokeResult } from "./node-invoke.types.js";
 import type { NodePairingLeaseResolution } from "./node-registry-pairing.js";
 import { NODE_INVOKE_PAIRING_CHANGED_ABORT } from "./node-registry-private-token.js";
-import type { NodeInvokeStreamController, PendingInvoke } from "./node-registry.invoke-stream.js";
+import type {
+  NodeInvokeStreamController,
+  PendingInvoke,
+  PendingSystemRunEvent,
+} from "./node-registry.invoke-stream.js";
 import {
   normalizeSystemRunInvokeParams,
   resolvePendingSystemRunEvent,
@@ -97,13 +101,12 @@ type NodeRegistryPrivateContext = {
   pendingInvokes: Map<string, PendingInvoke>;
   invokeStreams: NodeInvokeStreamController;
   sendEventToSession: (node: NodeRunnerRegistrySession, event: string, payload: unknown) => boolean;
-  rememberAuthorizedSystemRunEvent: (event: {
-    nodeId: string;
-    connId: string;
-    runId: string;
-    sessionKey?: string;
-    timeoutMs?: number | null;
-  }) => void;
+  rememberAuthorizedSystemRunEvent: (
+    event: PendingSystemRunEvent & {
+      nodeId: string;
+      connId: string;
+    },
+  ) => void;
   publishActiveNodeContext: () => void;
 };
 
@@ -138,6 +141,8 @@ async function invokeNodeRegistryCore(
   allowPrivateCommand: boolean,
   isCompletionAuthorized?: () => boolean,
 ): Promise<NodeInvokeResult> {
+  // Snapshot source facts before pairing/readiness can yield to caller mutation.
+  const turnSource = params.turnSource ? { ...params.turnSource } : undefined;
   let timeoutMs = resolveTimerTimeoutMs(params.timeoutMs, 30_000, 0);
   // Explicit budgets include pairing and serialization; omitted budgets retain
   // the post-dispatch default, and zero keeps long-lived invokes unbounded.
@@ -252,6 +257,7 @@ async function invokeNodeRegistryCore(
   const systemRunEvent = resolvePendingSystemRunEvent({
     command: params.command,
     params: invokeParams,
+    turnSource,
   });
   if (params.prepareDispatch) {
     const prepared = await prepareNodeInvokeDispatch({

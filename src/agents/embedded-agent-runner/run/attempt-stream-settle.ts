@@ -424,28 +424,23 @@ export async function prepareEmbeddedAttemptTransport(input: {
   const auth = selectedAuth?.selectedAuthMode
     ? { mode: selectedAuth.selectedAuthMode, authFlow: selectedAuth.selectedAuthFlow }
     : undefined;
-  const preparedRuntimeExtraParams = attempt.runtimePlan?.transport.resolveExtraParams({
+  const extraParamsContext = {
     extraParamsOverride: streamExtraParamsOverride,
     thinkingLevel: input.providerThinkingLevel,
     agentId: input.sessionAgentId,
     workspaceDir: input.workspaceDir,
     model: attempt.model,
     resolvedTransport,
-  });
+  };
   const effectiveExtraParams =
-    preparedRuntimeExtraParams ??
+    attempt.runtimePlan?.transport.resolveExtraParams(extraParamsContext) ??
     resolvePreparedExtraParams({
+      ...extraParamsContext,
       cfg: attempt.config,
       provider: attempt.provider,
       modelId: attempt.modelId,
       providerRuntimeHandle: input.getProviderRuntimeHandle(),
-      extraParamsOverride: streamExtraParamsOverride,
-      thinkingLevel: input.providerThinkingLevel,
-      agentId: input.sessionAgentId,
       agentDir: input.agentDir,
-      workspaceDir: input.workspaceDir,
-      model: attempt.model,
-      resolvedTransport,
       auth,
     });
   const providerStreamFn = registerProviderStreamForModel({
@@ -642,22 +637,14 @@ export async function prepareEmbeddedAttemptTransport(input: {
     });
     session.agent.streamFn = createOpenAIServiceTierObservationWrapper(
       session.agent.streamFn,
-      (model, serviceTiers) =>
+      (model, observation) =>
         !input.abortSignal.aborted &&
         record({
           modelId: model.id,
           runtimeId: "openclaw",
           api: model.api,
           baseUrl: model.baseUrl,
-          serviceTiers,
-        }),
-      (model) =>
-        runtime.accountCatalog?.readServiceTiers({
-          identityKey: selectedCredential.identityKey,
-          modelId: model.id,
-          runtimeId: "openclaw",
-          api: model.api,
-          baseUrl: model.baseUrl,
+          ...observation,
         }),
     );
   }

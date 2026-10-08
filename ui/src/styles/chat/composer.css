@@ -1909,7 +1909,6 @@ html[dir="rtl"] .chat-attachment-loading > span {
   flex: 0 0 auto;
 }
 
-/* The model trigger fills its shrinkable wrapper; effort keeps its content width. */
 .chat-controls__model-settings .chat-controls__effort-trigger {
   width: auto;
 }
@@ -2126,10 +2125,7 @@ html[dir="rtl"] .chat-attachment-loading > span {
   color: currentColor;
 }
 
-.agent-chat__input .chat-controls__permission-trigger--default {
-  color: var(--chat-composer-secondary);
-}
-
+.agent-chat__input .chat-controls__permission-trigger--default,
 .agent-chat__input .chat-controls__permission-trigger,
 .agent-chat__input .chat-controls__model-settings .chat-controls__inline-select-trigger {
   color: var(--chat-composer-secondary);
@@ -3172,7 +3168,7 @@ html[dir="rtl"] .chat-attachment-loading > span {
   .agent-chat__input .chat-controls__model-trigger {
     gap: 3px;
     justify-content: center;
-    padding-inline: 0;
+    padding-inline: 2px;
   }
 
   .agent-chat__input .chat-controls__model-settings .chat-controls__inline-select-chevron {
@@ -3215,6 +3211,11 @@ html[dir="rtl"] .chat-attachment-loading > span {
     border-radius: var(--radius-full);
     background: transparent;
     content: "";
+  }
+
+  /* The text picker has a slimmer wash without shrinking its 44px touch target. */
+  .agent-chat__input--mobile-toolbar .chat-controls__model-trigger::before {
+    inset-block: 6px;
   }
 
   .agent-chat__input--mobile-toolbar
@@ -3375,7 +3376,6 @@ html[dir="rtl"] .chat-attachment-loading > span {
   }
 }
 
-/* Welcome state (new session) */
 .agent-chat__welcome {
   display: flex;
   flex-direction: column;
@@ -3432,7 +3432,6 @@ html[dir="rtl"] .chat-attachment-loading > span {
   line-height: 1;
 }
 
-/* The 120x120 Clawd canvas stays centered in the existing hero slot. */
 .agent-chat__welcome-clawd {
   width: 128px;
   height: 112px;
@@ -3482,7 +3481,6 @@ html[dir="rtl"] .chat-attachment-loading > span {
   }
 }
 
-/* Recent user chats replace the canned suggestions once any exist. */
 .agent-chat__welcome-secondary {
   display: grid;
   grid-template-rows: minmax(0, 1fr);

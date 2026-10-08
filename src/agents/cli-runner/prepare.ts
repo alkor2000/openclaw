@@ -107,10 +107,6 @@ import { loadManifestModelCatalog, overlayConfiguredModelCatalog } from "../mode
 import { resolveModelContextWindowProfile } from "../model-context-window.js";
 import { recordAdmittedModelRoutingDecision } from "../model-routing-decision.js";
 import { applyPluginTextReplacements } from "../plugin-text-transforms.js";
-import {
-  prepareRootedExecutionCapability,
-  type PreparedRootedExecutionCapability,
-} from "../rooted-run-params.js";
 import { collectRuntimeChannelCapabilities } from "../runtime-capabilities.js";
 import { buildSystemPromptReport } from "../system-prompt-report.js";
 import { appendModelIdentitySystemPrompt, buildModelIdentityPromptLine } from "../system-prompt.js";
@@ -243,7 +239,7 @@ async function prepareCliRunContextWithinReadFence(
   const skipsTurnPreparation = isSideQuestion || isControlOperation;
   const runtimeChatType = params.chatType ?? params.sessionEntry?.chatType;
   const workspaceResolution = resolveRunWorkspaceDir({
-    workspaceDir: params.rootedExecution?.root ?? params.workspaceDir,
+    workspaceDir: params.workspaceDir,
     sessionKey: params.sessionKey,
     agentId: sessionOwner,
     config: workspaceConfig,
@@ -282,11 +278,7 @@ async function prepareCliRunContextWithinReadFence(
     config: runConfig,
     fallbackAgentId: params.runtimePolicySessionKey ? params.agentId : workspaceResolution.agentId,
   }).sessionAgentId;
-  const cwd = params.rootedExecution
-    ? resolveUserPath(params.rootedExecution.root)
-    : params.cwd
-      ? resolveUserPath(params.cwd)
-      : workspaceDir;
+  const cwd = params.cwd ? resolveUserPath(params.cwd) : workspaceDir;
   const cwdHash = hashCliSessionText(cwd);
 
   // params.agentId may identify a distinct runtime-policy requester. Backend
@@ -319,9 +311,6 @@ async function prepareCliRunContextWithinReadFence(
         workspaceDir,
         cwd,
       });
-  const rootedToolsAllow = params.rootedExecution
-    ? params.cliToolAvailability?.openClaw
-    : undefined;
   const toolPolicy = resolveCliRuntimeToolPolicy({
     params,
     policySessionKey,
@@ -340,63 +329,6 @@ async function prepareCliRunContextWithinReadFence(
     execHost: params.sessionEntry?.execHost,
     execNode: params.sessionEntry?.execNode,
   });
-  let rootedExecution: PreparedRootedExecutionCapability | undefined;
-  if (params.rootedExecution) {
-    const rootedRequest = params.rootedExecution;
-    if (backendResolved.isolatesInstructionsWithExactTools !== true) {
-      throw new Error(
-        `CLI backend "${backendResolved.id}" does not declare instruction isolation with exact tools; collection review skipped`,
-      );
-    }
-    if (
-      !canEnforceExactToolAvailability ||
-      !backendResolved.bundleMcp ||
-      nodeClaudePlacement ||
-      skipsTurnPreparation ||
-      params.disableTools
-    ) {
-      throw new Error(
-        "CLI runtime cannot enforce rooted execution with mediated tools; collection review skipped",
-      );
-    }
-    params = {
-      ...params,
-      workspaceDir,
-      cwd,
-      disableCliLiveSession: true,
-      cliToolAvailability: { native: [], openClaw: params.cliToolAvailability?.openClaw ?? [] },
-    };
-    const admittedParams = await admitCliRunParams(params, workspaceResolution.agentId);
-    const assertRootedCurrent = resolveAdmittedRunActiveAssertion(
-      admittedParams.admittedRunContext,
-      params.abortSignal,
-    );
-    if (!assertRootedCurrent) {
-      throw new Error("Rooted CLI execution requires active admitted run authority");
-    }
-    params = {
-      ...admittedParams,
-      assertCurrent: () => {
-        admittedParams.assertCurrent?.();
-        admittedParams.abortSignal?.throwIfAborted();
-        assertRootedCurrent();
-      },
-    };
-    params.abortSignal?.throwIfAborted();
-    assertRootedCurrent();
-    rootedExecution = await prepareRootedExecutionCapability({
-      rootedExecution: rootedRequest,
-      config: params.config,
-      agentId: workspaceResolution.agentId,
-      sessionId: params.sessionId,
-      sessionKey: params.sessionKey,
-      sandboxSessionKey: policySessionKey,
-      sandboxAgentId: policyAgentId,
-      execOverrides: params.execOverrides,
-      permissionMode: params.sessionEntry?.permissionMode,
-      skillsSnapshot: params.skillsSnapshot,
-    });
-  }
   params.assertCurrent?.();
   params.abortSignal?.throwIfAborted();
   await prepareRuntimeAuthProfileExecution(params, () => {
@@ -863,7 +795,6 @@ async function prepareCliRunContextWithinReadFence(
     backend: backendResolved,
     enabled: bundleMcpEnabled,
     nodePlacement: nodeClaudePlacement,
-    rooted: Boolean(rootedExecution),
     skipPreparation: skipsTurnPreparation,
   });
   const shouldMaterializeRuntimePolicy =
@@ -899,11 +830,9 @@ async function prepareCliRunContextWithinReadFence(
         agentId: workspaceResolution.agentId,
         context: mcpContextBase,
         runtimeToolsAllowPolicy,
-        rootedToolsAllow,
         defaultMediatedToolNames: hostOwnedTools,
         scope: {
           cfg: runConfig,
-          rootedExecution,
           ...(skillLibraryAuthoring ? { skillLibraryAuthoring } : {}),
           ...(mcpToolAuth ? { authProfileStore: mcpToolAuth.store } : {}),
           ...(mcpToolAuth?.agentDir ? { authProfileStoreAgentDir: mcpToolAuth.agentDir } : {}),
@@ -931,8 +860,7 @@ async function prepareCliRunContextWithinReadFence(
     (promptBuildRestrictsTools &&
       params.cliToolAvailability === undefined &&
       backendResolved.nativeToolMode === "selectable") ||
-    shouldMaterializeRuntimePolicy ||
-    rootedExecution
+    shouldMaterializeRuntimePolicy
   ) {
     params = {
       ...params,
@@ -1043,7 +971,6 @@ async function prepareCliRunContextWithinReadFence(
             bindQuestionAnswerAuthority: (assertActive) =>
               bindQuestionAnswerAuthorityForSession(mcpGrant.context.sessionKey, assertActive),
             ...(skillLibraryAuthoring ? { skillLibraryAuthoring } : {}),
-            rootedExecution,
             ...(mcpToolAuth ? { toolAuth: mcpToolAuth } : {}),
           })
         : undefined;
@@ -1161,17 +1088,16 @@ async function prepareCliRunContextWithinReadFence(
       rawLoopbackServerConfig && backendResolved.bundleMcpMode === "claude-config-file"
         ? applyClaudeManagedMcpTimeout(rawLoopbackServerConfig)
         : rawLoopbackServerConfig;
-    const { capabilityProfile: nativeMcpCapabilityProfile, sandboxStatus } =
-      mcp.resolveCliNativeMcpPolicy(params, {
-        config: runConfig,
-        policySessionKey,
-        policyAgentId,
-        modelProvider,
-        modelId,
-        workspaceDir,
-        cwd,
-        runtimeToolsAllowPolicy,
-      });
+    const nativeMcpCapabilityProfile = mcp.resolveCliNativeMcpPolicy(params, {
+      config: runConfig,
+      policySessionKey,
+      policyAgentId,
+      modelProvider,
+      modelId,
+      workspaceDir,
+      cwd,
+      runtimeToolsAllowPolicy,
+    });
     const preparedBackend = await prepareCliBundleMcpConfig({
       enabled: bundleMcpEnabled || systemAgentMcpConfig !== undefined,
       mode: backendResolved.bundleMcpMode,
@@ -1332,7 +1258,7 @@ async function prepareCliRunContextWithinReadFence(
           }
         : undefined;
     const claudeSkillsPlugin =
-      rootedExecution || skipsTurnPreparation || nodeClaudePlacement
+      skipsTurnPreparation || nodeClaudePlacement
         ? { args: [], cleanup: async () => {} }
         : await prepareClaudeCliSkillsPlugin({
             backendId: backendResolved.id,
@@ -1453,9 +1379,7 @@ async function prepareCliRunContextWithinReadFence(
       preparedBackendFinal.backend.input === "stdin" &&
       getCliLiveSessionGeneration({
         backendId: backendResolved.id,
-        agentAccountId: params.agentAccountId,
         agentId: workspaceResolution.agentId,
-        authProfileId: effectiveAuthProfileId,
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
       });
@@ -1505,9 +1429,8 @@ async function prepareCliRunContextWithinReadFence(
           skillPreparationParams.abortSignal?.throwIfAborted();
           skillPreparationParams.preparedRunAdmission?.assertSourceCurrent();
         };
-    const preparedSkills = rootedExecution
-      ? { prompt: params.skillsSnapshot?.prompt ?? "" }
-      : skipsTurnPreparation || nodeClaudePlacement || claudeSkillsPlugin.args.length > 0
+    const preparedSkills =
+      skipsTurnPreparation || nodeClaudePlacement || claudeSkillsPlugin.args.length > 0
         ? { prompt: "" }
         : await resolveCliSkillsPrompt({
             assertCurrent: assertSkillsCurrent,
@@ -1728,9 +1651,7 @@ async function prepareCliRunContextWithinReadFence(
         warningMode: bootstrapPromptWarningMode,
         warning: bootstrapPromptWarning,
       }),
-      sandbox: rootedExecution
-        ? { mode: sandboxStatus.mode, sandboxed: Boolean(rootedExecution.sandbox) }
-        : { mode: "off", sandboxed: false },
+      sandbox: { mode: "off", sandboxed: false },
       systemPrompt,
       injectedWorkspaceFiles: bootstrapInjectionStats,
       skillsPrompt: systemPromptSkillsPrompt,

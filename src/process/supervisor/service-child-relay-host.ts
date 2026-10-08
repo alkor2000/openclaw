@@ -240,6 +240,8 @@ export async function createServiceChildRelayAdapter(
     useWindowsJobAnchor,
     startup: startup.promise,
     cleanup: cleanup.completion.promise,
+    generation,
+    nextSequence: () => ++outboundSequence,
   });
 
   const retirement = createServiceChildRelayRetirement({
@@ -273,11 +275,7 @@ export async function createServiceChildRelayAdapter(
     if (state !== "starting" && state !== "active") {
       return;
     }
-    void sendControlMessage({
-      type: "lineage-closed",
-      generation,
-      sequence: ++outboundSequence,
-    }).catch((error: unknown) => {
+    void sendControlMessage({ type: "lineage-closed" }).catch((error: unknown) => {
       if (state === "starting" || state === "active") {
         loseIdentity(toErrorObject(error, "lineage notification failed").message);
       }
@@ -399,10 +397,7 @@ export async function createServiceChildRelayAdapter(
           throw new Error("service child construction aborted");
         }
         params.beforeSpawn?.();
-        await sendControlMessage(
-          { type: "launch", generation, sequence: ++outboundSequence },
-          initiateSpawn,
-        );
+        await sendControlMessage({ type: "launch" }, initiateSpawn);
       })().catch((error: unknown) => loseIdentity(String(error)));
     } else if (message.type === "ready" && state === "starting") {
       // Ready is not construction-complete: secret delivery can still be
@@ -454,11 +449,8 @@ export async function createServiceChildRelayAdapter(
       if (control) {
         // Retire cancellation before acknowledging this exact POSIX receipt.
         // The ACK releases the sender, not the independent native extinction join.
-        outboundSequence += 1;
         void sendControlMessage({
           type: "closing-ack",
-          generation,
-          sequence: outboundSequence,
           closingSequence: message.sequence,
         }).catch((error: unknown) => {
           controlError ??= toErrorObject(error, "closing acknowledgement failed");
@@ -470,12 +462,7 @@ export async function createServiceChildRelayAdapter(
       } else {
         loseIdentity(message.error);
       }
-      outboundSequence += 1;
-      startupErrorAckDelivery = sendControlMessage({
-        type: "startup-error-ack",
-        generation,
-        sequence: outboundSequence,
-      });
+      startupErrorAckDelivery = sendControlMessage({ type: "startup-error-ack" });
       void startupErrorAckDelivery.catch((error: unknown) =>
         loseIdentity(toErrorObject(error, "startup error acknowledgement failed").message),
       );
@@ -650,12 +637,9 @@ export async function createServiceChildRelayAdapter(
       return;
     }
     requestedSignal = normalized;
-    outboundSequence += 1;
     // The host never converts the diagnostic command PID into group authority.
     void sendControlMessage({
       type: "cancel",
-      generation,
-      sequence: outboundSequence,
       signal: normalized,
     }).catch((error: unknown) => {
       // Delivery can fail after the anchor has already sent its closing receipt.
@@ -672,11 +656,7 @@ export async function createServiceChildRelayAdapter(
         if (startGateClosed || state !== "active" || requestedSignal) {
           return Promise.reject(new Error("worker lifecycle closed before startup"));
         }
-        return (startGate ??= sendControlMessage({
-          type: "worker-start",
-          generation,
-          sequence: ++outboundSequence,
-        }));
+        return (startGate ??= sendControlMessage({ type: "worker-start" }));
       }
     : undefined;
 
@@ -724,11 +704,7 @@ export async function createServiceChildRelayAdapter(
     closeStartGate: params.ownedWorker
       ? () => {
           startGateClosed = true;
-          void sendControlMessage({
-            type: "worker-close",
-            generation,
-            sequence: ++outboundSequence,
-          }).catch((error: unknown) => {
+          void sendControlMessage({ type: "worker-close" }).catch((error: unknown) => {
             if (state === "active") {
               loseIdentity("worker startup channel could not be closed", { cause: error });
             }

@@ -74,14 +74,15 @@ vi.mock("../config/io.js", async (importOriginal) => ({
 
 vi.mock("../plugins/plugin-lifecycle-lease.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../plugins/plugin-lifecycle-lease.js")>();
-  const withPluginLifecycleLease: typeof actual.withPluginLifecycleLease = async (options, run) => {
-    pluginLifecycleLeaseState.depth += 1;
-    try {
-      return await actual.withPluginLifecycleLease(options, run);
-    } finally {
-      pluginLifecycleLeaseState.depth -= 1;
-    }
-  };
+  const withPluginLifecycleLease: typeof actual.withPluginLifecycleLease = (options, run) =>
+    actual.withPluginLifecycleLease(options, async (lease) => {
+      pluginLifecycleLeaseState.depth += 1;
+      try {
+        return await run(lease);
+      } finally {
+        pluginLifecycleLeaseState.depth -= 1;
+      }
+    });
   return { ...actual, withPluginLifecycleLease };
 });
 

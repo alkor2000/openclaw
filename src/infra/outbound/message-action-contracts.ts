@@ -56,6 +56,7 @@ export type MessageActionInput = Pick<
   | "deliveryIntentId"
   | "deliveryCompletion"
   | "onDeliveryAttempt"
+  | "withDirectAdapterHandoff"
   | "onDeliveryResult"
   | "onPlatformSendDispatch"
   | "assertDirectAdapterHandoff"
@@ -124,6 +125,17 @@ export type MessageActionInput = Pick<
   inboundEventKind?: InboundEventKind;
   inboundAudio?: boolean;
 };
+
+export function messageActionRequesterMediaContext(input: MessageActionInput) {
+  return {
+    workspaceMediaAccess: input.workspaceMediaAccess,
+    sessionKey: input.sessionKey,
+    requesterSenderId: input.requesterSenderId,
+    requesterSenderName: input.requesterSenderName,
+    requesterSenderUsername: input.requesterSenderUsername,
+    requesterSenderE164: input.requesterSenderE164,
+  };
+}
 
 export type MessageActionNormalization = {
   locationOmitted: true;

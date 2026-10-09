@@ -2229,7 +2229,7 @@ openclaw-settings-save-indicator:empty {
 
 .sidebar-recent-session:not(.sidebar-recent-session--child, .sidebar-recent-session--single-line)
   > .sidebar-recent-session__aside {
-  inset: calc(1px + max(24px, var(--sidebar-title-line-height)) / 2) 2px auto auto;
+  top: calc(1px + max(24px, var(--sidebar-title-line-height)) / 2);
 }
 
 .sidebar-recent-session--child > .sidebar-recent-session__aside {
@@ -2241,12 +2241,29 @@ openclaw-settings-save-indicator:empty {
   pointer-events: none;
 }
 
-/* Rows with a child toggle keep it as the rightmost in-flow control; the
-   overlaid actions land just left of it, at the link's right edge — the
-   same link-relative geometry as toggle-less rows, so one mask fits both. */
-.sidebar-recent-session:not(.sidebar-recent-session--child):has(> .sidebar-child-session-toggle)
+/* Keep the disclosure slot separate from actions when child membership changes. */
+.shell:not(.shell--mobile-nav)
+  .sidebar-recent-session:not(.sidebar-recent-session--child)
+  > .sidebar-recent-session__aside,
+.shell--mobile-nav
+  .sidebar-recent-session:not(.sidebar-recent-session--child):has(> .sidebar-child-session-toggle)
   > .sidebar-recent-session__aside {
   right: calc(var(--sidebar-child-session-toggle-width) + 4px);
+}
+
+.shell:not(.shell--mobile-nav)
+  .sidebar-recent-session:not(.sidebar-recent-session--child, .sidebar-recent-session--team)
+  > .sidebar-recent-session__link {
+  margin-right: var(--sidebar-child-session-toggle-width);
+}
+
+.shell:not(.shell--mobile-nav)
+  .sidebar-recent-session:not(.sidebar-recent-session--child, .sidebar-recent-session--team)
+  > .sidebar-child-session-toggle {
+  position: absolute;
+  top: 50%;
+  right: 2px;
+  transform: translateY(-50%);
 }
 
 .sidebar-recent-session:not(
@@ -3173,7 +3190,7 @@ a:is(
 
   .sidebar-recent-session:not(.sidebar-recent-session--child, .sidebar-recent-session--single-line)
     > .sidebar-recent-session__aside {
-    inset: 50% 2px auto auto;
+    top: 50%;
   }
 
   .sidebar-recent-session:not(.sidebar-recent-session--child) .sidebar-recent-session__text {

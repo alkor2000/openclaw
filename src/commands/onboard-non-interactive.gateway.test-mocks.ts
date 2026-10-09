@@ -1,7 +1,6 @@
 // Shared mocks and harness for the non-interactive gateway onboarding suites.
 // vi.mock calls live here so sibling suites share one config-write/daemon/health surface.
 import fs from "node:fs/promises";
-import path from "node:path";
 import { afterAll, afterEach, beforeAll, vi } from "vitest";
 import type { ConfigFileSnapshot, OpenClawConfig } from "../config/types.openclaw.js";
 import { makeTempWorkspace } from "../test-helpers/workspace.js";
@@ -73,29 +72,18 @@ vi.mock("../config/io.js", async (importOriginal) => ({
   readConfigFileSnapshot: gatewayOnboardConfigSnapshotMock,
 }));
 
-vi.mock("../plugins/plugin-lifecycle-lease.js", () => ({
-  withPluginLifecycleLease: async (
-    _options: unknown,
-    run: (lease: {
-      databasePath: string;
-      signal: AbortSignal;
-      assertOwned: () => void;
-      assertOwnedInTransaction: () => void;
-    }) => Promise<unknown>,
-  ) => {
+vi.mock("../plugins/plugin-lifecycle-lease.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../plugins/plugin-lifecycle-lease.js")>();
+  const withPluginLifecycleLease: typeof actual.withPluginLifecycleLease = async (options, run) => {
     pluginLifecycleLeaseState.depth += 1;
     try {
-      return await run({
-        databasePath: path.join(path.dirname(resolveTestConfigPath()), "openclaw.sqlite"),
-        signal: new AbortController().signal,
-        assertOwned: () => {},
-        assertOwnedInTransaction: () => {},
-      });
+      return await actual.withPluginLifecycleLease(options, run);
     } finally {
       pluginLifecycleLeaseState.depth -= 1;
     }
-  },
-}));
+  };
+  return { ...actual, withPluginLifecycleLease };
+});
 
 export const capturedReplaceConfigFileCalls: Array<{
   nextConfig: OpenClawConfig;

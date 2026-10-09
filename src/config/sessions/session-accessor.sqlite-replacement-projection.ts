@@ -13,7 +13,6 @@ import { withNativeSessionCommitContext } from "./session-accessor.sqlite-commit
 import type {
   SessionEntryReplacementSnapshot,
   SessionEntryReplacementUpdate,
-  SessionEntryStatus,
 } from "./session-accessor.sqlite-contract.js";
 import {
   hasPreparedNativeSessionDeletion,
@@ -71,8 +70,8 @@ type ReplacementProjectionOptions = {
   consumePendingReset?: boolean;
   requireWriteSuccess?: boolean;
   sessionKeys?: readonly string[];
+  includeSessionWindowOwner?: string;
   includeLabelOwners?: string;
-  statuses?: readonly SessionEntryStatus[];
   skipMaintenance?: boolean;
   storePath: string;
 };
@@ -143,7 +142,7 @@ async function applySqliteSessionEntryReplacementProjection<T, TReplacement>(
                   projection: "replacement",
                   replacementSelection: {
                     sessionKeys: params.sessionKeys,
-                    statuses: params.statuses,
+                    includeSessionWindowOwner: params.includeSessionWindowOwner,
                     includeLabelOwners: params.includeLabelOwners,
                   },
                   env: { ...resolved.env },
@@ -167,18 +166,17 @@ async function applySqliteSessionEntryReplacementProjection<T, TReplacement>(
             },
             // Label owners can expand a keyed selection beyond the foreground read budget.
             params.sessionKeys &&
-              params.sessionKeys.length <= MAX_SESSION_ROW_FACTS_KEYS &&
+              params.sessionKeys.length + (params.includeSessionWindowOwner ? 1 : 0) <=
+                MAX_SESSION_ROW_FACTS_KEYS &&
               params.includeLabelOwners === undefined
               ? projectionLane
               : maintenanceLane,
           )
         : await readNative();
       const { entries, expectedRows, labelOwnerKeys } = snapshot;
-      const selectedKeys = params.sessionKeys ? new Set(params.sessionKeys) : undefined;
-      const selectedStatuses = params.statuses ? new Set(params.statuses) : undefined;
-      const replacementAuthorityKeys = selectedStatuses
-        ? new Set(entries.map(({ sessionKey }) => sessionKey))
-        : selectedKeys;
+      const selectedKeys = snapshot.selectedSessionKeys
+        ? new Set(snapshot.selectedSessionKeys)
+        : undefined;
       const operation = await params.update(entries);
       const replacements = normalize(operation.replacements);
       const claimedCanonicalKeys = new Set<string>();
@@ -197,10 +195,9 @@ async function applySqliteSessionEntryReplacementProjection<T, TReplacement>(
           );
         }
         for (const sessionKey of [replacement.sessionKey, ...(previousSessionKeys ?? [])]) {
-          if (replacementAuthorityKeys && !replacementAuthorityKeys.has(sessionKey)) {
-            const selectionName = selectedStatuses ? "row" : "key";
+          if (selectedKeys && !selectedKeys.has(sessionKey)) {
             throw new Error(
-              `Session entry replacement is outside the selected ${selectionName} set: ${sessionKey}`,
+              `Session entry replacement is outside the selected key set: ${sessionKey}`,
             );
           }
           if (canonical) {
@@ -425,7 +422,7 @@ export async function applySessionEntryExactReplacements<T>(params: {
   agentId?: string;
   requireWriteSuccess?: boolean;
   sessionKeys?: readonly string[];
-  statuses?: readonly SessionEntryStatus[];
+  includeSessionWindowOwner?: string;
   skipMaintenance?: boolean;
   storePath: string;
   update: (

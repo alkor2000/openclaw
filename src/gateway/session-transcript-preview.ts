@@ -1,4 +1,3 @@
-import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { SessionManager } from "../agents/sessions/session-manager.js";
 import type { SessionTranscriptReadScope } from "../config/sessions/session-accessor.js";
 import { readRecentSessionTranscriptHistoryEvents } from "../config/sessions/session-accessor.sqlite-history-events.js";
@@ -10,7 +9,10 @@ import {
 import { prepareSessionTranscriptReadTargetCore } from "../config/sessions/session-accessor.transcript-read-target.js";
 import { resolveSessionTranscriptReadTarget } from "../config/sessions/session-accessor.transcript-target.js";
 import { authorizeSessionFacts } from "../config/sessions/session-incognito-admission.js";
-import { withIncognitoSessionActor } from "../config/sessions/session-incognito-binding.js";
+import {
+  captureIncognitoSessionHistoryBinding,
+  withIncognitoSessionActor,
+} from "../config/sessions/session-incognito-binding.js";
 import {
   prepareIncognitoSessionHistoryRead,
   type IncognitoSessionHistoryBinding,
@@ -25,7 +27,7 @@ import {
 } from "../state/openclaw-agent-db.paths.js";
 import { buildSessionPreviewItems } from "./session-display-projection.js";
 import {
-  readBoundedSessionPreviewItems,
+  readSessionDisplayPreviewItems,
   readBoundedSessionPreviewItemsAsync,
 } from "./session-transcript-preview-reader.js";
 import { toTranscriptReadScope } from "./session-transcript-read-target.js";
@@ -37,8 +39,9 @@ export async function readSessionPreviewItemsFromTranscriptAsync(
   maxItems: number,
   maxChars: number,
   view: "display" | "model-context" = "display",
-  incognito?: IncognitoSessionHistoryBinding,
+  suppliedIncognito?: IncognitoSessionHistoryBinding,
 ): Promise<SessionPreviewItem[]> {
+  const incognito = suppliedIncognito ?? captureIncognitoSessionHistoryBinding(scope);
   if (incognito) {
     const { actor, authority, target } = prepareIncognitoSessionHistoryRead(incognito, scope);
     const claim = actor.sessions.captureCurrent(target.sessionKey);
@@ -65,8 +68,8 @@ export async function readSessionPreviewItemsFromTranscriptAsync(
       sessionId: target.sessionId,
       ...(scope.env ? { env: scope.env } : {}),
     });
-    return actor.sessions.withSharedState(async () => {
-      const items =
+    const items = await actor.sessions.withSharedState(async () => {
+      const preparedItems =
         view === "display"
           ? (
               await actor.sessions.history(authority, {
@@ -80,8 +83,12 @@ export async function readSessionPreviewItemsFromTranscriptAsync(
             );
       authority.assertCurrent();
       claim.authorize(authority, "commit");
-      return items;
+      return preparedItems;
     });
+    authority.assertCurrent();
+    claim.authorize(authority, "commit");
+    actor.assertReadable();
+    return items;
   }
   const target = prepareSessionTranscriptReadTargetCore(scope);
   if (view === "model-context") {
@@ -111,7 +118,10 @@ export async function readSessionPreviewItemsFromTranscriptAsync(
   const options = toDatabaseOptions(resolved);
   const databasePath = resolveOpenClawAgentSqlitePath(options);
   if (isIncognitoOpenClawAgentSqlitePath(databasePath, options)) {
-    return readSessionDisplayPreviewItems(readScope, maxItems, maxChars);
+    const transcript = resolveSessionTranscriptReadTarget(readScope);
+    return readSessionDisplayPreviewItems(maxItems, maxChars, (limits) =>
+      readRecentSessionTranscriptHistoryEvents(toTranscriptReadScope(transcript), limits),
+    );
   }
   // Qualify the key with the bound logical agent without discovering the physical store again.
   const entryValidationKey = target.entryValidationScope
@@ -168,29 +178,6 @@ function readSessionModelPreviewItems(
         "model-context",
       ),
       hasOlderEvents: truncated,
-    };
-  });
-}
-
-function readSessionDisplayPreviewItems(
-  scope: SessionTranscriptReadScope,
-  maxItems: number,
-  maxChars: number,
-): SessionPreviewItem[] {
-  const target = resolveSessionTranscriptReadTarget(scope);
-  return readBoundedSessionPreviewItems(maxItems, (maxEvents, maxBytes) => {
-    const page = readRecentSessionTranscriptHistoryEvents(toTranscriptReadScope(target), {
-      maxBytes,
-      maxLines: maxEvents,
-      maxMessages: maxEvents,
-    });
-    return {
-      items: buildSessionPreviewItems(
-        page.events.map((entry) => asOptionalRecord(entry.event)?.message),
-        maxItems,
-        maxChars,
-      ),
-      hasOlderEvents: page.totalMessages > page.events.length,
     };
   });
 }

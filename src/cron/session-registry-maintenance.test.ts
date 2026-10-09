@@ -9,15 +9,16 @@ import { resetConfigRuntimeState } from "../config/config.js";
 import { loadSessionEntry, replaceSessionEntry } from "../config/sessions/session-accessor.js";
 import { resolveSqliteTargetFromSessionStorePath } from "../config/sessions/session-sqlite-target.js";
 import { reconstructAgentDeletionJournal } from "../state/agent-deletion-journal-recovery.js";
+import { completeAgentDeletionJournalInDatabase } from "../state/agent-deletion-journal.js";
 import {
-  beginAgentDeletionJournal,
-  completeAgentDeletionJournalInDatabase,
-} from "../state/agent-deletion-journal.js";
-import { closeOpenClawAgentDatabasesForTest } from "../state/openclaw-agent-db.js";
+  closeOpenClawAgentDatabasesAsync,
+  closeOpenClawAgentDatabasesForTest,
+} from "../state/openclaw-agent-db.js";
 import {
   openOpenClawStateDatabase,
   runOpenClawStateWriteTransaction,
 } from "../state/openclaw-state-db.js";
+import { beginAgentDeletionJournal } from "../test-utils/agent-deletion-journal.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import type { OpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { runSessionRegistryMaintenance } from "./session-registry-maintenance.js";
@@ -194,7 +195,7 @@ describe("runSessionRegistryMaintenance", () => {
         const mainKey = await writeStaleCronSession(mainStorePath, "main");
         const retainedKey = await writeStaleCronSession(retainedStorePath, "retained");
         const databasePath = resolveSqliteTargetFromSessionStorePath(retainedStorePath).path;
-        closeOpenClawAgentDatabasesForTest();
+        await closeOpenClawAgentDatabasesAsync(state.stateDir);
         runOpenClawStateWriteTransaction((database) => {
           database.db.exec("DROP TABLE agent_deletion_journal");
           if (history === "reconstructed") {

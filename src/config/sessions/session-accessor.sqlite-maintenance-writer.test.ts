@@ -4,6 +4,7 @@ import { trackSqliteStatementExecutions } from "../../../test/helpers/sqlite-sta
 import { recordInboundSession } from "../../channels/session.js";
 import { racePromiseWithAbortSignal } from "../../infra/abort-signal.js";
 import * as workerAdmission from "../../infra/sqlite-worker-operation-admission.js";
+import { sqliteWorkerOwnerProbe as probe } from "../../infra/sqlite-worker-owner-probe.test-support.js";
 import {
   beginSessionWorkAdmission,
   isSessionLifecycleMutationActive,
@@ -191,7 +192,6 @@ it("caps only the oldest eligible activity ties without decoding unrelated paylo
     ["started", { sessionStartedAt: now }],
     ["pinned", { pinnedAt: old }],
     ["locked", { modelSelectionLocked: true }],
-    ["running", { status: "running" }],
     ["group", { chatType: "group" }],
     ["recent", { lastActivityAt: now }],
     ["live", {}],
@@ -489,18 +489,13 @@ it("rolls back planner statistics when maintenance ownership is revoked before c
       .get("idx_agent_session_nodes_updated_at");
   let current = true;
   let reachedCommit = false;
-  const createAdmission = workerAdmission.createSqliteWorkerOperationAdmission;
-  const authorization = vi
-    .spyOn(workerAdmission, "createSqliteWorkerOperationAdmission")
-    .mockImplementation((callback, attachment) =>
-      createAdmission((request, grant) => {
-        if (request.stage === "commit") {
-          reachedCommit = true;
-          current = false;
-        }
-        return callback(request, grant);
-      }, attachment),
-    );
+  const authorization = probe.admission(workerAdmission, (request, grant, callback) => {
+    if (request.stage === "commit") {
+      reachedCommit = true;
+      current = false;
+    }
+    return callback(request, grant);
+  });
 
   await maintenance.refreshSqliteSessionPlannerStatisticsBestEffort(scope, 65, {
     isCurrent: () => current,

@@ -2252,18 +2252,10 @@ openclaw-settings-save-indicator:empty {
 }
 
 .shell:not(.shell--mobile-nav)
-  .sidebar-recent-session:not(.sidebar-recent-session--child, .sidebar-recent-session--team)
-  > .sidebar-recent-session__link {
-  margin-right: var(--sidebar-child-session-toggle-width);
-}
-
-.shell:not(.shell--mobile-nav)
-  .sidebar-recent-session:not(.sidebar-recent-session--child, .sidebar-recent-session--team)
-  > .sidebar-child-session-toggle {
-  position: absolute;
-  top: 50%;
-  right: 2px;
-  transform: translateY(-50%);
+  .sidebar-recent-session:not(.sidebar-recent-session--child, .sidebar-recent-session--team):not(
+    :has(> .sidebar-child-session-toggle)
+  ) {
+  --sidebar-session-action-extra-space: var(--sidebar-child-session-toggle-width);
 }
 
 .sidebar-recent-session:not(
@@ -2271,12 +2263,16 @@ openclaw-settings-save-indicator:empty {
     .sidebar-recent-session--single-line
   ):is(:hover, :focus-within)
   .sidebar-recent-session__title-row {
-  padding-right: var(--session-row-actions-reserve);
+  padding-right: calc(
+    var(--session-row-actions-reserve) + var(--sidebar-session-action-extra-space, 0px)
+  );
 }
 
 .sidebar-recent-session--single-line:not(.sidebar-recent-session--child):is(:hover, :focus-within)
   .sidebar-recent-session__text {
-  padding-right: var(--session-row-actions-reserve);
+  padding-right: calc(
+    var(--session-row-actions-reserve) + var(--sidebar-session-action-extra-space, 0px)
+  );
 }
 
 /* Hover actions replace trailing PR badges; leading state and second-line metadata stay visible. */
@@ -3194,7 +3190,9 @@ a:is(
   }
 
   .sidebar-recent-session:not(.sidebar-recent-session--child) .sidebar-recent-session__text {
-    padding-right: var(--session-row-actions-reserve);
+    padding-right: calc(
+      var(--session-row-actions-reserve) + var(--sidebar-session-action-extra-space, 0px)
+    );
   }
 
   .sidebar-recent-session:not(.sidebar-recent-session--child) .sidebar-recent-session__title-row {

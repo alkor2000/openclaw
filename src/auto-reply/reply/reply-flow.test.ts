@@ -358,20 +358,31 @@ describe("createReplyDispatcher", () => {
     expect(onIdle).toHaveBeenCalledTimes(1);
   });
 
-  it.each(["onIdle", "onSettled"] as const)(
-    "releases deferred delivery finalization from %s before sealing",
-    async (settleHook) => {
+  it.each([
+    { settleHook: "onIdle", idleFailure: "none" },
+    { settleHook: "onSettled", idleFailure: "none" },
+    { settleHook: "onSettled", idleFailure: "throw" },
+    { settleHook: "onSettled", idleFailure: "reject" },
+  ] as const)(
+    "releases deferred delivery finalization from $settleHook with idle $idleFailure",
+    async ({ settleHook, idleFailure }) => {
       vi.useFakeTimers({ toFake: ["setTimeout"] });
+      const finalization = createDeferred<{ visibleReplySent: true }>();
+      let dispatcher: ReturnType<typeof createReplyDispatcher> | undefined;
       try {
-        let resolveFinalization!: (result: { visibleReplySent: true }) => void;
-        const finalization = new Promise<{ visibleReplySent: true }>((resolve) => {
-          resolveFinalization = resolve;
-        });
-        const settle = () => resolveFinalization({ visibleReplySent: true });
-        const { dispatcher } = createReplyDispatcherWithTyping({
-          deliver: async () => ({ visibleReplySent: false, finalization }),
+        const settle = () => finalization.resolve({ visibleReplySent: true });
+        const failure = new Error("synthetic idle observer failure");
+        const failIdle = () => {
+          if (idleFailure === "throw") {
+            throw failure;
+          }
+          return Promise.reject(failure);
+        };
+        ({ dispatcher } = createReplyDispatcherWithTyping({
+          deliver: async () => ({ visibleReplySent: false, finalization: finalization.promise }),
           ...(settleHook === "onIdle" ? { onIdle: settle } : { onSettled: settle }),
-        });
+          ...(idleFailure === "none" ? {} : { onIdle: failIdle }),
+        }));
 
         dispatcher.sendFinalReply({ text: "final" });
         dispatcher.markComplete();
@@ -389,6 +400,8 @@ describe("createReplyDispatcher", () => {
           counts: { final: { delivered: 1, deliveredNotVisible: 0 } },
         });
       } finally {
+        finalization.resolve({ visibleReplySent: true });
+        await dispatcher?.waitForIdle();
         vi.useRealTimers();
       }
     },

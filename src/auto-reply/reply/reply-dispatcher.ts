@@ -709,12 +709,16 @@ export function createReplyDispatcherWithTyping(
   const dispatcher = createReplyDispatcher({
     ...dispatcherOptions,
     onIdle: async () => {
-      typingController?.markDispatchIdle();
-      const idle = resolvedOnIdle?.();
-      if (idle) {
-        await Promise.resolve(idle);
+      try {
+        typingController?.markDispatchIdle();
+        const idle = resolvedOnIdle?.();
+        if (idle) {
+          await Promise.resolve(idle);
+        }
+      } finally {
+        // Settlement releases channel finalization even when an idle observer fails.
+        await onSettled?.();
       }
-      await onSettled?.();
     },
   });
 

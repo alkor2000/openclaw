@@ -429,6 +429,7 @@ type PromptContextAttempt = Pick<
   | "runtimeContextFragments"
   | "sessionId"
   | "sessionKey"
+  | "sessionTarget"
   | "suppressNextUserMessagePersistence"
   | "operation"
 >;
@@ -582,6 +583,7 @@ export async function prepareEmbeddedAttemptPromptContext(input: {
           cfg: attempt.config ?? {},
           sessionKey: attempt.sessionKey,
           sessionId: attempt.sessionId,
+          sessionTarget: attempt.sessionTarget,
           agentId: input.sessionAgentId,
           includeEmptySnapshots: input.appendOnlyRuntimeContext === true,
         });

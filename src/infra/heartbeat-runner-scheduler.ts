@@ -34,7 +34,7 @@ import {
 } from "./heartbeat-wake.js";
 import { isSessionEventWakePollDeferred } from "./session-event-wake.js";
 import { resolveSystemEventQueueKey } from "./system-event-ownership.js";
-import { peekSystemEventEntries } from "./system-events.js";
+import { peekDeliverableSystemEventEntries } from "./system-events.js";
 
 const loadHeartbeatExecution = createLazyRuntimeModule(() => import("./heartbeat-runner-run.js"));
 
@@ -69,7 +69,6 @@ export function startHeartbeatRunner(opts: {
   // follow-ups. Persisted monitor ticks bypass it.
   const state = {
     cfg: opts.cfg ?? getRuntimeConfig(),
-    runtime,
     agents: new Map<string, HeartbeatAgentState>(),
     stopped: false,
   };
@@ -225,7 +224,7 @@ export function startHeartbeatRunner(opts: {
         agent.heartbeat = { ...agent.heartbeat, every: `${scheduledEveryMs}ms` };
       }
       const pendingEvents = execEventWake
-        ? peekSystemEventEntries(
+        ? peekDeliverableSystemEventEntries(
             resolveSystemEventQueueKey(requestedSessionKey ?? "global", agentId),
           ).filter((event) => !isHeartbeatDeliveryAwarenessEvent(event))
         : [];
@@ -278,7 +277,7 @@ export function startHeartbeatRunner(opts: {
           ...(scheduledEveryMs !== undefined ? { scheduledEveryMs } : {}),
           ...(targeted ? { sessionKey: requestedSessionKey } : {}),
           tasks: requestedTasks,
-          deps: { runtime: state.runtime },
+          deps: { runtime },
         };
         const execute = runOnce ?? (await loadHeartbeatExecution()).runHeartbeatOnce;
         // Import can outlive this runner or its wake generation. The wake owner
@@ -366,8 +365,7 @@ export function startHeartbeatRunner(opts: {
     // Agent state is disjoint; concurrent broadcast dispatch prevents a slow
     // session from starving another agent's independent wake.
     const agentOutcomes = await Promise.all(enrolledAgents.map((agent) => runOneAgent(agent)));
-    let ran = false;
-    let firstResult: HeartbeatRunResult | undefined;
+    const ran = agentOutcomes.some(({ result }) => result.status === "ran");
     let firstFailure: Extract<HeartbeatRunResult, { status: "failed" }> | undefined;
     let firstGuardSkip: Extract<HeartbeatRunResult, { status: "skipped" }> | undefined;
     for (const { result, retryable } of agentOutcomes) {
@@ -376,8 +374,6 @@ export function startHeartbeatRunner(opts: {
         // cooldown, so the retry does not replay their completed work.
         return result;
       }
-      ran ||= result.status === "ran";
-      firstResult ??= result;
       if (result.status === "failed") {
         firstFailure ??= result;
       }
@@ -393,11 +389,10 @@ export function startHeartbeatRunner(opts: {
       }
     }
     if (ran) {
+      const singleResult = agentOutcomes.length === 1 ? agentOutcomes[0]?.result : undefined;
       return (
         firstFailure ?? {
-          ...(agentOutcomes.length === 1 && firstResult?.status === "ran"
-            ? firstResult
-            : undefined),
+          ...(singleResult?.status === "ran" ? singleResult : undefined),
           status: "ran",
           durationMs: Date.now() - startedAt,
         }
@@ -406,7 +401,7 @@ export function startHeartbeatRunner(opts: {
     return (
       firstGuardSkip ??
       firstFailure ??
-      firstResult ?? {
+      agentOutcomes[0]?.result ?? {
         status: "skipped",
         reason: isInterval ? "not-due" : "disabled",
       }

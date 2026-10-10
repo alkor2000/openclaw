@@ -302,6 +302,7 @@ async function prepareHeartbeatDispatchReply(
       outcome.kind === "failure"
         ? { status: "failed", reason: outcome.reason }
         : { status: "ran", durationMs: Date.now() - startedAt, ...policy.runSession };
+    return {};
   };
   const stateKey = prepared.outboundPolicySessionKey ?? sessionKey;
   const record = (value: HeartbeatToolResponse) =>
@@ -332,6 +333,17 @@ async function prepareHeartbeatDispatchReply(
   const restoreActivity = () =>
     restoreHeartbeatUpdatedAt({ agentId, storePath, sessionKey, updatedAt: previousUpdatedAt });
   const suppressSelected = () => suppressPendingFinalDelivery(selected, { preserveActivity: true });
+  const checkReady = (onError: (error: unknown) => { ok: false; reason?: string }) =>
+    channel
+      ? resolveHeartbeatChannelPlugin(channel)
+          ?.heartbeat?.checkReady?.({ cfg, accountId: delivery.accountId, deps: opts.deps })
+          .catch(onError)
+      : undefined;
+  const deliveryRetry = (): HeartbeatRunResult => ({
+    status: "skipped",
+    reason: HEARTBEAT_SKIP_CHANNEL_NOT_READY,
+    retryAtMs: Date.now() + HEARTBEAT_IDLE_RETRY_GRACE_MS,
+  });
   if (outcome.kind === "ack") {
     if ("response" in outcome && outcome.response) {
       await record(outcome.response);
@@ -346,7 +358,7 @@ async function prepareHeartbeatDispatchReply(
       return {};
     }
     if (committed.matchingRoute) {
-      finish({
+      return finish({
         status: "sent",
         to: delivery.to,
         preview: truncateHeartbeatPreview(committed.routeSentTexts.join("\n")),
@@ -355,17 +367,15 @@ async function prepareHeartbeatDispatchReply(
         indicatorType: visibility.useIndicator ? resolveIndicatorType("sent") : undefined,
         silent: false,
       });
-      return {};
     }
     if (runState.backgroundWorkStarted) {
-      finish({
+      return finish({
         status: "skipped",
         reason: "background-work",
         message: "Heartbeat started background work; completion is tracked separately.",
         channel,
         silent: true,
       });
-      return {};
     }
     const event = {
       status: outcome.eventStatus,
@@ -377,16 +387,10 @@ async function prepareHeartbeatDispatchReply(
         : undefined,
     };
     if (!("silent" in outcome && outcome.silent) && visibility.showOk && channel && delivery.to) {
-      const readiness = await resolveHeartbeatChannelPlugin(channel)
-        ?.heartbeat?.checkReady?.({
-          cfg,
-          accountId: delivery.accountId,
-          deps: opts.deps,
-        })
-        .catch((error: unknown) => {
-          log.warn(`heartbeat: HEARTBEAT_OK delivery failed: ${formatErrorMessage(error)}`);
-          return { ok: false };
-        });
+      const readiness = await checkReady((error) => {
+        log.warn(`heartbeat: HEARTBEAT_OK delivery failed: ${formatErrorMessage(error)}`);
+        return { ok: false };
+      });
       if (!readiness || readiness.ok) {
         return {
           reply: setReplyPayloadMetadata(
@@ -405,8 +409,7 @@ async function prepareHeartbeatDispatchReply(
         };
       }
     }
-    finish({ ...event, silent: true });
-    return {};
+    return finish({ ...event, silent: true });
   }
   const stateEntry = prepared.policySessionEntry;
   const failed = outcome.kind === "failure";
@@ -437,8 +440,7 @@ async function prepareHeartbeatDispatchReply(
     ) {
       await restoreActivity();
       await suppressSelected();
-      finish({ status: "skipped", reason: "duplicate", preview, hasMedia: false, channel });
-      return {};
+      return finish({ status: "skipped", reason: "duplicate", preview, hasMedia: false, channel });
     }
   }
   const noChannelTarget = !prepared.internalProjection && (!channel || !delivery.to);
@@ -450,7 +452,7 @@ async function prepareHeartbeatDispatchReply(
       }
       await suppressSelected();
     }
-    finish(
+    return finish(
       failed
         ? { ...event, silent: true }
         : {
@@ -465,12 +467,9 @@ async function prepareHeartbeatDispatchReply(
           },
       !failed,
     );
-    return {};
   }
   const readiness = channel
-    ? await resolveHeartbeatChannelPlugin(channel)
-        ?.heartbeat?.checkReady?.({ cfg, accountId: delivery.accountId, deps: opts.deps })
-        .catch((error: unknown) => ({ ok: false, reason: formatErrorMessage(error) }))
+    ? await checkReady((error) => ({ ok: false, reason: formatErrorMessage(error) }))
     : undefined;
   if (readiness && !readiness.ok) {
     await unconfirmed(readiness.reason ?? HEARTBEAT_SKIP_CHANNEL_NOT_READY);
@@ -485,11 +484,7 @@ async function prepareHeartbeatDispatchReply(
       false,
     );
     if (!failed) {
-      policy.result = {
-        status: "skipped",
-        reason: HEARTBEAT_SKIP_CHANNEL_NOT_READY,
-        retryAtMs: Date.now() + HEARTBEAT_IDLE_RETRY_GRACE_MS,
-      };
+      policy.result = deliveryRetry();
     }
     return {};
   }
@@ -551,11 +546,7 @@ async function prepareHeartbeatDispatchReply(
         sent && !failed,
       );
       if (!failed && policy.retryUnqueuedDelivery) {
-        policy.result = {
-          status: "skipped",
-          reason: HEARTBEAT_SKIP_CHANNEL_NOT_READY,
-          retryAtMs: Date.now() + HEARTBEAT_IDLE_RETRY_GRACE_MS,
-        };
+        policy.result = deliveryRetry();
       } else if (policy.deliveryError && !failed) {
         policy.result = { status: "failed", reason: policy.deliveryError };
       }

@@ -13,6 +13,7 @@ import {
 } from "../../infra/kysely-sync.js";
 import { isPathInside } from "../../infra/path-guards.js";
 import { retainSnapshotTempDirectory } from "../../infra/sqlite-readonly-location-cleanup.js";
+import { admitSqliteSchema } from "../../infra/sqlite-schema-facts.js";
 import { openSqliteReadOnlyDatabase } from "../../infra/sqlite-snapshot-source.js";
 import { readSqliteUserVersion } from "../../infra/sqlite-user-version.js";
 import {
@@ -171,8 +172,16 @@ export function acquireAuthProfileReadDatabase(
   let readable = false;
   try {
     enableNodeSqliteKyselyStatementCache(db);
-    // The pooled reader bypasses canonical bootstrap and validates its schema on open.
-    readable = readSqliteUserVersion(db) <= OPENCLAW_AGENT_SCHEMA_VERSION;
+    if (inspection) {
+      readable = readSqliteUserVersion(db) <= OPENCLAW_AGENT_SCHEMA_VERSION;
+    } else {
+      admitSqliteSchema(db, (version) => {
+        if (version > OPENCLAW_AGENT_SCHEMA_VERSION) {
+          throw new Error("Auth profile database uses a newer agent schema");
+        }
+      });
+      readable = true;
+    }
   } catch {
     // Invalid readers are disposed below, where native close failures propagate.
   }

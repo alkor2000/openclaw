@@ -71,6 +71,7 @@ async function prepareAttempt(input: {
   admittedRunContext?: ReturnType<typeof createTestAdmittedRunContext>;
   currentAttemptCompletedAssistant?: AssistantMessage;
   sourceReplyDeliveryMode?: "message_tool_only";
+  heartbeat?: { continuesConversation: boolean };
   terminalState: EmbeddedRunTerminalState;
 }) {
   const { prepareEmbeddedRunTerminal } = await import("./terminal-preparation.js");
@@ -81,7 +82,8 @@ async function prepareAttempt(input: {
       runId: "run-focused",
       workspaceDir: "/tmp/openclaw-test",
       prompt: "hi",
-      trigger: "user",
+      trigger: input.heartbeat ? "heartbeat" : "user",
+      ...(input.heartbeat?.continuesConversation ? { continuesConversation: true } : {}),
       timeoutMs: 60_000,
       ...(input.sourceReplyDeliveryMode
         ? { sourceReplyDeliveryMode: input.sourceReplyDeliveryMode }
@@ -213,7 +215,8 @@ describe("prepareEmbeddedRunTerminal", () => {
   it.each([
     { assistantTexts: ["Earlier", "  Latest 😀  ", "\t\r\n"], expected: "Latest 😀" },
     { assistantTexts: ["Earlier", "\ufeff\u2003Latest\u00a0", "\u2028"], expected: "Latest" },
-    { assistantTexts: ["Earlier", " \u200b "], expected: "\u200b" },
+    { assistantTexts: ["Earlier", " \u200b "], expected: "Earlier" },
+    { assistantTexts: [" \u200b\u200d\u2060 "], expected: undefined },
     { assistantTexts: ["  First line \n second line  "], expected: "First line \n second line" },
     { assistantTexts: ["Earlier", " \ud800text\udc00 "], expected: "\ud800text\udc00" },
     { assistantTexts: ["", " \t\r\n", "\ufeff\u2003"], expected: undefined },
@@ -598,6 +601,40 @@ describe("prepareEmbeddedRunTerminal", () => {
       expect.objectContaining({ runAborted: true, runStopReason: "restart" }),
     );
   });
+
+  it.each([
+    { continuesConversation: false, warns: true },
+    { continuesConversation: true, warns: false },
+  ])(
+    "keeps a failed command's NO_REPLY silent only when the heartbeat continues a conversation ($continuesConversation)",
+    async ({ continuesConversation, warns }) => {
+      const actual = await vi.importActual<{
+        buildEmbeddedRunPayloads: typeof buildEmbeddedRunPayloads;
+      }>("./payloads.js");
+      payloadMocks.buildEmbeddedRunPayloads.mockImplementation(actual.buildEmbeddedRunPayloads);
+      const silent: AssistantMessage = {
+        ...assistantMessage("stop"),
+        content: [{ type: "text", text: "NO_REPLY" }],
+      };
+      const prepared = await prepareAttempt({
+        attempt: attemptResult({
+          assistantTexts: ["NO_REPLY"],
+          messagesSnapshot: [silent],
+          lastAssistant: silent,
+          currentAttemptAssistant: silent,
+          currentAttemptCompletedAssistant: silent,
+          lastToolError: { toolName: "exec", error: "Command exited with code 1" },
+        }),
+        heartbeat: { continuesConversation },
+        terminalState: {
+          outcome: { reason: "completed", status: "ok", stopReason: "stop" },
+          signalOwnedInterruption: false,
+        },
+      });
+
+      expect(prepared.payloads.some((payload) => payload.isError === true)).toBe(warns);
+    },
+  );
 });
 
 describe("prepareEmbeddedRunTerminal run stats", () => {

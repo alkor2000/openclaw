@@ -201,6 +201,7 @@ async function submitRealTurn(input: {
     activeSession: session,
     transcriptPrompt: context.promptForSession,
     modelPrompt: context.promptForModel,
+    modelPromptProvenance: context.modelPromptProvenance,
     runtimeContextMessage: context.runtimeContextMessageForCurrentTurn,
     appendOnlyRuntimeContext: policy.appendOnlyRuntimeContext,
     appendContext: assembly.promptBuildAppendContext,

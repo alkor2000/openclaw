@@ -6,6 +6,7 @@ import {
   getNodeSqliteKysely,
 } from "../../infra/kysely-sync.js";
 import type { DB as StateDatabase } from "../../state/openclaw-state-db.generated.js";
+import { getOpenClawStateFeatureSchemaSql } from "../../state/openclaw-state-feature-schema.js";
 import type {
   WorkerEnvironmentIntentInput,
   WorkerEnvironmentRecord,
@@ -32,22 +33,9 @@ type AttachmentDatabase = Pick<StateDatabase, "worker_environments"> & {
 };
 const query = (db: DatabaseSync) => getNodeSqliteKysely<AttachmentDatabase>(db);
 
-export const WORKER_ENVIRONMENT_SESSION_ATTACHMENTS_SCHEMA_SQL = `
-CREATE TABLE IF NOT EXISTS worker_environment_session_attachments (
-  session_id TEXT PRIMARY KEY,
-  session_key TEXT NOT NULL,
-  agent_id TEXT NOT NULL,
-  session_lifecycle_revision TEXT,
-  environment_id TEXT NOT NULL UNIQUE,
-  generation INTEGER NOT NULL CHECK (generation >= 1),
-  created_at_ms INTEGER NOT NULL,
-  last_used_at_ms INTEGER NOT NULL,
-  closed_at_ms INTEGER,
-  FOREIGN KEY (environment_id) REFERENCES worker_environments(environment_id) ON DELETE CASCADE
-) STRICT;
-CREATE INDEX IF NOT EXISTS worker_environment_session_attachments_session_key
-ON worker_environment_session_attachments(agent_id, session_key);
-`;
+export const WORKER_ENVIRONMENT_SESSION_ATTACHMENTS_SCHEMA_SQL = getOpenClawStateFeatureSchemaSql(
+  "worker_environment_session_attachments",
+);
 
 function fromRow(row: Selectable<AttachmentTable>): WorkerEnvironmentAttachmentRecord {
   return {
@@ -151,7 +139,7 @@ export function createWorkerEnvironmentSessionAttachmentStore(options: {
         last_used_at_ms: at,
         closed_at_ms: null,
       };
-      executeSqliteQuerySync(
+      const row = executeSqliteQueryTakeFirstSync(
         db,
         query(db)
           .insertInto("worker_environment_session_attachments")
@@ -161,23 +149,25 @@ export function createWorkerEnvironmentSessionAttachmentStore(options: {
             agent_id: input.agentId,
             ...values,
           })
-          .onConflict((oc) => oc.column("session_id").doUpdateSet(values)),
+          .onConflict((oc) => oc.column("session_id").doUpdateSet(values))
+          .returningAll(),
       );
-      return { attachment: get(db, input.sessionId)!, environment };
+      return { attachment: fromRow(row!), environment };
     },
     closeSessionAttachment(this: void, sessionId) {
       const current = get(db, sessionId);
       if (!current || current.closedAtMs !== null) {
         return current;
       }
-      executeSqliteQuerySync(
+      const row = executeSqliteQueryTakeFirstSync(
         db,
         query(db)
           .updateTable("worker_environment_session_attachments")
           .set({ closed_at_ms: now() })
-          .where("session_id", "=", sessionId),
+          .where("session_id", "=", sessionId)
+          .returningAll(),
       );
-      return get(db, sessionId);
+      return row ? fromRow(row) : undefined;
     },
     cancelSessionAttachmentReservation(this: void, record) {
       const current = get(db, record.sessionId);

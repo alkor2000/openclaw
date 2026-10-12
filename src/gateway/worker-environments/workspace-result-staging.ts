@@ -277,6 +277,7 @@ export async function applyStagedWorkerWorkspaceResult(params: {
   stagedResultRef: string;
   expectedBaseManifestRef: string;
   alreadyAccepted?: boolean;
+  additionalPaths?: ReadonlySet<string>;
   journal: WorkerWorkspaceReconciliationJournalAdapter;
   assertCurrent?: () => void;
   publishAcceptedManifest?: (
@@ -296,6 +297,7 @@ export async function applyStagedWorkerWorkspaceResult(params: {
         allowAdvancedLocalState: true,
         base: staged.base,
         current: staged.current,
+        additionalPaths: params.additionalPaths,
       });
       if (!accepted) {
         throw new Error("Cloud workspace staged result does not match the placement base");
@@ -315,6 +317,7 @@ export async function applyStagedWorkerWorkspaceResult(params: {
         currentManifestRef: staged.currentManifestRef,
         base: staged.base,
         current: staged.current,
+        additionalPaths: params.additionalPaths,
         journal: params.journal,
         assertCurrent: params.assertCurrent,
         acceptance: { kind: "reconcile", publish: params.publishAcceptedManifest },
@@ -331,6 +334,7 @@ async function prepareRequestedWorkerWorkspaceResult(params: {
   baseManifestRaw: string;
   currentManifestRaw: string;
   unchanged?: WorkerWorkspaceApplyResult;
+  additionalPaths?: ReadonlySet<string>;
   publishAcceptedManifest?: (
     accepted: Omit<WorkerWorkspaceApplyResult, "verifyLocalStable">,
   ) => Promise<void>;
@@ -340,17 +344,20 @@ async function prepareRequestedWorkerWorkspaceResult(params: {
   const { memo: hashMemo = new Map(), metrics } = activeWorkspaceHashContext() ?? {};
   let appliedWorkspaceResult: WorkerWorkspaceApplyResult | undefined;
   const root = await fs.realpath(params.request.localPath);
-  const commit = await stageWorkerWorkspaceResult({
-    root,
-    stagingRoot: params.stagingRoot,
-    stagedResultRef: candidateRef,
-    baseManifestRef: params.request.baseManifestRef,
-    currentManifestRef: params.currentManifestRef,
-    baseManifestRaw: params.baseManifestRaw,
-    currentManifestRaw: params.currentManifestRaw,
-    assertCurrent: params.request.assertCurrent,
-  });
   const unchanged = params.unchanged;
+  // Exact matches have no result bytes; their durable acceptance still owns completion.
+  const commit = unchanged
+    ? undefined
+    : await stageWorkerWorkspaceResult({
+        root,
+        stagingRoot: params.stagingRoot,
+        stagedResultRef: candidateRef,
+        baseManifestRef: params.request.baseManifestRef,
+        currentManifestRef: params.currentManifestRef,
+        baseManifestRaw: params.baseManifestRaw,
+        currentManifestRaw: params.currentManifestRaw,
+        assertCurrent: params.request.assertCurrent,
+      });
   const applyPreparedStagedResult = async () => {
     if (unchanged) {
       await unchanged.verifyLocalStable();
@@ -366,6 +373,7 @@ async function prepareRequestedWorkerWorkspaceResult(params: {
           root,
           stagedResultRef: candidateRef,
           expectedBaseManifestRef: params.request.baseManifestRef,
+          additionalPaths: params.additionalPaths,
           journal: params.request.journal,
           assertCurrent: params.request.assertCurrent,
           publishAcceptedManifest: params.publishAcceptedManifest,
@@ -385,6 +393,9 @@ async function prepareRequestedWorkerWorkspaceResult(params: {
       await local.verifyLocalStable();
     },
     publishStagedResult: async () => {
+      if (unchanged) {
+        return;
+      }
       await updateWorkspaceResultRefs(
         root,
         [{ ref: stagedResult.ref, objectId: commit }, { ref: candidateRef }],
@@ -397,11 +408,13 @@ async function prepareRequestedWorkerWorkspaceResult(params: {
       params.request.assertCurrent?.();
     },
     discardPreparedStagedResult: async () => {
-      await deleteStagedWorkerWorkspaceResult({
-        root: params.request.localPath,
-        stagedResultRef: candidateRef,
-        assertCurrent: params.request.assertCurrent,
-      });
+      if (!unchanged) {
+        await deleteStagedWorkerWorkspaceResult({
+          root: params.request.localPath,
+          stagedResultRef: candidateRef,
+          assertCurrent: params.request.assertCurrent,
+        });
+      }
     },
   };
 }

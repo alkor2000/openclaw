@@ -2,7 +2,7 @@ import { isDeepStrictEqual } from "node:util";
 import { theme } from "../../packages/terminal-core/src/theme.js";
 import {
   assertConfigWriteAllowedInCurrentMode,
-  getRuntimeConfig,
+  captureRuntimeConfigAsyncReader,
   readConfigFileSnapshotForWrite,
   replaceConfigFile,
 } from "../config/config.js";
@@ -39,6 +39,7 @@ import {
 import { loadInstalledPluginIndex } from "../plugins/installed-plugin-index.js";
 import { createInstalledPluginOwnershipResolver } from "../plugins/installed-plugin-package-ownership.js";
 import { configReferencesNpmInstallPath } from "../plugins/installs.js";
+import { VERSION_BOUND_RUNTIME_PLUGIN_IDS } from "../plugins/official-runtime-plugins.js";
 import { createPluginCache, withPluginCache } from "../plugins/plugin-cache.js";
 import {
   withPluginLifecycleLease,
@@ -49,6 +50,7 @@ import {
   pluginPackageUpdateMayMutateConfig,
   reconcilePluginPackageUpdateConfig,
 } from "../plugins/plugin-package-update.js";
+import { resolveOfficialPluginCohortNpmSpecs } from "../plugins/plugin-version-drift.js";
 import { refreshPluginRegistryAfterConfigMutation } from "../plugins/registry-refresh.js";
 import {
   isClawHubTrustSkippedOutcome,
@@ -130,7 +132,7 @@ function mayMutatePluginInstallRecord(
   return Boolean(record?.marketplaceSource && record.marketplacePlugin);
 }
 
-function pluginConfigReferencesId(config: ReturnType<typeof getRuntimeConfig>, pluginId: string) {
+function pluginConfigReferencesId(config: OpenClawConfig, pluginId: string) {
   const plugins = config.plugins;
   return (
     plugins?.allow?.includes(pluginId) ||
@@ -143,7 +145,7 @@ function pluginConfigReferencesId(config: ReturnType<typeof getRuntimeConfig>, p
 
 function shouldPreserveEmptyPlugins(params: {
   parsed: unknown;
-  sourceConfig: ReturnType<typeof getRuntimeConfig>;
+  sourceConfig: OpenClawConfig;
 }): boolean {
   const plugins = params.sourceConfig.plugins;
   const parsedPlugins =
@@ -247,7 +249,8 @@ async function runPluginUpdateCommandUnlocked(
   }
   // Bind selection, updater input, ownership checks, and persistence to one
   // mutation-start snapshot so concurrent config changes cannot be resurrected.
-  const cfg = mutationSnapshot?.snapshot.runtimeConfig ?? getRuntimeConfig();
+  const cfg =
+    mutationSnapshot?.snapshot.runtimeConfig ?? (await captureRuntimeConfigAsyncReader()());
   const sourceCfg = mutationSnapshot?.snapshot.sourceConfig ?? cfg;
   const pluginInstallRecords = await loadInstalledPluginIndexInstallRecords();
   const cfgWithPluginInstallRecords = withPluginInstallRecords(cfg, pluginInstallRecords);
@@ -459,6 +462,12 @@ async function runPluginUpdateCommandUnlocked(
                 officialPluginUpdateChannel,
                 syncOfficialPluginInstalls: params.opts.all ? true : undefined,
                 coreVersion: VERSION,
+                versionBoundPluginIds: VERSION_BOUND_RUNTIME_PLUGIN_IDS,
+                npmInstallSpecOverrides: resolveOfficialPluginCohortNpmSpecs({
+                  gatewayVersion: VERSION,
+                  installRecords: pluginInstallRecords,
+                  config: cfgWithPluginInstallRecords,
+                }),
                 ...installPolicyWarningAcknowledgement,
                 ...resolvePluginCapabilityConsentCliOptions({
                   acceptCapabilities: params.opts.acceptCapabilities,

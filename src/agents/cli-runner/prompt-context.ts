@@ -98,13 +98,18 @@ export async function prepareCliTurnPromptContext(
 }> {
   // The local Claude plugin delivers current facts privately, outside its reusable system prompt.
   const runtimeFacts =
-    params.runtimeFactsInTurn || (params.backendId === "claude-cli" && params.privateContext)
+    params.runtimeFactsInTurn ||
+    (params.backendId === "claude-cli" &&
+      params.privateContext &&
+      !params.hookResult?.systemPrompt?.trim())
       ? splitSystemPromptRelocatableBoundary(params.systemPrompt)
       : undefined;
   let systemPrompt = runtimeFacts?.remainingPrompt ?? params.systemPrompt;
   let prependContext = "";
-  // Optional context failures must not erase this turn's delivery instructions.
-  let appendContext = params.deliveryGuidance ?? "";
+  // Optional context failures must not erase Runtime facts or delivery instructions.
+  let appendContext = [runtimeFacts?.relocatable, params.deliveryGuidance]
+    .filter((value): value is string => Boolean(value?.trim()))
+    .join("\n\n");
   try {
     const preparedPrependContext = params.prependContext
       .filter((value): value is string => Boolean(value?.trim()))

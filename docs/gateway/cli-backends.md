@@ -216,6 +216,8 @@ through this private hook context on every turn. Session identity stays out of t
 appended system prompt, so otherwise identical conversations can share its stable
 prefix. Policy and workspace instructions remain in the system prompt; process
 and paired-node transports keep their existing Runtime delivery.
+A hook that replaces the entire system prompt still replaces its Runtime facts;
+those removed facts are not restored through private context.
 
 Saved session notes also reach fresh and resumed turns as quoted reference data.
 OpenClaw replays eligible notes from the active reset/compaction window, with a

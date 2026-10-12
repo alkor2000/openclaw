@@ -1,4 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
+import * as mediaTaskStatus from "../media-generation-task-status.js";
 import { createCliCurrentPromptRenderer, prepareCliTurnPromptContext } from "./prompt-context.js";
 
 afterEach(() => vi.restoreAllMocks());
@@ -47,4 +48,44 @@ it("keeps a transient session notice at the top of the native user prompt", () =
   expect(createCliCurrentPromptRenderer({}, session)("Read the latest token.")).toBe(
     "Read the latest token.",
   );
+});
+
+const runtimeFacts = "Runtime: session=agent:main:private-probe | channel=cli";
+const claudeTurn = {
+  agentId: "main",
+  backendId: "claude-cli",
+  backend: { command: "claude", systemPromptArg: "--system-prompt" },
+  systemPrompt: `Stable instructions.\n<!-- OPENCLAW-RELOCATABLE-BOUNDARY -->\n${runtimeFacts}\n<!-- /OPENCLAW-RELOCATABLE-BOUNDARY -->`,
+  prompt: "Hello",
+  capabilityToolNames: new Set<string>(),
+  context: [],
+  prependContext: [],
+  privateContext: true,
+  isNewSession: true,
+};
+
+it("preserves private Runtime facts when optional turn context fails", async () => {
+  vi.spyOn(mediaTaskStatus, "buildMediaTaskRuntimeContext").mockRejectedValueOnce(
+    new Error("snapshot unavailable"),
+  );
+  const turn = await prepareCliTurnPromptContext({
+    ...claudeTurn,
+    deliveryGuidance: "Reply in this conversation.",
+  });
+  expect(turn.systemPrompt).toBe("Stable instructions.");
+  expect(turn.prompt).toBe("Hello");
+  expect(turn.promptContext?.appendContext).toBe(`${runtimeFacts}\n\nReply in this conversation.`);
+});
+
+it("lets a whole-system hook replacement remove ordinary Claude Runtime facts", async () => {
+  const turn = await prepareCliTurnPromptContext({
+    ...claudeTurn,
+    hookResult: {
+      systemPrompt: "Replacement instructions.",
+      hasPendingNonPromptBuildContext: false,
+    },
+  });
+  expect(turn.systemPrompt).toBe("Replacement instructions.");
+  expect(turn.prompt).toBe("Hello");
+  expect(turn.promptContext?.appendContext).not.toContain(runtimeFacts);
 });

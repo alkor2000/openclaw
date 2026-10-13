@@ -15,6 +15,7 @@ import type {
   CliBackendPrepareExecutionContext,
 } from "../plugins/cli-backend.types.js";
 import { reserveTestPortListener } from "../test-utils/port-claims.js";
+import { observeGatewayRunExecution } from "./agent-command.test-helpers.js";
 import * as agentJobs from "./agent-turn/agent-job.js";
 import type { GatewayClient } from "./client.js";
 import {
@@ -110,8 +111,8 @@ describe.skipIf(process.platform === "win32")(
       "registered chat.send $name",
       { timeout: 180_000 },
       (testCase, { signal, onTestFinished }) => {
-        if (!fixture || fixture.cleanupFailed) {
-          throw new Error("The shared watchdog Gateway is not available for another case.");
+        if (!fixture) {
+          throw new Error("The shared watchdog Gateway did not start.");
         }
         const work = runWatchdogCase(fixture, testCase, signal);
         onTestFinished(() => work);
@@ -127,6 +128,7 @@ async function runWatchdogCase(
   signal: AbortSignal,
 ) {
   const { state, gateway, backends, token, controllerScript } = fixture;
+  const requestExecution = await observeGatewayRunExecution();
   const proof = state.path("proof", testCase.behavior);
   const nativeRoot = state.path("receipts", testCase.behavior);
   const sessionKey = `agent:main:freeze-${randomUUID()}`;
@@ -518,7 +520,8 @@ async function runWatchdogCase(
             await controllerExit?.catch(() => {});
           },
           async () => {
-            await gateway.client.request("sessions.delete", { key: sessionKey });
+            // agent.wait can observe a terminal attempt while detached chat work settles.
+            await gateway.client.request("chat.abort", { sessionKey });
           },
           async () => {
             const results = await Promise.allSettled(
@@ -536,6 +539,10 @@ async function runWatchdogCase(
           },
           async () => {
             await pendingCompletion?.catch(() => {});
+            await requestExecution.waitForCompletion();
+          },
+          async () => {
+            await gateway.client.request("sessions.delete", { key: sessionKey });
           },
           async () => {
             closingReceipts = true;
@@ -547,9 +554,6 @@ async function runWatchdogCase(
           },
           () => receipts?.claim.release(),
         );
-      } catch (error) {
-        fixture.cleanupFailed = true;
-        throw error;
       } finally {
         // Restore observation hooks after every owner has had its cleanup attempt.
         signal.removeEventListener("abort", abortWaits);
@@ -558,6 +562,7 @@ async function runWatchdogCase(
         capability.mockRestore();
         log.mockRestore();
         waitForAgentJob?.mockRestore();
+        await requestExecution.restore();
       }
     },
     async () => {

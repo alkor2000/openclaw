@@ -159,10 +159,7 @@ import {
   resolveAutoCliSessionReseedHistoryChars,
 } from "./session-history.js";
 import { resolveCliSkillsPrompt } from "./skills-prompt.js";
-import {
-  captureCliRunToolAuthority,
-  finalizeCliSessionEventSourcePolicy,
-} from "./tool-authority.js";
+import { captureCliRunToolAuthority } from "./tool-authority.js";
 import {
   captureCliRunStartTime,
   type CliReusableSession,
@@ -900,6 +897,10 @@ async function prepareCliRunContextWithinReadFence(
       tool.resultContentSource ? [[tool.name, tool.resultContentSource] as const] : [],
     ),
   );
+  const sessionEventSourcePolicy = callerToolAuthority.finalizeSessionEventSourcePolicy(
+    params,
+    promptBuildToolsAllow,
+  );
   const { mcpGrant, projectNativeToolAuthority, exclusiveTools } = mcp.prepareCliMcpGrant(params, {
     context: mcpContextBase,
     tools: projectedTools,
@@ -930,6 +931,7 @@ async function prepareCliRunContextWithinReadFence(
       mcpLoopbackRuntime && mcpGrant
         ? mintMcpLoopbackClientGrant({
             ...mcpGrant,
+            sessionEventSourcePolicy,
             runtimeOwnerToken: mcpLoopbackRuntime.ownerToken,
             bindQuestionAnswerAuthority: (assertActive) =>
               bindQuestionAnswerAuthorityForSession(mcpGrant.context.sessionKey, assertActive),
@@ -1463,11 +1465,11 @@ async function prepareCliRunContextWithinReadFence(
       skipsTurnPreparation || params.isolatedCompletion
         ? undefined
         : await loadCliSessionPromptContext({
-            abortSignal: params.abortSignal,
-            sessionManager: params.sessionManager,
-            sessionTarget: params.sessionTarget,
+            ...params,
             allowRawTranscriptReseed,
             rawTranscriptReseedReason,
+            nativeSessionId: reusableCliSessionId,
+            tools: promptTools,
           });
     const effectiveReplyGuidance =
       skipsTurnPreparation || params.isolatedCompletion
@@ -1480,6 +1482,7 @@ async function prepareCliRunContextWithinReadFence(
     const finalizedTranscriptPrompt =
       (params.finalizePromptForResolvedTools ||
         sessionPromptContext?.durableContext ||
+        sessionPromptContext?.sessionGapContext ||
         effectiveReplyGuidance) &&
       params.transcriptPrompt === undefined
         ? params.prompt
@@ -1495,6 +1498,7 @@ async function prepareCliRunContextWithinReadFence(
     if (!isControlOperation && params.skillsSnapshot?.librarySelections?.length) {
       preparedPrompt = remapSkillReferencePaths(preparedPrompt, preparedSkills.usagePaths);
     }
+    let historyPromptCurrentTurn = preparedPrompt;
     if (!skipsTurnPreparation) {
       ({
         prompt: preparedPrompt,
@@ -1532,10 +1536,8 @@ async function prepareCliRunContextWithinReadFence(
       }));
       params.assertCurrent?.();
       params.abortSignal?.throwIfAborted();
-    }
-    let historyPromptCurrentTurn = preparedPrompt;
-    if (!skipsTurnPreparation) {
-      const renderCurrentPrompt = createCliCurrentPromptRenderer(params, reusableCliSession);
+      const gap = sessionPromptContext?.sessionGapContext;
+      const renderCurrentPrompt = createCliCurrentPromptRenderer(params, reusableCliSession, gap);
       const preferResumableText =
         params.currentInboundEventKind === "room_event" && Boolean(reusableCliSessionId);
       historyPromptCurrentTurn = renderCurrentPrompt(preparedPrompt);
@@ -1603,11 +1605,7 @@ async function prepareCliRunContextWithinReadFence(
     const buildPreparedContext = (preparedParams: PreparedCliRunContext["params"]) => ({
       params: preparedParams,
       bindQuestionAnswerAuthority,
-      sessionEventSourcePolicy: finalizeCliSessionEventSourcePolicy(
-        callerToolAuthority.sessionEventSourcePolicy,
-        preparedParams,
-        promptBuildToolsAllow,
-      ),
+      sessionEventSourcePolicy,
       effectiveAuthProfileId,
       ...(authStore ? { authProfileStore: authStore } : {}),
       agentDir,

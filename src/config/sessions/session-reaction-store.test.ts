@@ -22,10 +22,8 @@ import { closeStateDatabaseForTest } from "../../test-utils/database-cleanup.js"
 import { SessionWorkStartInvalidatedError } from "./lifecycle.js";
 import { upsertSessionEntryCore } from "./session-accessor.sqlite-entry.js";
 import { copySessionNodeArtifactsForRepair } from "./session-accessor.sqlite-node-artifacts.js";
-import {
-  replaceTranscriptEvents,
-  replaceTranscriptSuffixEventsSync,
-} from "./session-accessor.sqlite-transcript-write.js";
+import { replaceTranscriptSuffixEventsSync } from "./session-accessor.sqlite-transcript-write.js";
+import { replaceTranscriptEvents } from "./session-accessor.sqlite-transcript-write.test-support.js";
 import {
   listSessionReactions,
   SessionReactionLimitError,
@@ -254,6 +252,9 @@ describe("session reaction store", () => {
     const result = await setSessionReactionAsync(scope, removal);
     expect(result).toMatchObject({ changed: true, newestRemainingEmoji: scenario.expected });
     expect(result.reactions.map(({ emoji }) => emoji)).toEqual(["👍", "🎉"]);
+    expect(listSessionReactions(scope, { sessionId: "session-a" })[reaction.messageId]).toEqual(
+      result.reactions,
+    );
     expect(await setSessionReactionAsync(scope, removal)).toMatchObject({
       changed: false,
       newestRemainingEmoji: scenario.expected,

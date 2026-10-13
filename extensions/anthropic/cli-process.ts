@@ -17,6 +17,11 @@ type ClaudeCliSpawnOptions = Pick<
   signal?: AbortSignal;
 };
 
+export type ClaudeCliProcessContext = Pick<
+  CliBackendExecuteContextV2,
+  "command" | "argv0" | "args" | "cwd" | "env" | "abortSignal" | "assertCurrent"
+>;
+
 export type ClaudeCliSecretInput = { fd: 3; createData: () => Buffer };
 
 const STDERR_CAPTURE_CHARS = 8_192;
@@ -60,7 +65,7 @@ function spawnClaudeCliProcess(
 
 /** Owns process-wide diagnostics and the credentials needed to redact warm turns. */
 export function createClaudeCliProcessOwner(
-  currentContext: () => CliBackendExecuteContextV2 | undefined,
+  currentContext: () => ClaudeCliProcessContext | undefined,
   secretInput?: ClaudeCliSecretInput,
 ) {
   const assertCurrent = () => {

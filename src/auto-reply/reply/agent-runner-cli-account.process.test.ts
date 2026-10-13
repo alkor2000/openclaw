@@ -449,6 +449,7 @@ it.each([
             ...common,
             cliExecutionProvider: runtime,
             lifecycleGeneration: getAgentEventLifecycleGeneration(),
+            onSessionWriter: () => {},
             providerScopedAuthProfile: resolveRunAuthProfile(followupRun.run, "google", {
               config: cfg,
             }),

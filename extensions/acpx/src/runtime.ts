@@ -640,15 +640,15 @@ export class AcpxRuntime implements CompleteAcpRuntime {
           decoded.acpxRecordId !== persistedHandle.acpxRecordId ||
           decoded.agent !== normalizeAgentName(input.agent)))
     ) {
-      return;
+      return undefined;
     }
     const recordId = oneShot ? persistedHandle?.acpxRecordId : sessionKey;
     if (!recordId) {
-      return;
+      return undefined;
     }
     const record = await this.sessionStore.load(recordId);
     if (!record || readRecordResetOnNextEnsure(record)) {
-      return;
+      return undefined;
     }
     if (
       oneShot &&
@@ -660,7 +660,7 @@ export class AcpxRuntime implements CompleteAcpRuntime {
         record.lastPromptAt !== undefined ||
         record.messages.some((message) => typeof message !== "string" && "User" in message))
     ) {
-      return;
+      return undefined;
     }
     const recordCwd = readRecordCwd(record);
     const recordCommand = readRecordAgentCommand(record);
@@ -670,12 +670,12 @@ export class AcpxRuntime implements CompleteAcpRuntime {
       path.resolve(recordCwd) !== path.resolve(input.cwd?.trim() || this.cwd) ||
       (!oneShot && resumeSessionId && record.acpSessionId !== resumeSessionId)
     ) {
-      return;
+      return undefined;
     }
     const lease = readAcpxProcessLeaseIdentity(recordCommand);
     const ownLease = !lease || lease.gatewayInstanceId === this.gatewayInstanceId;
     if (!oneShot && !ownLease) {
-      return;
+      return undefined;
     }
     const expectedCommand = lease
       ? withAcpxLeaseArgs({
@@ -685,7 +685,7 @@ export class AcpxRuntime implements CompleteAcpRuntime {
         })
       : command;
     if (!isDeepStrictEqual(splitCommandParts(recordCommand), splitCommandParts(expectedCommand))) {
-      return;
+      return undefined;
     }
     // Restore the conversation, not a previous Gateway's process lease.
     return {

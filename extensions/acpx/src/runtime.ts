@@ -6,6 +6,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
   AcpxRuntime as BaseAcpxRuntime,
   decodeAcpxRuntimeHandleState,
@@ -56,7 +57,6 @@ import { AcpxGenerationRegistry } from "./runtime-generations.js";
 import { AcpxRuntimeProbe } from "./runtime-probe.js";
 import { prepareAcpxProcessCleanup } from "./runtime-process-cleanup.js";
 import type { CompleteAcpRuntime, CompleteAcpRuntimeTurn } from "./runtime-proxy.js";
-import { readAcpxSessionRestoration } from "./runtime-session-restoration.js";
 import {
   type AcpLoadedSessionRecord,
   type ResetAwareSessionStore,
@@ -67,6 +67,9 @@ import {
   type GenerationHandle,
   acpxOperationScope,
   readRecordAgentCommand,
+  readRecordCwd,
+  readRecordResetOnNextEnsure,
+  readSessionRecordName,
   readOpenClawLeaseIdFromRecord,
   extractGeneratedWrapperPath,
   createResetAwareSessionStore,
@@ -618,6 +621,79 @@ export class AcpxRuntime implements CompleteAcpRuntime {
     );
   }
 
+  private async readReusableSession(
+    input: OpenClawRuntimeEnsureInput,
+    command: AcpxAgentCommand | undefined,
+  ): Promise<{ reusableCommand?: AcpxAgentCommand; resumeSessionId?: string } | undefined> {
+    const { persistedHandle, sessionKey, resumeSessionId } = input;
+    const oneShot = input.mode === "oneshot";
+    const decoded =
+      persistedHandle && decodeAcpxRuntimeHandleState(persistedHandle.runtimeSessionName);
+    if (
+      !command ||
+      (oneShot &&
+        (resumeSessionId ||
+          persistedHandle?.backend !== "acpx" ||
+          !persistedHandle.acpxRecordId ||
+          decoded?.mode !== "oneshot" ||
+          decoded.name !== sessionKey ||
+          decoded.acpxRecordId !== persistedHandle.acpxRecordId ||
+          decoded.agent !== normalizeAgentName(input.agent)))
+    ) {
+      return;
+    }
+    const recordId = oneShot ? persistedHandle?.acpxRecordId : sessionKey;
+    if (!recordId) {
+      return;
+    }
+    const record = await this.sessionStore.load(recordId);
+    if (!record || readRecordResetOnNextEnsure(record)) {
+      return;
+    }
+    if (
+      oneShot &&
+      (record.acpxRecordId !== recordId ||
+        readSessionRecordName(record) !== sessionKey ||
+        record.acpSessionId !== (persistedHandle?.backendSessionId ?? decoded?.backendSessionId) ||
+        (!record.agentCapabilities?.loadSession &&
+          !record.agentCapabilities?.sessionCapabilities?.resume) ||
+        record.lastPromptAt !== undefined ||
+        record.messages.some((message) => typeof message !== "string" && "User" in message))
+    ) {
+      return;
+    }
+    const recordCwd = readRecordCwd(record);
+    const recordCommand = readRecordAgentCommand(record);
+    if (
+      !recordCwd ||
+      !recordCommand ||
+      path.resolve(recordCwd) !== path.resolve(input.cwd?.trim() || this.cwd) ||
+      (!oneShot && resumeSessionId && record.acpSessionId !== resumeSessionId)
+    ) {
+      return;
+    }
+    const lease = readAcpxProcessLeaseIdentity(recordCommand);
+    const ownLease = !lease || lease.gatewayInstanceId === this.gatewayInstanceId;
+    if (!oneShot && !ownLease) {
+      return;
+    }
+    const expectedCommand = lease
+      ? withAcpxLeaseArgs({
+          command,
+          leaseId: lease.leaseId,
+          gatewayInstanceId: lease.gatewayInstanceId,
+        })
+      : command;
+    if (!isDeepStrictEqual(splitCommandParts(recordCommand), splitCommandParts(expectedCommand))) {
+      return;
+    }
+    // Restore the conversation, not a previous Gateway's process lease.
+    return {
+      reusableCommand: ownLease ? recordCommand : undefined,
+      resumeSessionId: oneShot ? record.acpSessionId : undefined,
+    };
+  }
+
   private async runWithLaunchLease<T>(params: {
     agent: string;
     sessionKey: string;
@@ -895,28 +971,17 @@ export class AcpxRuntime implements CompleteAcpRuntime {
       codexModelOverride && command
         ? appendCodexAcpConfigOverrides(command, codexModelOverride)
         : command;
-    const restoration = await readAcpxSessionRestoration({
-      sessionStore: this.sessionStore,
-      persistedHandle: input.persistedHandle,
-      gatewayInstanceId: this.gatewayInstanceId,
-      defaultCwd: this.cwd,
-      agent: input.agent,
-      sessionKey: input.sessionKey,
-      mode: input.mode,
-      cwd: input.cwd,
-      command: stableLaunchCommand,
-      resumeSessionId: input.resumeSessionId,
-    });
+    const restoration = await this.readReusableSession(input, stableLaunchCommand);
 
     this.generationRegistry.assertCurrentGeneration(generation);
-    const restoredInput = restoration.resumeSessionId
+    const restoredInput = restoration?.resumeSessionId
       ? { ...ensureInput, resumeSessionId: restoration.resumeSessionId }
       : ensureInput;
     const handle = await this.runWithLaunchLease({
       agent: restoredInput.agent,
       sessionKey: ensureInput.sessionKey,
       command: stableLaunchCommand,
-      reusableCommand: restoration.reusableCommand,
+      reusableCommand: restoration?.reusableCommand,
       run: () =>
         this.withCodexWrapperDiagnostics({
           command: stableLaunchCommand,

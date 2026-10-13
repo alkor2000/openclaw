@@ -462,6 +462,7 @@ export async function runAgentAttempt(
       onContextEngineTurnCandidate: params.onContextEngineTurnCandidate,
       suppressNextUserMessagePersistence: params.suppressPromptPersistenceOnRetry === true,
       disableTools,
+      disableMessageTool: params.opts.disableMessageTool,
       terminalReplyExpectation: replyExpectation,
       silentReplyPromptMode:
         params.opts.silentReplyPromptMode ?? (replyExpectation === "required" ? "none" : undefined),
@@ -819,7 +820,6 @@ export async function runAgentAttempt(
     internalEvents: params.opts.internalEvents,
     runtimeContextFragments: params.opts.runtimeContextFragments,
     requireExplicitMessageTarget: params.opts.requireExplicitMessageTarget,
-    disableMessageTool: params.opts.disableMessageTool,
     swarmCollector: params.opts.swarmCollector,
     swarmOutputSchema: params.opts.swarmOutputSchema,
     forceRestartSafeTools: params.opts.forceRestartSafeTools,

@@ -318,7 +318,7 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
               mergedPost,
               last.payload,
               admissionLifecycle,
-              entries.map((entry) => entry.post.id),
+              entries.length > 1 ? entries.map((entry) => entry.post.id) : undefined,
             );
           }
           if (shutdown.signal.aborted || admissionLifecycle.abortSignal.aborted) {
@@ -441,10 +441,7 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
       unregisterInteractions();
     }
   }
-  const slashShutdownCleanupPromise = slashShutdownCleanup;
-  if (slashShutdownCleanupPromise) {
-    await Promise.resolve(slashShutdownCleanupPromise);
-  }
+  await Promise.resolve(slashShutdownCleanup);
   if (shutdownFailures.length > 0) {
     throw new AggregateError(shutdownFailures, "Mattermost monitor shutdown failed.", {
       cause: connectionFailure?.error,

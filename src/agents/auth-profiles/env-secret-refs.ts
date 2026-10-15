@@ -6,7 +6,10 @@ import { collectEnvSecretRefIds } from "../../config/resolution-facts.js";
 import { parseSecretRef } from "../../config/types.secrets.js";
 import { isDeletedAgentDatabasePath } from "../../infra/agent-database-readers.js";
 import { SqliteSnapshotCleanupError } from "../../infra/sqlite-readonly-location-cleanup.js";
-import { prepareSqliteReadOnlyLocationSync } from "../../infra/sqlite-snapshot-source.js";
+import {
+  openSqliteReadOnlyDatabase,
+  prepareSqliteReadOnlyLocationSync,
+} from "../../infra/sqlite-snapshot-source.js";
 import { withArtifactPreservingStateReads } from "../../state/openclaw-state-db-readonly.js";
 import { inspectSharedAuthStoreDatabaseTarget } from "./path-resolve.js";
 import { readAuthProfileRowsReadOnly } from "./sqlite-json.js";
@@ -46,6 +49,10 @@ export function collectAuthProfileEnvSecretRefIds(params: {
                   ok: true,
                   value: readAuthProfileRowsReadOnly(
                     source.location,
+                    openSqliteReadOnlyDatabase,
+                    undefined,
+                    undefined,
+                    false,
                     source.cleanupRoot ?? nodePath.dirname(source.location),
                   ).store,
                 };

@@ -13,7 +13,7 @@ import { openOpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { cleanupSessionStateForTest } from "../../test-utils/session-state-cleanup.js";
 import { collectAuthProfileEnvSecretRefIds } from "./env-secret-refs.js";
-import { resolveSharedAuthStoreOwnership } from "./path-resolve.js";
+import { prepareSharedAuthStoreOwnership } from "./path-resolve.js";
 import { closeAuthProfileReadPool } from "./sqlite-read-pool.js";
 import { resolveAuthProfileDatabasePath, writePersistedAuthProfileStoreRaw } from "./sqlite.js";
 import { AuthProfileStoreUnreadableError } from "./store-unreadable-error.js";
@@ -227,7 +227,7 @@ describe("auth-profile references before managed service environment cleanup", (
       expect(artifactHashes(state.root)).toEqual(before);
 
       writeConfigMachineState("auth.sharedStore", { location: "state-db" }, { env: state.env });
-      expect(resolveSharedAuthStoreOwnership(state.env)).toEqual({ location: "state-db" });
+      expect(await prepareSharedAuthStoreOwnership(state.env)).toEqual({ location: "state-db" });
     });
   });
 

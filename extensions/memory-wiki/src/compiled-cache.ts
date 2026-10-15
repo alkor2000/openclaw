@@ -380,8 +380,17 @@ export function createMemoryWikiCompiledCacheStore(
         generation,
         encoding: "gzip-json",
       };
+      // Freeze prior candidates before registering this one; later writers keep their rows.
+      const priorPublicationIds = (await store.entries()).flatMap(({ metadata: previous }) =>
+        isMetadata(previous) &&
+        previous.ownerId === ownerId &&
+        previous.vaultPath === vaultPath &&
+        previous.vaultGeneration === activeVault.vaultGeneration
+          ? [previous.publicationId]
+          : [],
+      );
       await store.register(publicationKey(ownerId, publicationId), gzipSync(serialized), metadata);
-      return { activeVault, serializedSnapshot: serialized };
+      return { activeVault, serializedSnapshot: serialized, priorPublicationIds };
     },
 
     async reconcile(
@@ -535,7 +544,7 @@ export async function writeMemoryWikiCompiledCache(
   loadDurableIdentity: () => Promise<DurableVaultIdentity>,
 ): Promise<void> {
   const store = requireConfiguredStore();
-  const { activeVault, serializedSnapshot } = await store.write(
+  const { activeVault, serializedSnapshot, priorPublicationIds } = await store.write(
     config,
     snapshot,
     generation,
@@ -577,8 +586,13 @@ export async function writeMemoryWikiCompiledCache(
     await store.deletePublication(config, publicationId);
     throw new Error("Memory Wiki cache owner retired during publication.");
   }
-  if (parentPublicationId) {
-    await store.deletePublication(config, parentPublicationId);
+  const superseded = new Set(
+    parentPublicationId ? [parentPublicationId, ...priorPublicationIds] : priorPublicationIds,
+  );
+  superseded.delete(publicationId);
+  // Only the confirmed causal publication retires candidates captured before its write.
+  for (const priorPublicationId of superseded) {
+    await store.deletePublication(config, priorPublicationId);
   }
   if (resolveActiveVault(config) !== activeVault) {
     await store.deletePublication(config, publicationId);

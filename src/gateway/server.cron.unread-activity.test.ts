@@ -54,8 +54,7 @@ const modelErrors: unknown[] = [];
 const sessionKey = "agent:main:dashboard:cron-unread-report";
 const profileId = "owned-fixture:cron-unread";
 const visibleReport = "OWNED_CRON_REPORT: the scheduled check found three items.";
-const failureReport =
-  "AUTOMATION_FAILED\nOWNED_FAILURE_REPORT: the scheduled check could not finish.";
+const blockerReport = "OWNED_BLOCKER_REPORT: the scheduled check could not finish.";
 
 beforeAll(async () => {
   // Gateway helpers normally replace cron execution and its active-run registry.
@@ -374,20 +373,20 @@ test("cron reports mark their session unread while quiet runs and detached sourc
   ).toBe(true);
   expect(reported.lastActivityAt).toBeGreaterThan(baseline.lastReadAt ?? 0);
 
-  const beforeFailure = await acknowledge();
-  const failed = await runJob(jobId, failureReport);
-  expect(failed.record.status).toBe("error");
-  const failureHistory = await rpcReq<{ messages: unknown[] }>(ws, "cron.history", {
+  const beforeBlocker = await acknowledge();
+  const blocked = await runJob(jobId, blockerReport);
+  expect(blocked.record.status).toBe("ok");
+  const blockerHistory = await rpcReq<{ messages: unknown[] }>(ws, "cron.history", {
     id: jobId,
-    runId: failed.runId,
+    runId: blocked.runId,
   });
-  expect(failureHistory.ok, JSON.stringify(failureHistory.error)).toBe(true);
-  expect(JSON.stringify(failureHistory.payload?.messages)).toContain("OWNED_FAILURE_REPORT");
-  const failedEntry = expectDefined(
+  expect(blockerHistory.ok, JSON.stringify(blockerHistory.error)).toBe(true);
+  expect(JSON.stringify(blockerHistory.payload?.messages)).toContain("OWNED_BLOCKER_REPORT");
+  const blockedEntry = expectDefined(
     loadSessionEntry({ agentId: "main", sessionKey, storePath }),
-    "canonical failure-report row",
+    "canonical blocker-report row",
   );
-  expect(failedEntry.lastActivityAt).toBeGreaterThan(beforeFailure.lastReadAt ?? 0);
+  expect(blockedEntry.lastActivityAt).toBeGreaterThan(beforeBlocker.lastReadAt ?? 0);
   expect((await readRow()).unread).toBe(true);
 
   for (const silent of ["NO_REPLY", "", "HEARTBEAT_OK"]) {

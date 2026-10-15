@@ -1,8 +1,8 @@
-import type { APISelectMenuOption } from "discord-api-types/v10";
-import { ButtonStyle } from "discord-api-types/v10";
-import type {
-  ModelsProviderData,
-  ModelsRuntimeChoice,
+import { ButtonStyle, type APISelectMenuOption } from "discord-api-types/v10";
+import {
+  getModelsRuntimeChoices,
+  type ModelsProviderData,
+  type ModelsRuntimeChoice,
 } from "openclaw/plugin-sdk/models-provider-runtime";
 import { normalizeProviderId } from "openclaw/plugin-sdk/provider-model-shared";
 import { sliceUtf16Safe, truncateCodePoints } from "openclaw/plugin-sdk/text-utility-runtime";
@@ -16,15 +16,12 @@ import {
   type TopLevelComponents,
 } from "../internal/discord.js";
 import {
-  getDiscordModelPickerRuntimeChoices,
-  supportsDiscordModelPickerRuntimeChoices,
-} from "./model-picker.runtime.js";
-import {
   buildDiscordModelPickerCustomId,
   createDiscordModelPickerModelToken,
   createDiscordModelPickerRuntimeToken,
   getDiscordModelPickerModelPage,
   getDiscordModelPickerProviderPage,
+  getDiscordModelPickerRecentModelRefs,
   normalizeModelPickerPage,
   type DiscordModelPickerBucket,
   type DiscordModelPickerCommandContext,
@@ -145,28 +142,22 @@ function buildBucketSelectRow(params: {
   providerPage?: number;
   modelIndex?: number;
 }): Row<StringSelectMenu> | null {
-  if (params.buckets.length <= 1) {
+  const { buckets, currentBucketId, ...state } = params;
+  if (buckets.length <= 1) {
     return null;
   }
-  const options: APISelectMenuOption[] = params.buckets.map((bucket) => ({
+  const options: APISelectMenuOption[] = buckets.map((bucket) => ({
     label: bucket.label,
     value: bucket.id,
-    default: bucket.id === params.currentBucketId,
+    default: bucket.id === currentBucketId,
   }));
   // The select value carries the bucket; derive the provider bucket on interaction
   // to keep long provider and user IDs within Discord's 100-character custom-id cap.
   return createModelSelectRow(
     {
-      command: params.command,
+      ...state,
       action: "bucket",
-      view: params.view,
-      userId: params.userId,
       page: 1,
-      provider: params.provider,
-      runtime: params.runtime,
-      runtimeToken: params.runtimeToken,
-      providerPage: params.providerPage,
-      modelIndex: params.modelIndex,
     },
     options,
     params.view === "providers"
@@ -205,9 +196,8 @@ function buildRenderedShell(
     containerComponents.push(new TextDisplay(`-# ${params.footer}`));
   }
 
-  const container = new Container(containerComponents);
   return {
-    components: [container],
+    components: [new Container(containerComponents)],
   };
 }
 
@@ -220,24 +210,22 @@ function buildProviderSelectRow(params: {
   providerBucket?: string;
   showModelCounts?: boolean;
 }): Row<StringSelectMenu> {
-  const options: APISelectMenuOption[] = params.page.items.map((provider) => ({
+  const { page, currentProvider, showModelCounts, ...state } = params;
+  const options: APISelectMenuOption[] = page.items.map((provider) => ({
     label: provider.id,
     value: provider.id,
-    default: provider.id === params.currentProvider,
-    ...(params.showModelCounts
+    default: provider.id === currentProvider,
+    ...(showModelCounts
       ? { description: `${provider.count} ${provider.count === 1 ? "model" : "models"}` }
       : {}),
   }));
   return createModelSelectRow(
     {
-      command: params.command,
+      ...state,
       action: "provider",
       view: "models",
-      provider: params.provider,
-      page: params.page.page,
-      providerPage: params.page.page,
-      providerBucket: params.providerBucket,
-      userId: params.userId,
+      page: page.page,
+      providerPage: page.page,
     },
     options,
     "Select provider",
@@ -330,7 +318,7 @@ function buildModelRows(
   }
 
   const runtimeModel = parseCurrentModelRef(params.pendingModel ?? params.currentModel);
-  const runtimeChoices = getDiscordModelPickerRuntimeChoices(
+  const runtimeChoices = getModelsRuntimeChoices(
     params.data,
     params.modelPage.provider,
     runtimeModel?.provider === normalizeProviderId(params.modelPage.provider)
@@ -346,10 +334,9 @@ function buildModelRows(
   const selectedRuntime = explicitRuntime
     ? runtimeChoices?.find((choice) => choice.id === explicitRuntime)?.id
     : runtimeChoices?.[0]?.id;
-  const compactRuntime =
-    supportsDiscordModelPickerRuntimeChoices() && explicitRuntime
-      ? { runtimeToken: createDiscordModelPickerRuntimeToken(explicitRuntime) }
-      : {};
+  const compactRuntime = explicitRuntime
+    ? { runtimeToken: createDiscordModelPickerRuntimeToken(explicitRuntime) }
+    : {};
   const modelViewState = {
     command: params.command,
     userId: params.userId,
@@ -358,6 +345,7 @@ function buildModelRows(
     page: params.modelPage.page,
     providerPage: providerPage.page,
   };
+  const modelActionState = { ...modelViewState, ...compactRuntime };
 
   if (
     runtimeChoices &&
@@ -400,8 +388,7 @@ function buildModelRows(
   rows.push(
     createModelSelectRow(
       {
-        ...modelViewState,
-        ...compactRuntime,
+        ...modelActionState,
         action: "pick",
       },
       modelOptions,
@@ -410,11 +397,10 @@ function buildModelRows(
   );
 
   const modelNavRow = buildPaginationRow({
-    ...modelViewState,
+    ...modelActionState,
     totalPages: params.modelPage.totalPages,
     hasPrev: params.modelPage.hasPrev,
     hasNext: params.modelPage.hasNext,
-    ...compactRuntime,
     modelIndex: params.pendingModelIndex,
     modelToken: pendingModelToken,
     // Model navigation derives providerBucket from provider on interaction;
@@ -435,7 +421,6 @@ function buildModelRows(
     typeof params.pendingModelIndex === "number" &&
     params.pendingModelIndex > 0;
 
-  const modelActionState = { ...modelViewState, ...compactRuntime };
   const buttonRowItems: Button[] = [
     createModelPickerButton("Providers", {
       command: params.command,
@@ -478,9 +463,7 @@ function buildModelRows(
       },
       {
         style: ButtonStyle.Primary,
-        disabled:
-          !hasPendingSelection ||
-          (supportsDiscordModelPickerRuntimeChoices() && selectedRuntime === undefined),
+        disabled: !hasPendingSelection || selectedRuntime === undefined,
       },
     ),
   );
@@ -618,15 +601,13 @@ export function renderDiscordModelPickerModelsView(
   const selectedRuntimeLabel = choices?.find((choice) => choice.id === selectedRuntime)?.label;
   const pendingLine = !params.pendingModel
     ? "Select a model, then press Submit."
-    : !supportsDiscordModelPickerRuntimeChoices()
-      ? `Selected: ${params.pendingModel} (press Submit)`
-      : choices === undefined
-        ? "Could not confirm how to run this model. Open /models to try again."
-        : choices.length === 0
-          ? "This model cannot run with your current connections. Choose another model."
-          : selectedRuntimeLabel
-            ? `Selected: ${params.pendingModel} · ${selectedRuntimeLabel} (press Submit)`
-            : "Choose how to run this model, then press Submit.";
+    : choices === undefined
+      ? "Could not confirm how to run this model. Open /models to try again."
+      : choices.length === 0
+        ? "This model cannot run with your current connections. Choose another model."
+        : selectedRuntimeLabel
+          ? `Selected: ${params.pendingModel} · ${selectedRuntimeLabel} (press Submit)`
+          : "Choose how to run this model, then press Submit.";
 
   const detailLines = [formatCurrentModelLine(params.currentModel), `Default: ${defaultModel}`];
   if (modelPage.totalPages > 1) {
@@ -679,11 +660,7 @@ export function renderDiscordModelPickerRecentsView(
   params: DiscordModelPickerRecentsViewParams,
 ): DiscordModelPickerRenderedView {
   const { data, quickModels, currentModel, modelBucket, ...navigationState } = params;
-  const defaultModelRef = `${data.resolvedDefault.provider}/${data.resolvedDefault.model}`;
-  const recentModels = [
-    defaultModelRef,
-    ...quickModels.filter((modelRef) => modelRef !== defaultModelRef),
-  ];
+  const recentModels = getDiscordModelPickerRecentModelRefs(data, quickModels);
   const rows = recentModels.map(
     (modelRef, index) =>
       new Row([

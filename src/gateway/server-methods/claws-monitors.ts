@@ -22,12 +22,14 @@ import { cronJobReadView } from "../../cron/job-read-view.js";
 import { getSuspensionVisibleCronTaskRunCount } from "../../cron/service/active-run-cancellation.js";
 import { reconcileToolsAllowAuthority } from "../../cron/service/jobs-tool-policy.js";
 import { hasPendingCronSessionCleanupForAgent } from "../../cron/service/locked.js";
-import { resolveSkillCollectionReviewMonitorSpecs } from "../../cron/skill-collection-review-monitor.js";
 import { cronStoreKey } from "../../cron/store/key.js";
 import { hasActiveCronRunReceiptsForAgent } from "../../cron/store/run-receipt-drain.js";
 import type { CronJob, CronJobCreate } from "../../cron/types.js";
 import { resolveHeartbeatSchedulerSeedAsync } from "../../infra/heartbeat-schedule.js";
-import { readAgentDeletionJournal } from "../../state/agent-deletion-journal.js";
+import {
+  prepareAgentDeletionJournalObservation,
+  type AgentDeletionJournalEntry,
+} from "../../state/agent-deletion-journal.js";
 import { sleep } from "../../utils/sleep.js";
 import type { GatewayRequestContext, GatewayRequestHandlers, RespondFn } from "./types.js";
 
@@ -76,10 +78,9 @@ function inspectMonitors(
   schedulerSeed: string,
 ): ClawMonitorSnapshot[] {
   const cfg = context.getRuntimeConfig();
-  const specs = [
-    ...resolveHeartbeatMonitorPlan(cfg, jobs, { schedulerSeed }).specs,
-    ...resolveSkillCollectionReviewMonitorSpecs(cfg, jobs, { schedulerSeed }),
-  ].filter((spec) => spec.agentId === agentId);
+  const specs = resolveHeartbeatMonitorPlan(cfg, jobs, { schedulerSeed }).specs.filter(
+    (spec) => spec.agentId === agentId,
+  );
   const storeKey = cronStoreKey(context.cronStorePath);
   return readAttachedCronJobs(agentId, {}).flatMap((row) => {
     if (
@@ -117,8 +118,10 @@ function inspectMonitors(
   });
 }
 
-function readDeletionFenceJournal(agentId: string, operationId: string) {
-  const journal = readAgentDeletionJournal(agentId);
+function assertDeletionFenceJournal(
+  journal: AgentDeletionJournalEntry | undefined,
+  operationId: string,
+) {
   if (!journal || journal.operationId !== operationId || journal.cleanupCompleted) {
     throw new Error("Claw removal no longer owns the serving Gateway's deletion fence.");
   }
@@ -128,12 +131,13 @@ function readDeletionFenceJournal(agentId: string, operationId: string) {
 function assertDeletionFence(
   agentId: string,
   operationId: string,
+  entry: AgentDeletionJournalEntry | undefined,
   config: OpenClawConfig,
   install: PersistedClawInstall | undefined,
 ) {
-  const journal = readDeletionFenceJournal(agentId, operationId);
+  const journal = assertDeletionFenceJournal(entry, operationId);
   // Orphaned ownership can outlive its install row, but must never remove a configured replacement.
-  const agent = listAgentEntries(config).find((entry) => entry.id === agentId);
+  const agent = listAgentEntries(config).find((candidate) => candidate.id === agentId);
   if (agent && digestClawValue(agent) !== install?.agentConfigDigest) {
     throw new Error("The serving Gateway's Claw agent configuration changed after planning.");
   }
@@ -199,6 +203,7 @@ export const clawsMonitorHandlers = {
       return;
     }
     const input = parsed.data;
+    let releaseObservation: (() => void) | undefined;
     try {
       const cron = context.cron;
       const assertBinding = () => {
@@ -227,13 +232,18 @@ export const clawsMonitorHandlers = {
         );
         return;
       }
-      readDeletionFenceJournal(input.agentId, input.operationId);
+      const observation = await prepareAgentDeletionJournalObservation(input.agentId);
+      releaseObservation = observation.release;
+      assertDeletionFenceJournal(observation.entry, input.operationId);
+      assertBinding();
       const { install } = await readClawPackageOwnership({ agentId: input.agentId });
       const assertCurrent = () => {
         assertBinding();
+        observation.assertCurrent(input.operationId);
         return assertDeletionFence(
           input.agentId,
           input.operationId,
+          observation.entry,
           context.getRuntimeConfig(),
           install,
         );
@@ -310,6 +320,8 @@ export const clawsMonitorHandlers = {
         undefined,
         errorShape(ErrorCodes.UNAVAILABLE, error instanceof Error ? error.message : String(error)),
       );
+    } finally {
+      releaseObservation?.();
     }
   },
 } satisfies GatewayRequestHandlers;

@@ -3,6 +3,7 @@ import {
   resolveNativeCommandSessionTargets,
   type CommandArgs,
 } from "openclaw/plugin-sdk/command-auth-native";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { ResolvedAgentRoute } from "openclaw/plugin-sdk/routing";
 import { resolveDiscordConversationIdentity } from "../conversation-identity.js";
 import type { BaseComponentInteraction, CommandInteraction } from "../internal/discord.js";
@@ -16,6 +17,7 @@ import type { resolveDiscordNativeInteractionChannelContext } from "./native-int
 import { buildDiscordRoutePeer } from "./route-resolution.js";
 
 type BuildDiscordNativeCommandContextParams = {
+  cfg: OpenClawConfig;
   prompt: string;
   commandArgs: CommandArgs;
   sessionKey: string;
@@ -57,14 +59,12 @@ export async function buildDiscordNativeCommandContext(
   const conversationLabel = params.isDirectMessage
     ? (params.user.globalName ?? params.user.username)
     : params.channelId;
-  const { groupSystemPrompt, ownerAllowFrom, channelStructuredContext } =
+  const { groupSystemPrompt, ownerAllowFrom, channelStructuredContext, toolPolicy } =
     buildDiscordInboundAccessContext({
-      channelConfig: params.channelConfig,
-      guildInfo: params.guildInfo,
-      sender: params.sender,
-      allowNameMatching: params.allowNameMatching,
-      isGuild: params.isGuild,
-      channelTopic: params.channelTopic,
+      ...params,
+      parentId: params.threadParentId,
+      senderName: params.user.globalName ?? params.user.username,
+      senderUsername: params.user.username,
     });
 
   const conversation = {
@@ -157,6 +157,7 @@ export async function buildDiscordNativeCommandContext(
     },
     message: { rawBody: params.prompt },
     access: {
+      toolPolicy,
       mentions: { canDetectMention: true, wasMentioned: true },
       commands: { authorized: params.commandAuthorized },
     },
@@ -181,6 +182,7 @@ export async function buildDiscordNativeCommandContext(
 export async function buildDiscordNativeInteractionContext(
   params: Pick<
     BuildDiscordNativeCommandContextParams,
+    | "cfg"
     | "prompt"
     | "commandArgs"
     | "user"

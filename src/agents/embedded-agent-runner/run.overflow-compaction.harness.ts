@@ -2,12 +2,11 @@
  * Test harness mocks for embedded-run overflow compaction coverage.
  */
 
-import { matchesContextOverflowMessage } from "@openclaw/ai/internal/runtime";
+import { matchesContextOverflowMessage } from "@openclaw/ai/internal/shared";
 import { type Mock, vi } from "vitest";
 import type { ThinkLevel } from "../../auto-reply/thinking.js";
 import type { ContextEngine, ContextEngineSessionTarget } from "../../context-engine/types.js";
 import { formatErrorMessage } from "../../infra/errors.js";
-import type { AssistantMessage } from "../../llm/types.js";
 import type { ClaimingHookAdmission } from "../../plugins/hook-claim-admission.js";
 import type {
   PluginHookBeforeAgentFinalizeEvent,
@@ -255,7 +254,7 @@ type MockCoerceToFailoverError = (
 ) => unknown;
 type MockDescribeFailoverError = (err: unknown) => MockFailoverErrorDescription;
 type MockResolveFailoverStatus = (reason: string) => number | undefined;
-type MockAssistantErrorProbe = (assistant?: AssistantMessage) => boolean;
+type MockAssistantErrorProbe = (assistant?: { errorMessage?: string }) => boolean;
 export class MockedFailoverError extends Error {
   constructor(message: string) {
     super(message);
@@ -293,7 +292,7 @@ export const mockedClassifyFailoverReason = vi.fn<(raw: string) => FailoverReaso
   () => null,
 );
 export const mockedClassifyAssistantFailoverReason = vi.fn(
-  (assistant?: AssistantMessage): FailoverReason | null =>
+  (assistant?: { errorMessage?: string | null }): FailoverReason | null =>
     mockedClassifyFailoverReason(assistant?.errorMessage ?? ""),
 );
 const mockedExtractObservedOverflowTokenCount = vi.fn(extractObservedOverflowTokenCount);
@@ -520,8 +519,9 @@ function resetRunOverflowCompactionHarnessMocks(): void {
   mockedClassifyFailoverReason.mockReset();
   mockedClassifyFailoverReason.mockReturnValue(null);
   mockedClassifyAssistantFailoverReason.mockReset();
-  mockedClassifyAssistantFailoverReason.mockImplementation((assistant) =>
-    mockedClassifyFailoverReason(assistant?.errorMessage ?? ""),
+  mockedClassifyAssistantFailoverReason.mockImplementation(
+    (assistant?: { errorMessage?: string | null }): FailoverReason | null =>
+      mockedClassifyFailoverReason(assistant?.errorMessage ?? ""),
   );
   mockedFormatBillingErrorMessage.mockReset();
   mockedFormatBillingErrorMessage.mockReturnValue("");
@@ -628,8 +628,9 @@ export function resetSharedRunIntegrationHarnessMocks(): void {
   mockedClassifyFailoverReason.mockReset();
   mockedClassifyFailoverReason.mockReturnValue(null);
   mockedClassifyAssistantFailoverReason.mockReset();
-  mockedClassifyAssistantFailoverReason.mockImplementation((assistant) =>
-    mockedClassifyFailoverReason(assistant?.errorMessage ?? ""),
+  mockedClassifyAssistantFailoverReason.mockImplementation(
+    (assistant?: { errorMessage?: string | null }): FailoverReason | null =>
+      mockedClassifyFailoverReason(assistant?.errorMessage ?? ""),
   );
   mockedCompactDirect.mockReset();
   mockedCompactDirect.mockResolvedValue({
@@ -882,11 +883,17 @@ export async function loadRunOverflowCompactionHarness(): Promise<{
     resolveModelAsync: mockedResolveModelAsync,
   }));
 
-  vi.doMock("../model-auth.js", () => ({
+  // mock-isolation: Overflow recovery uses fixture profiles and keys without host credential discovery.
+  vi.doMock("../model-auth.js", async () => ({
+    createRuntimeProviderAuthLookup: (await import("../model-auth-runtime.js"))
+      .createRuntimeProviderAuthLookup,
     applyAuthHeaderOverride: vi.fn((model: unknown) => model),
     applyLocalNoAuthHeaderOverride: vi.fn((model: unknown) => model),
     ensureAuthProfileStore: mockedEnsureAuthProfileStore,
+    ensureAuthProfileStoreAsync: mockedEnsureAuthProfileStore,
     ensureAuthProfileStoreWithoutExternalProfiles:
+      mockedEnsureAuthProfileStoreWithoutExternalProfiles,
+    ensureAuthProfileStoreWithoutExternalProfilesAsync:
       mockedEnsureAuthProfileStoreWithoutExternalProfiles,
     getApiKeyForModelCore: mockedGetApiKeyForModel,
     hasUsableCustomProviderApiKey: mockedHasUsableCustomProviderApiKey,

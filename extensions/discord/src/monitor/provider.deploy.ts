@@ -109,15 +109,11 @@ function installDeployRestLogging(params: {
     delete: params.rest.delete.bind(params.rest),
   };
   for (const method of Object.keys(original) as RestMethodName[]) {
-    const timeout = (params.rest as { options?: { timeout?: unknown } }).options?.timeout;
     params.rest[method] = wrapDeployRestMethod({
+      ...params,
       method,
       original,
-      runtime: params.runtime,
-      accountId: params.accountId,
-      startupStartedAt: params.startupStartedAt,
-      timeoutMs: typeof timeout === "number" ? timeout : undefined,
-      shouldLogVerbose: params.shouldLogVerbose,
+      timeoutMs: params.rest.options.timeout,
     }) as RequestClient[typeof method];
   }
   return () => {
@@ -132,13 +128,10 @@ async function deployDiscordCommands(params: {
   startupStartedAt: number;
   shouldLogVerbose: () => boolean;
 }) {
-  const { accountId, startupStartedAt } = params;
+  const { accountId } = params;
   const restoreDeployRestLogging = installDeployRestLogging({
+    ...params,
     rest: params.client.rest,
-    runtime: params.runtime,
-    accountId,
-    startupStartedAt,
-    shouldLogVerbose: params.shouldLogVerbose,
   });
   try {
     try {

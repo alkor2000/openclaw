@@ -1,17 +1,22 @@
+import path from "node:path";
 import "../../../test-utils/prepare-compiled-subprocesses.js";
 import { streamAnthropic } from "@openclaw/ai/internal/anthropic";
 import { expectDefined } from "@openclaw/normalization-core";
 import { asOptionalObjectRecord } from "@openclaw/normalization-core/record-coerce";
 import { Type } from "typebox";
 import { expect, it, onTestFinished } from "vitest";
+import { setRuntimeConfigSnapshot } from "../../../config/runtime-snapshot.js";
+import { upsertSessionEntryCore } from "../../../config/sessions/session-accessor.js";
 import type { Context, Model } from "../../../llm/types.js";
 import {
   annotateInterSessionPromptText,
   type InputProvenance,
 } from "../../../sessions/input-provenance.js";
 import { createUserTurnTranscriptRecorder } from "../../../sessions/user-turn-transcript.js";
+import type { UserTurnTranscriptTarget } from "../../../sessions/user-turn-transcript.types.js";
 import { withOpenClawTestState } from "../../../test-utils/openclaw-test-state.js";
 import { prepareSystemAgentRunAdmission } from "../../admitted-run-context.js";
+import { forgetPromptBuildDrainCacheForRun } from "../../plugin-turn-context.js";
 import { guardSessionManager } from "../../session-tool-result-guard-wrapper.js";
 import {
   createAssistant,
@@ -21,18 +26,18 @@ import {
   streamMocks,
   testModel,
 } from "../../sessions/agent-session-loop-correctness.test-support.js";
+import { withSessionManagerWrite } from "../../sessions/session-manager-write-admission.js";
 import { SessionManager } from "../../sessions/session-manager.js";
 import { resolveTranscriptPolicy } from "../../transcript-policy.js";
 import { sanitizeSessionHistory } from "../replay-history.js";
 import {
   clearEmbeddedSessionPromptStates,
-  getEmbeddedSessionPromptState,
+  retainEmbeddedSessionPromptState,
 } from "../session-prompt-state.js";
 import {
   prepareEmbeddedAttemptPromptAssembly,
   prepareEmbeddedAttemptPromptContext,
 } from "./attempt-prompt-build.js";
-import { forgetPromptBuildDrainCacheForRun } from "./attempt-prompt-helpers.js";
 import { submitEmbeddedAttemptPrompt } from "./attempt-prompt-submit.js";
 import { prepareEmbeddedAttemptSessionBoundary } from "./attempt-session-prepare.js";
 import type { EmbeddedRunAttemptParams } from "./types.js";
@@ -79,6 +84,7 @@ async function convertThroughPublicAnthropic(context: Context) {
 async function submitRealTurn(input: {
   fixture: Awaited<ReturnType<typeof createTestSession>>;
   manager: SessionManager;
+  target: UserTurnTranscriptTarget;
   runId: string;
   body: string;
   timestamp: number;
@@ -98,7 +104,7 @@ async function submitRealTurn(input: {
   // The session guard records this prepared user from its actual append receipt.
   const recorder = createUserTurnTranscriptRecorder({
     message,
-    target: async () => undefined,
+    target: input.target,
   });
   const manager = guardSessionManager(input.manager, {
     agentId: "main",
@@ -132,8 +138,8 @@ async function submitRealTurn(input: {
     runId: input.runId,
     sessionId: "prefix-proof",
     sessionKey: "agent:main:prefix-proof",
-    sessionFile: "",
-    sessionPersistence: "detached",
+    sessionFile: input.target.sessionKey,
+    sessionTarget: input.target,
     trigger: "user",
     timeoutMs: 10_000,
     workspaceDir: input.workspaceDir,
@@ -175,7 +181,8 @@ async function submitRealTurn(input: {
     setActiveSessionSystemPrompt: (text) => session.setBaseSystemPrompt(text),
     setLeasedSteering: () => {},
   });
-  const promptState = getEmbeddedSessionPromptState(attempt.sessionId);
+  using promptStateLease = retainEmbeddedSessionPromptState(attempt.sessionId);
+  const promptState = promptStateLease.state;
   const context = await prepareEmbeddedAttemptPromptContext({
     attempt,
     prompt: assembly,
@@ -219,6 +226,7 @@ async function submitRealTurn(input: {
     onFinalPromptText: () => {},
     onSteeringAcknowledged: () => {},
     assertHostActive: assembly.assertHostActive,
+    withTranscriptWrite: (write) => withSessionManagerWrite(manager, write),
     persistToolResultProjections: async () => {},
     promptActiveSession: (text, options) => session.prompt(text, options),
   });
@@ -282,7 +290,17 @@ for (const interSession of [true, false]) {
           ),
         );
       });
-      const manager = SessionManager.inMemory();
+      const target = {
+        agentId: "main",
+        sessionId: "prefix-proof",
+        sessionKey: "agent:main:prefix-proof",
+        storePath: path.join(state.agentDir("main"), "openclaw-agent.sqlite"),
+        config: {},
+        sessionEntry: { sessionId: "prefix-proof", updatedAt: 1 },
+      };
+      setRuntimeConfigSnapshot(target.config);
+      await upsertSessionEntryCore(target, target.sessionEntry);
+      const manager = await SessionManager.openAsync(target, state.workspaceDir);
       const fixture = await createTestSession({
         model,
         sessionManager: manager,
@@ -299,6 +317,7 @@ for (const interSession of [true, false]) {
       await submitRealTurn({
         fixture,
         manager,
+        target,
         runId: "original-turn",
         body: originalBody,
         timestamp: 1_754_000_000_000,
@@ -310,7 +329,8 @@ for (const interSession of [true, false]) {
         .map((message) => ({ stopReason: message.stopReason, error: message.errorMessage }));
       expect(contexts, JSON.stringify(failures)).toHaveLength(2);
       const persisted = structuredClone(manager.getPersistedEntries());
-      const reopened = SessionManager.fromEntries(structuredClone(persisted));
+      fixture.session.dispose();
+      const reopened = await SessionManager.openAsync(target, state.workspaceDir);
       const resumed = await createTestSession({
         model,
         sessionManager: reopened,
@@ -331,6 +351,7 @@ for (const interSession of [true, false]) {
       await submitRealTurn({
         fixture: resumed,
         manager: reopened,
+        target,
         runId: "next-turn",
         body: "PREFIX_PROOF_NEXT_BODY: proceed normally.",
         timestamp: 1_754_000_000_001,

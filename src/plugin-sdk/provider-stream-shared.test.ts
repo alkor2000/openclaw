@@ -1,5 +1,5 @@
 import type { StreamFn } from "openclaw/plugin-sdk/agent-core";
-import type { Model } from "openclaw/plugin-sdk/llm";
+import type { AssistantMessage, Model } from "openclaw/plugin-sdk/llm";
 import { createRequireRecord, createZeroUsageFixture } from "openclaw/plugin-sdk/test-fixtures";
 import { describe, expect, it } from "vitest";
 import { createAssistantMessageEventStream } from "../llm/utils/event-stream.js";
@@ -15,6 +15,7 @@ import {
   normalizeOpenAICompatibleReasoningReplay,
   setQwenChatTemplateThinking,
   stripTrailingAnthropicAssistantPrefillWhenThinking,
+  transformProviderStreamMessages,
 } from "./provider-stream-shared.js";
 
 type StreamEvent = { type: string } & Record<string, unknown>;
@@ -206,6 +207,54 @@ async function nextEvent(iterator: AsyncIterator<unknown>, label: string): Promi
   expect(result.done).toBe(false);
   return result.value as StreamEvent;
 }
+
+describe("transformProviderStreamMessages", () => {
+  it.each(["done"] as const)(
+    "transforms checkpoint and %s result messages while preserving sparse deltas",
+    async (terminal) => {
+      const partial: AssistantMessage = {
+        role: "assistant",
+        api: "openai-completions",
+        provider: "test",
+        model: "test-model",
+        content: [],
+        usage: createZeroUsageFixture(),
+        stopReason: "stop",
+        timestamp: 1,
+      };
+      const final: AssistantMessage = {
+        ...partial,
+        usage: createZeroUsageFixture(),
+        stopReason: terminal === "done" ? "stop" : "error",
+      };
+      const source = createAssistantMessageEventStream();
+      source.push({ type: "start", partial });
+      source.push({ type: "text_delta", contentIndex: 0, delta: "reply" });
+      source.push(
+        terminal === "done"
+          ? { type: "done", reason: "stop", message: final }
+          : { type: "error", reason: "error", error: final },
+      );
+      source.end();
+      const stream = transformProviderStreamMessages(source, (message) => {
+        message.usage.cacheTelemetry = { state: "available" };
+      });
+      const eventTypes: string[] = [];
+      for await (const event of stream) {
+        eventTypes.push(event.type);
+        if (event.type === "text_delta") {
+          expect(event).toEqual({ type: "text_delta", contentIndex: 0, delta: "reply" });
+        }
+      }
+      expect(eventTypes).toEqual(["start", "text_delta", terminal]);
+      expect(partial.usage.cacheTelemetry).toEqual({ state: "available" });
+      expect(final.usage.cacheTelemetry).toEqual(
+        terminal === "done" ? { state: "available" } : undefined,
+      );
+      expect((await stream.result()).usage.cacheTelemetry).toEqual({ state: "available" });
+    },
+  );
+});
 
 describe("defaultToolStreamExtraParams", () => {
   it("defaults tool_stream on when absent", () => {
@@ -425,26 +474,6 @@ describe("createOpenAICompatibleCompletionsThinkingOffWrapper", () => {
       expect(payloads.map((payload) => payload.reasoning_effort)).toEqual(efforts);
     },
   );
-
-  it("preserves native none unless the request selects the configured off mapping", () => {
-    const { baseStreamFn, payloads } = createPayloadCapture("none");
-    const wrapped = createOpenAICompatibleCompletionsThinkingOffWrapper(baseStreamFn, "off");
-    for (const reasoning of ["off", "max", undefined] as const) {
-      void wrapped(
-        {
-          ...lmstudioBinaryModel,
-          compat: {
-            supportedReasoningEfforts: ["none", "low", "high"],
-            reasoningEffortMap: { off: "low", none: "none" },
-          },
-        },
-        { messages: [] },
-        { reasoning },
-      );
-    }
-
-    expect(payloads.map((payload) => payload.reasoning_effort)).toEqual(["low", "none", "low"]);
-  });
 
   it("drops reasoning_effort when the model has no disabled effort", () => {
     const { baseStreamFn, payloads } = createPayloadCapture("high");

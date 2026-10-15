@@ -28,7 +28,7 @@ import {
   resolveDiscordMemberAccessState,
   resolveDiscordMentionPolicy,
 } from "./allow-list.js";
-import { resolveDiscordChannelInfoSafe, resolveDiscordChannelNameSafe } from "./channel-access.js";
+import { resolveDiscordChannelNameSafe } from "./channel-access.js";
 import { resolveDiscordTextCommandAccess } from "./dm-command-auth.js";
 import { resolveDiscordSystemLocation, resolveTimestampMs } from "./format.js";
 import {
@@ -123,31 +123,8 @@ async function resolveDiscordHistoryMediaForPendingRecord(params: {
   if (imageAttachments.length === 0 && stickers.length === 0) {
     return [];
   }
-  const rawData = (() => {
-    try {
-      return params.message.rawData;
-    } catch {
-      return {};
-    }
-  })();
-  const mediaMessage = Object.assign(
-    Object.create(Object.getPrototypeOf(params.message)),
-    params.message,
-  ) as typeof params.message;
-  Object.defineProperties(mediaMessage, {
-    attachments: { value: imageAttachments },
-    rawData: {
-      value: {
-        ...rawData,
-        attachments: imageAttachments,
-        sticker_items: stickers,
-        stickers,
-      },
-    },
-    stickers: { value: stickers },
-  });
   const mediaList = await resolveMediaList(
-    mediaMessage,
+    { attachments: imageAttachments, stickers },
     Math.min(params.preflight.mediaMaxBytes, DISCORD_HISTORY_MEDIA_MAX_BYTES),
     {
       fetchImpl: params.preflight.discordRestFetch,
@@ -171,36 +148,6 @@ async function resolveDiscordHistoryMediaForPendingRecord(params: {
       messageId: media.messageId,
     }),
   );
-}
-
-async function recordDiscordPendingHistoryEntry(params: {
-  preflight: DiscordMessagePreflightParams;
-  historyKey: string;
-  message: DiscordMessagePreflightContext["message"];
-  entry?: DiscordHistoryEntry;
-}) {
-  if (!params.entry || params.preflight.historyLimit <= 0) {
-    return;
-  }
-  await createChannelHistoryWindow<DiscordHistoryEntry>({
-    historyMap: params.preflight.guildHistories,
-  }).recordWithMedia({
-    historyKey: params.historyKey,
-    entry: params.entry,
-    limit: params.preflight.historyLimit,
-    mediaLimit: DISCORD_HISTORY_MEDIA_MAX_ATTACHMENTS,
-    messageId: params.message.id,
-    shouldRecord: () =>
-      !params.preflight.abortSignal?.aborted && params.preflight.isPolicyCurrent?.() !== false,
-    media: async () =>
-      toHistoryMediaEntries(
-        await resolveDiscordHistoryMediaForPendingRecord({
-          preflight: params.preflight,
-          message: params.message,
-        }),
-        { messageId: params.message.id },
-      ),
-  });
 }
 
 export async function preflightDiscordMessage(
@@ -288,30 +235,45 @@ export async function preflightDiscordMessage(
           threadId: messageChannelId,
         })
       : undefined;
+  const ignoreBoundThreadMessage = (
+    threadBinding: Parameters<typeof shouldIgnoreBoundThreadWebhookMessage>[0]["threadBinding"],
+    isBoundThreadSession: () => boolean,
+  ) => {
+    let reason: string;
+    if (
+      shouldIgnoreBoundThreadWebhookMessage({
+        threadId: messageChannelId,
+        webhookId,
+        threadBinding,
+      })
+    ) {
+      reason = "webhook echo";
+    } else if (
+      isBoundThreadBotSystemMessage({
+        isBoundThreadSession: isBoundThreadSession(),
+        isBotAuthor: Boolean(author.bot),
+        text: messageText,
+      })
+    ) {
+      reason = "bot system";
+    } else {
+      return false;
+    }
+    logVerbose(`discord: drop bound-thread ${reason} message ${message.id}`);
+    return true;
+  };
   if (
-    shouldIgnoreBoundThreadWebhookMessage({
-      threadId: messageChannelId,
-      webhookId,
-      threadBinding: injectedBoundThreadBinding,
-    })
-  ) {
-    logVerbose(`discord: drop bound-thread webhook echo message ${message.id}`);
-    return null;
-  }
-  if (
-    isBoundThreadBotSystemMessage({
-      isBoundThreadSession:
+    ignoreBoundThreadMessage(
+      injectedBoundThreadBinding,
+      () =>
         Boolean(injectedBoundThreadBinding) &&
         isDiscordThreadChannelMessage({
           isGuildMessage,
           message,
           channelInfo,
         }),
-      isBotAuthor: Boolean(author.bot),
-      text: messageText,
-    })
+    )
   ) {
-    logVerbose(`discord: drop bound-thread bot system message ${message.id}`);
     return null;
   }
   const pluralkitInfo = await resolveDiscordPreflightPluralKitInfo({
@@ -435,25 +397,8 @@ export async function preflightDiscordMessage(
     boundAgentId,
     baseSessionKey,
   } = routeState;
-  if (
-    shouldIgnoreBoundThreadWebhookMessage({
-      threadId: messageChannelId,
-      webhookId,
-      threadBinding,
-    })
-  ) {
-    logVerbose(`discord: drop bound-thread webhook echo message ${message.id}`);
-    return null;
-  }
   const isBoundThreadSession = Boolean(threadBinding && threadChannel);
-  if (
-    isBoundThreadBotSystemMessage({
-      isBoundThreadSession,
-      isBotAuthor: Boolean(author.bot),
-      text: messageText,
-    })
-  ) {
-    logVerbose(`discord: drop bound-thread bot system message ${message.id}`);
+  if (ignoreBoundThreadMessage(threadBinding, () => isBoundThreadSession)) {
     return null;
   }
   const mentionRegexes = buildMentionRegexes(params.cfg, effectiveRoute.agentId, {
@@ -563,14 +508,32 @@ export async function preflightDiscordMessage(
     sender,
     memberRoleIds,
   });
+  const recordPendingHistoryEntry = async () => {
+    if (!historyEntry || params.historyLimit <= 0) {
+      return;
+    }
+    await createChannelHistoryWindow<DiscordHistoryEntry>({
+      historyMap: params.guildHistories,
+    }).recordWithMedia({
+      historyKey: messageChannelId,
+      entry: historyEntry,
+      limit: params.historyLimit,
+      mediaLimit: DISCORD_HISTORY_MEDIA_MAX_ATTACHMENTS,
+      messageId: message.id,
+      shouldRecord: () => !params.abortSignal?.aborted && params.isPolicyCurrent?.() !== false,
+      media: async () =>
+        toHistoryMediaEntries(
+          await resolveDiscordHistoryMediaForPendingRecord({ preflight: params, message }),
+          { messageId: message.id },
+        ),
+    });
+  };
 
   const mentionPolicy = resolveDiscordMentionPolicy({
     isGuildMessage,
     isThread: Boolean(threadChannel),
     botId,
-    threadOwnerId: threadChannel
-      ? (resolveDiscordChannelInfoSafe(threadChannel).ownerId ?? channelInfo?.ownerId)
-      : undefined,
+    threadOwnerId: threadChannel ? (threadChannel.ownerId ?? channelInfo?.ownerId) : undefined,
     channelConfig,
     guildInfo,
   });
@@ -752,12 +715,7 @@ export async function preflightDiscordMessage(
       },
       "discord: skipping guild message",
     );
-    await recordDiscordPendingHistoryEntry({
-      preflight: params,
-      historyKey: messageChannelId,
-      message,
-      entry: historyEntry,
-    });
+    await recordPendingHistoryEntry();
     return null;
   }
 
@@ -793,12 +751,7 @@ export async function preflightDiscordMessage(
     logVerbose(
       `discord: drop guild message (addressed to another identity, ignoreOtherMentions=true, botId=${botId})`,
     );
-    await recordDiscordPendingHistoryEntry({
-      preflight: params,
-      historyKey: messageChannelId,
-      message,
-      entry: historyEntry,
-    });
+    await recordPendingHistoryEntry();
     return null;
   }
 
@@ -844,25 +797,23 @@ export async function preflightDiscordMessage(
     }
   }
 
-  const botLoopProtection =
+  if (
     author.bot &&
     !sender.isPluralKit &&
     allowBotsMode !== "off" &&
     params.botUserId &&
     author.id !== params.botUserId
-      ? {
-          scopeId: params.accountId,
-          conversationId: messageChannelId,
-          senderId: author.id,
-          receiverId: params.botUserId,
-          config: params.discordConfig?.botLoopProtection,
-          defaultsConfig: params.cfg.channels?.defaults?.botLoopProtection,
-          defaultEnabled: true,
-          nowMs: resolveTimestampMs(message.timestamp),
-        }
-      : undefined;
-  if (botLoopProtection) {
-    const botLoopResult = recordChannelBotPairLoopAndCheckSuppression(botLoopProtection);
+  ) {
+    const botLoopResult = recordChannelBotPairLoopAndCheckSuppression({
+      scopeId: params.accountId,
+      conversationId: messageChannelId,
+      senderId: author.id,
+      receiverId: params.botUserId,
+      config: params.discordConfig?.botLoopProtection,
+      defaultsConfig: params.cfg.channels?.defaults?.botLoopProtection,
+      defaultEnabled: true,
+      nowMs: resolveTimestampMs(message.timestamp),
+    });
     if (botLoopResult.suppressed) {
       logVerbose(
         `discord: bot-to-bot loop detected before media download, suppressing for ${Math.max(0, Math.ceil((botLoopResult.cooldownUntilMs - Date.now()) / 1000))}s`,

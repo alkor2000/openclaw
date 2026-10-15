@@ -1,7 +1,7 @@
 import type { APIGatewayBotInfo } from "discord-api-types/v10";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { parseStrictPositiveInteger } from "openclaw/plugin-sdk/number-runtime";
-import * as proxyCaptureSdk from "openclaw/plugin-sdk/proxy-capture";
+import { captureHttpExchangeAsync } from "openclaw/plugin-sdk/proxy-capture";
 import { readResponseWithLimit } from "openclaw/plugin-sdk/response-limit-runtime";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
 import { fetchWithSsrFGuard } from "openclaw/plugin-sdk/ssrf-runtime";
@@ -9,10 +9,6 @@ import { Type } from "typebox";
 import { Check, Errors } from "typebox/value";
 import { isDiscordRateLimitResponseBody, summarizeDiscordResponseBody } from "../error-body.js";
 import { withAbortTimeout } from "./timeouts.js";
-
-// The shipped 2026.9.6 host omits async capture; retire this check when the minimum advances.
-const captureSdk: Partial<Pick<typeof proxyCaptureSdk, "captureHttpExchangeAsync">> =
-  proxyCaptureSdk;
 
 const DISCORD_GATEWAY_BOT_URL = "https://discord.com/api/v10/gateway/bot";
 const DISCORD_API_HOST = "discord.com";
@@ -107,19 +103,6 @@ function createGatewayMetadataError(params: {
   return error;
 }
 
-function createDefaultGatewayInfo(): APIGatewayBotInfo {
-  return {
-    url: DEFAULT_DISCORD_GATEWAY_URL,
-    shards: 1,
-    session_start_limit: {
-      total: 1,
-      remaining: 1,
-      reset_after: 0,
-      max_concurrency: 1,
-    },
-  };
-}
-
 function summarizeGatewaySchemaErrors(value: unknown): string {
   const errors = Errors(discordGatewayBotInfoSchema, value);
   if (errors.length === 0) {
@@ -202,9 +185,7 @@ export async function fetchDiscordGatewayInfoWithTimeout(params: {
       }),
     run: async (signal) =>
       await fetchDiscordGatewayInfo({
-        token: params.token,
-        gatewayBotUrl: params.gatewayBotUrl,
-        fetchImpl: params.fetchImpl,
+        ...params,
         fetchInit: {
           ...params.fetchInit,
           signal,
@@ -235,7 +216,16 @@ export function resolveGatewayInfoWithFallback(params: { runtime?: RuntimeEnv; e
     }
   }
   return {
-    info: createDefaultGatewayInfo(),
+    info: {
+      url: DEFAULT_DISCORD_GATEWAY_URL,
+      shards: 1,
+      session_start_limit: {
+        total: 1,
+        remaining: 1,
+        reset_after: 0,
+        max_concurrency: 1,
+      },
+    },
     usedFallback: true,
   };
 }
@@ -275,17 +265,15 @@ export async function fetchDiscordGatewayMetadataGuarded(
   }
   if (options?.capture) {
     // Finalization retains capture failures; observe the Promise returned by the SDK view.
-    void captureSdk
-      .captureHttpExchangeAsync?.({
-        url: input,
-        method: (init?.method as string | undefined) ?? "GET",
-        requestHeaders: init?.headers as Headers | Record<string, string> | undefined,
-        requestBody: (init as RequestInit & { body?: BodyInit | null })?.body ?? null,
-        response,
-        flowId: options.capture.flowId,
-        meta: options.capture.meta,
-      })
-      .catch(() => {});
+    void captureHttpExchangeAsync({
+      url: input,
+      method: (init?.method as string | undefined) ?? "GET",
+      requestHeaders: init?.headers as Headers | Record<string, string> | undefined,
+      requestBody: (init as RequestInit & { body?: BodyInit | null })?.body ?? null,
+      response,
+      flowId: options.capture.flowId,
+      meta: options.capture.meta,
+    }).catch(() => {});
   }
   return response;
 }

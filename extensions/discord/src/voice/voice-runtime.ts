@@ -84,6 +84,7 @@ export class DiscordVoiceManager implements DiscordVoiceListenerManager {
   // Room watchers outlive individual bot sessions; only unsubscribe/destroy retires them.
   private readonly occupancyWatchers = new Set<{ guildId: string; refresh: () => void }>();
   private destroyed = false;
+  private readonly abort = new AbortController();
 
   constructor(params: {
     scheduler: PluginServiceSchedulerV1;
@@ -157,14 +158,14 @@ export class DiscordVoiceManager implements DiscordVoiceListenerManager {
     });
     this.voiceSessions = new DiscordVoiceSessions({
       ...params,
+      signal: this.abort.signal,
+      isSessionGenerationCurrent: (entry) =>
+        this.guildLifecycles.get(entry.guildId)?.generation === entry.generation,
       botUserId: () => this.botUserId,
       destroyed: () => this.destroyed,
       getTranscripts: this.getTranscripts,
       membership: this.membership,
-      onLeaveFollowState: (guildId) => {
-        this.following.followedVoiceGuilds.delete(guildId);
-        this.following.deleteFollowedUserChannelsForGuild(guildId);
-      },
+      onLeaveFollowState: (guildId) => this.following.clearFollowedGuild(guildId),
       onSessionStopped: (entry, reason) => {
         const lifecycle = this.guildLifecycles.get(entry.guildId);
         if (lifecycle?.status === "active" && lifecycle.instance === entry) {
@@ -536,8 +537,7 @@ export class DiscordVoiceManager implements DiscordVoiceListenerManager {
         return await this.voiceSessions.leave(params, options);
       }
       if (!options?.preserveFollowState) {
-        this.following.followedVoiceGuilds.delete(guildId);
-        this.following.deleteFollowedUserChannelsForGuild(guildId);
+        this.following.clearFollowedGuild(guildId);
       }
       return {
         ok: true,
@@ -590,6 +590,7 @@ export class DiscordVoiceManager implements DiscordVoiceListenerManager {
 
   async destroy(): Promise<void> {
     this.destroyed = true;
+    this.abort.abort(new Error("Discord voice manager stopped"));
     this.occupancyWatchers.clear();
     const followingStopped = this.following.destroy();
     for (const entry of this.sessions.values()) {

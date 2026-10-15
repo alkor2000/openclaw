@@ -96,6 +96,13 @@ data class GatewayLoadedImage(
   val mimeType: String,
 )
 
+enum class TalkSessionCloseDisposition(
+  val wireValue: String,
+) {
+  Abort("abort"),
+  Detach("detach"),
+}
+
 enum class GatewayMediaKind(
   val wireValue: String,
   val maximumBufferedBytes: Long,
@@ -205,6 +212,7 @@ data class GatewayErrorDetails(
   val clawhubWarning: String? = null,
   val missingScope: String? = null,
   val requiredScopes: List<String> = emptyList(),
+  val retryAfterMs: Int? = null,
 )
 
 data class GatewayMissingScopeErrorDetails(
@@ -263,11 +271,9 @@ private data class SelectedConnectAuth(
   val authBootstrapToken: String?,
   val authDeviceToken: String?,
   val authPassword: String?,
-  val signatureToken: String?,
   val storedToken: String?,
   val storedScopes: List<String>,
   val authSource: GatewayConnectAuthSource,
-  val attemptedDeviceTokenRetry: Boolean,
 )
 
 private class GatewayConnectFailure(
@@ -400,11 +406,35 @@ class GatewaySession(
     private val commitIfCurrentImpl: ((block: () -> Unit) -> Boolean)? = null,
     private val advertisedMethods: Set<String> = emptySet(),
     val controlUiCredential: NativeControlUiCredential? = null,
+    private val advertisedCapabilities: Set<String> = emptySet(),
+    private val reconnectIfCurrentImpl: () -> Unit = {},
     private val requestImpl: suspend (method: String, paramsJson: String?, timeoutMs: Long, withEnqueue: (() -> Unit) -> Unit) -> String,
   ) {
     fun isCurrent(): Boolean = isCurrentImpl()
 
     fun supportsMethod(method: String): Boolean = method in advertisedMethods
+
+    suspend fun closeTalkSession(
+      sessionId: String,
+      disposition: TalkSessionCloseDisposition,
+      withEnqueue: (() -> Unit) -> Unit = { it() },
+    ): String =
+      try {
+        request(
+          "talk.session.close",
+          buildJsonObject {
+            put("sessionId", JsonPrimitive(sessionId))
+            // Older Gateways reject unknown fields and retain the legacy aborting close.
+            if ("talk-session-close-disposition" in advertisedCapabilities) put("disposition", JsonPrimitive(disposition.wireValue))
+          }.toString(),
+          timeoutMs = 5_000,
+          withEnqueue = withEnqueue,
+        )
+      } catch (error: Throwable) {
+        // Disconnect also detaches accepted work if the close could not be confirmed.
+        if (disposition == TalkSessionCloseDisposition.Detach) reconnectIfCurrentImpl()
+        throw error
+      }
 
     fun commitIfCurrent(block: () -> Unit): Boolean {
       commitIfCurrentImpl?.let { return it(block) }
@@ -874,6 +904,12 @@ class GatewaySession(
         endpointStableId = conn.target.endpoint.stableId,
         advertisedMethods = conn.advertisedMethods,
         controlUiCredential = conn.controlUiCredential,
+        advertisedCapabilities = conn.advertisedCapabilities,
+        reconnectIfCurrentImpl = {
+          synchronized(lifecycleLock) {
+            if (currentConnection === conn && conn.isReady()) reconnect()
+          }
+        },
         isCurrentImpl = { currentConnection === conn && conn.isReady() },
         commitIfCurrentImpl = { block ->
           synchronized(lifecycleLock) {
@@ -919,7 +955,28 @@ class GatewaySession(
     paramsJson: String?,
     timeoutMs: Long,
     withEnqueue: (() -> Unit) -> Unit = { it() },
-  ): RpcResult = conn.request(method, parseRequestParams(paramsJson), timeoutMs, guardRequestEnqueue(conn, withEnqueue))
+  ): RpcResult {
+    val params = parseRequestParams(paramsJson)
+    val enqueue = guardRequestEnqueue(conn, withEnqueue)
+    if (method != "talk.catalog") return conn.request(method, params, timeoutMs, enqueue)
+    var remainingMs = minOf(timeoutMs, 10_000)
+    val deadline = SystemClock.elapsedRealtime() + remainingMs
+    while (true) {
+      val result = conn.request(method, params, remainingMs, enqueue)
+      val error = result.error
+      if (
+        result.ok || error?.code != "UNAVAILABLE" || error.details?.retryable != true ||
+        error.details.reason != "talk-catalog-warming"
+      ) {
+        return result
+      }
+      val retryDelayMs = (error.details.retryAfterMs ?: 250).coerceAtLeast(250).toLong()
+      if (SystemClock.elapsedRealtime() + retryDelayMs >= deadline) return result
+      delay(retryDelayMs)
+      remainingMs = deadline - SystemClock.elapsedRealtime()
+      if (remainingMs <= 0) return result
+    }
+  }
 
   private fun parseRequestParams(paramsJson: String?): JsonElement? = paramsJson?.takeUnless(String::isBlank)?.let(json::parseToJsonElement)
 
@@ -977,6 +1034,9 @@ class GatewaySession(
     val target: DesiredConnection,
   ) {
     var advertisedMethods: Set<String> = emptySet()
+      private set
+
+    var advertisedCapabilities: Set<String> = emptySet()
       private set
 
     var controlUiCredential: NativeControlUiCredential? = null
@@ -1364,9 +1424,10 @@ class GatewaySession(
 
     fun hasOpenTransport(): Boolean = state.get() != ConnectionState.CLOSED && connectHandshakeJob != null
 
-    fun markReady(methods: Set<String>?): Boolean {
+    fun markReady(hello: GatewayHelloSummary): Boolean {
       if (!state.compareAndSet(ConnectionState.CONNECTING, ConnectionState.READY)) return false
-      advertisedMethods = methods.orEmpty().toSet()
+      advertisedMethods = hello.methods.orEmpty()
+      advertisedCapabilities = hello.capabilities.orEmpty()
       return true
     }
 
@@ -1595,7 +1656,7 @@ class GatewaySession(
           storedToken = storedToken?.takeIf { it.isNotEmpty() },
           storedScopes = storedEntry?.scopes.orEmpty(),
         )
-      if (selectedAuth.attemptedDeviceTokenRetry) {
+      if (selectedAuth.authDeviceToken != null) {
         target.pendingDeviceTokenRetry = false
       }
       val payload =
@@ -1622,18 +1683,17 @@ class GatewaySession(
           target.recoveringStoredBootstrap = true
         }
         val shouldRetryWithDeviceToken =
-          shouldRetryWithStoredDeviceToken(
-            target = target,
-            error = error,
-            explicitGatewayToken = target.token?.trim()?.takeIf { it.isNotEmpty() },
-            storedToken = storedToken?.takeIf { it.isNotEmpty() },
-            attemptedDeviceTokenRetry = selectedAuth.attemptedDeviceTokenRetry,
-          )
+          !target.deviceTokenRetryBudgetUsed &&
+            selectedAuth.authDeviceToken == null &&
+            !target.token.isNullOrBlank() &&
+            !storedToken.isNullOrEmpty() &&
+            isTrustedDeviceRetryEndpoint(target.endpoint, target.tls) &&
+            error.details?.canRetryWithDeviceToken == true
         if (shouldRetryWithDeviceToken) {
           target.pendingDeviceTokenRetry = true
           target.deviceTokenRetryBudgetUsed = true
         } else if (
-          selectedAuth.attemptedDeviceTokenRetry &&
+          selectedAuth.authDeviceToken != null &&
           error.details?.code == "AUTH_DEVICE_TOKEN_MISMATCH"
         ) {
           deviceAuthStore.clearToken(target.endpoint.stableId, identity.deviceId, target.options.role, onlyIfToken = storedToken)
@@ -1867,7 +1927,7 @@ class GatewaySession(
           role = target.options.role,
           scopes = connectScopes,
           signedAtMs = signedAtMs,
-          token = selectedAuth.signatureToken,
+          token = selectedAuth.authToken ?: selectedAuth.authBootstrapToken,
           nonce = connectNonce,
           platform = client.platform,
           deviceFamily = client.deviceFamily,
@@ -1948,6 +2008,7 @@ class GatewaySession(
                 reason = it["reason"].asStringOrNull(),
                 requestId = normalizeGatewayApprovalRequestId(it["requestId"].asStringOrNull()),
                 retryable = it["retryable"].asBooleanOrNull() == true || wireError.retryable == true,
+                retryAfterMs = frame["error"].asObjectOrNull()?.get("retryAfterMs").asIntOrNull(),
                 clientMinProtocol = it["clientMinProtocol"].asIntOrNull(),
                 clientMaxProtocol = it["clientMaxProtocol"].asIntOrNull(),
                 expectedProtocol = it["expectedProtocol"].asIntOrNull(),
@@ -2186,7 +2247,7 @@ class GatewaySession(
       val connected = conn.connect()
       synchronized(notificationLock) {
         synchronized(lifecycleLock) {
-          if (currentConnection !== conn || desired !== target || job?.isActive != true || !conn.markReady(connected.hello.methods)) return@withContext
+          if (currentConnection !== conn || desired !== target || job?.isActive != true || !conn.markReady(connected.hello)) return@withContext
           // Ready metadata precedes callbacks; retries requested by a callback remain queued.
           pluginSurfaceUrls = connected.pluginSurfaceUrls
           sessionRouting = connected.sessionRouting
@@ -2340,26 +2401,10 @@ class GatewaySession(
       authBootstrapToken = authBootstrapToken,
       authDeviceToken = authDeviceToken,
       authPassword = explicitPassword,
-      signatureToken = authToken ?: authBootstrapToken,
       storedToken = storedToken,
       storedScopes = storedScopes,
       authSource = authSource,
-      attemptedDeviceTokenRetry = shouldUseDeviceRetryToken,
     )
-  }
-
-  private fun shouldRetryWithStoredDeviceToken(
-    target: DesiredConnection,
-    error: ErrorShape,
-    explicitGatewayToken: String?,
-    storedToken: String?,
-    attemptedDeviceTokenRetry: Boolean,
-  ): Boolean {
-    if (target.deviceTokenRetryBudgetUsed) return false
-    if (attemptedDeviceTokenRetry) return false
-    if (explicitGatewayToken == null || storedToken == null) return false
-    if (!isTrustedDeviceRetryEndpoint(target.endpoint, target.tls)) return false
-    return error.details?.canRetryWithDeviceToken == true
   }
 
   private fun shouldPauseReconnectAfterAuthFailure(

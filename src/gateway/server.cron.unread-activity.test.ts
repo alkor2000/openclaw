@@ -8,6 +8,7 @@ import { afterAll, beforeAll, beforeEach, expect, test, vi } from "vitest";
 import type WebSocket from "ws";
 import { closeGatewayTestWebSocket } from "../../test/helpers/gateway-websocket.js";
 import { runQaGatewayFixture } from "../../test/helpers/qa-gateway-cleanup.js";
+import { persistAuthProfileBatch } from "../agents/auth-profiles/upsert-with-lock.js";
 import { getRuntimeConfig, writeConfigFile } from "../config/io.js";
 import { loadSessionEntry } from "../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -51,6 +52,7 @@ let responseText = "";
 const modelResponses: string[] = [];
 const modelErrors: unknown[] = [];
 const sessionKey = "agent:main:dashboard:cron-unread-report";
+const profileId = "owned-fixture:cron-unread";
 const visibleReport = "OWNED_CRON_REPORT: the scheduled check found three items.";
 const failureReport =
   "AUTOMATION_FAILED\nOWNED_FAILURE_REPORT: the scheduled check could not finish.";
@@ -132,6 +134,7 @@ beforeAll(async () => {
   });
   modelBaseUrl = `http://127.0.0.1:${modelPort.port}/v1`;
   fixtureConfig = {
+    auth: { profiles: { [profileId]: { provider: "owned-fixture", mode: "api_key" } } },
     cron: { enabled: false },
     plugins: { enabled: false, slots: { memory: "none" } },
     skills: { load: { watch: false } },
@@ -151,7 +154,6 @@ beforeAll(async () => {
         "owned-fixture": {
           api: "openai-completions",
           baseUrl: modelBaseUrl,
-          apiKey: "synthetic-cron-unread-key",
           models: [
             {
               id: "fixture-model",
@@ -220,6 +222,20 @@ beforeEach(async () => {
   vi.stubEnv("OPENCLAW_SKIP_CRON", "0");
   vi.stubEnv("OPENCLAW_TEST_FAST", "0");
   await writeConfigFile(fixtureConfig);
+  await persistAuthProfileBatch({
+    agentDir,
+    stateDir: expectDefined(process.env.OPENCLAW_STATE_DIR, "owned state"),
+    profiles: [
+      {
+        profileId,
+        credential: {
+          type: "api_key",
+          provider: "owned-fixture",
+          key: "synthetic-cron-unread-key",
+        },
+      },
+    ],
+  });
   const cfg = getRuntimeConfig();
   expect(cfg.agents?.defaults?.model).toEqual({
     primary: "owned-fixture/fixture-model",
@@ -322,7 +338,11 @@ test("cron reports mark their session unread while quiet runs and detached sourc
     schedule: { kind: "every", everyMs: 3_600_000 },
     sessionTarget: `session:${sessionKey}`,
     wakeMode: "now",
-    payload: { kind: "agentTurn", message: "Produce the owned scheduled report." },
+    payload: {
+      kind: "agentTurn",
+      message: "Produce the owned scheduled report.",
+      model: `owned-fixture/fixture-model@${profileId}`,
+    },
     delivery: { mode: "none" },
   });
   expect(added.ok, JSON.stringify(added.error)).toBe(true);

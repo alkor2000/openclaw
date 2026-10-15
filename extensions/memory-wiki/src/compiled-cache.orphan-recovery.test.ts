@@ -105,6 +105,12 @@ it("reclaims an abandoned persisted candidate after a successful cold compile", 
       acceptedBefore.compiledCachePublicationId,
     );
 
+    // Recovery must publish changed input, independently of unchanged-compile reuse.
+    await fs.appendFile(
+      path.join(rootDir, "entities", "alpha.md"),
+      "\nA changed source awaiting successful publication.\n",
+    );
+
     // A failed compiler must retire only its own candidate, retaining the
     // accepted publication and the abandoned row until a successor commits.
     abortAfterRegistration = new AbortController();
@@ -134,6 +140,9 @@ it("reclaims an abandoned persisted candidate after a successful cold compile", 
     const acceptedAfter = await loadMemoryWikiVaultIdentity(rootDir);
     expect(acceptedAfter.compiledCachePublicationId).toBeTruthy();
     expect(acceptedAfter.compiledCachePublicationId).not.toBe("orphan-B");
+    expect(acceptedAfter.compiledCachePublicationId).not.toBe(
+      acceptedBefore.compiledCachePublicationId,
+    );
 
     configureMemoryWikiCompiledCacheStore(undefined);
     await closeOpenClawStateDatabaseAsync();

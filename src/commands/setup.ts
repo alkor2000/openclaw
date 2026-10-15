@@ -10,6 +10,7 @@ import {
   formatConfigReadFailureForCli,
   writeInvalidConfigCliJson,
 } from "../cli/config-validation-output.js";
+import { runWithLocalStateOwner } from "../cli/local-state-owner.js";
 import {
   configIncludeOwnsAgentRoster,
   hasResolvedRosterBeforeMigrations,
@@ -25,7 +26,20 @@ import { isRecord, shortenHomePath } from "../utils.js";
 export async function setupCommand(
   opts?: { workspace?: string; skipBootstrap?: boolean; json?: boolean },
   runtime: RuntimeEnv = defaultRuntime,
-) {
+): Promise<void> {
+  return await runWithLocalStateOwner({
+    method: "setup",
+    params: {},
+    target: "agent roster and workspace",
+    onForeignOwner: "refuse",
+    runLocal: () => setupUnderOwner(opts, runtime),
+  });
+}
+
+async function setupUnderOwner(
+  opts: Parameters<typeof setupCommand>[0],
+  runtime: RuntimeEnv,
+): Promise<void> {
   const desiredWorkspace =
     typeof opts?.workspace === "string" && opts.workspace.trim()
       ? opts.workspace.trim()

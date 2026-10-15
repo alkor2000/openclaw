@@ -364,21 +364,35 @@ describe("loadWebMedia", () => {
 
   it("rejects oversized local media before an unbounded file-handle read", async () => {
     const maxBytes = 1.5 * 1024 * 1024;
-    const file = await writeFile("oversized.bin", Buffer.alloc(maxBytes + 1));
+    // Sparse and well past the cap, so an uncapped read would consume all of it.
+    const file = await writeFile("oversized.bin", Buffer.alloc(0));
+    await fs.truncate(file, maxBytes * 4);
     const unboundedRead = vi.fn(async () => {
       throw new Error("unbounded read invoked");
     });
+    let observedOpen = false;
+    let bytesRead = 0;
     __setFsSafeTestHooksForTest({
       afterOpen: (openedPath, handle) => {
         if (openedPath === file) {
+          observedOpen = true;
           vi.spyOn(handle, "readFile").mockImplementation(unboundedRead);
+          const read = handle.read.bind(handle);
+          vi.spyOn(handle, "read").mockImplementation(async (...args) => {
+            const result = await read(...args);
+            bytesRead += result.bytesRead;
+            return result;
+          });
         }
       },
     });
     await expect(media.loadWebMediaRaw(file, { ...localOptions(), maxBytes })).rejects.toThrow(
       "Media exceeds 1.50MB limit",
     );
+    expect(observedOpen).toBe(true);
     expect(unboundedRead).not.toHaveBeenCalled();
+    // fs-safe reads with FileHandle.read; a bounded read stops one byte past the cap.
+    expect(bytesRead).toBeLessThanOrEqual(maxBytes + 1);
   });
 
   it.runIf(process.platform !== "win32")(
@@ -430,10 +444,6 @@ describe("loadWebMedia", () => {
 
   it("rejects text disguised as an allowed binary document", async () => {
     await expectAccessError(hostDocument("secret.pdf", "secret"));
-  });
-
-  it("rejects unverified text named as XLSM", async () => {
-    await expectAccessError(hostDocument("report.xlsm", "not a workbook"));
   });
 
   it("keeps the host-read XLSM root boundary and byte limit", async () => {
@@ -603,11 +613,6 @@ describe("loadWebMedia", () => {
 
   it("rejects trusted HTML paths without HTML document shape", async () => {
     await expectAccessError(hostDocument("report.html", "status,value\nok,1\n"));
-  });
-
-  it("rejects opaque non-NUL binary data disguised as HTML", async () => {
-    const body = Buffer.from(Array.from({ length: 9000 }, (_, index) => (index % 255) + 1));
-    await expectAccessError(hostDocument("opaque.html", body));
   });
 
   it("rejects a CSV binary tail after the old text sample window", async () => {

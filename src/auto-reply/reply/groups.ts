@@ -148,14 +148,14 @@ export function buildGroupChatContext(params: {
   }
   if (canUseSilentReply) {
     lines.push(
-      `If no text reply is needed, including after a reaction or other action, reply with exactly "${params.silentToken}" as the entire final answer, without commentary, punctuation, or formatting.`,
+      `If no text reply is needed, reply with exactly "${params.silentToken}" as the entire final answer, without commentary, punctuation, or formatting.`,
     );
   }
   return lines.join(" ");
 }
 
 /** Builds system prompt context for direct conversations. */
-export function buildDirectChatContext(params: {
+function buildDirectChatContext(params: {
   sessionCtx: TemplateContext;
   sourceReplyDeliveryMode?: SourceReplyDeliveryMode;
 }): string {

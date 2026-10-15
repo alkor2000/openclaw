@@ -11,6 +11,7 @@ import * as embeddedAgent from "../agents/embedded-agent.js";
 import { withFullRuntimeReplyConfig } from "../auto-reply/reply/get-reply-fast-path.js";
 import { getReplyFromConfig } from "../auto-reply/reply/get-reply.js";
 import { finalizeInboundContext } from "../auto-reply/reply/inbound-context.js";
+import { setRuntimeConfigSnapshot } from "../config/io.js";
 import * as sessionAccessor from "../config/sessions/session-accessor.js";
 import { resetCronActiveJobs } from "../cron/active-jobs.js";
 import { canRequesterAbortChatRun } from "../gateway/server-methods/chat-abort-authorization.js";
@@ -75,6 +76,7 @@ async function createHeartbeatScenario(target: "none" | "telegram" = "none") {
     session: { store: storePath },
   });
   await state.writeConfig(cfg);
+  setRuntimeConfigSnapshot(cfg);
   const sessionKey = await seedMainSessionStore(storePath, cfg, {
     lastChannel: "telegram",
     lastProvider: "telegram",
@@ -484,6 +486,7 @@ it("records each isolated execution identity independently of its delivery sessi
     session: { store: storePath },
   });
   await state.writeConfig(cfg);
+  setRuntimeConfigSnapshot(cfg);
   const sessionKey = await seedMainSessionStore(storePath, cfg, {
     lastChannel: "telegram",
     lastProvider: "telegram",

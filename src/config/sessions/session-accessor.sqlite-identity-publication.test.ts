@@ -13,6 +13,7 @@ import {
   runOpenClawAgentWriteTransaction,
 } from "../../state/openclaw-agent-db.js";
 import { resolveIncognitoOpenClawAgentSqlitePath } from "../../state/openclaw-agent-db.paths.js";
+import { requireNativeSqliteDatabase } from "../../test-utils/native-sqlite.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import {
   readPreparedSessionEntryChange,
@@ -325,7 +326,9 @@ it.each(["session ID", "lifecycle revision"] as const)(
           if (mutation.current.sessionKeys.includes(firstKey) && !nativeReplacementStarted) {
             workerPublications.push(readPreparedSessionEntryChange(mutation, firstKey));
             nativeReplacementStarted = true;
-            nativeCacheWasCold = readCommittedSessionEntryCache(database.db) === undefined;
+            nativeCacheWasCold =
+              readCommittedSessionEntryCache(requireNativeSqliteDatabase(database.db)) ===
+              undefined;
             inNativeReplacement = true;
             try {
               replaceSessionEntrySync(scope, newer);

@@ -246,8 +246,7 @@ export function refreshQueuedFollowupSession(params: {
     Boolean(params.previousSessionId) &&
     Boolean(params.nextSessionId) &&
     params.previousSessionId !== params.nextSessionId;
-  const hasNextModelRoute =
-    typeof params.nextProvider === "string" || typeof params.nextModel === "string";
+  const hasNextModelRoute = params.nextProvider !== undefined || params.nextModel !== undefined;
   const shouldRewriteModelSelection =
     hasNextModelRoute || Object.hasOwn(params, "nextModelOverrideSource");
   const shouldRewriteSelection =
@@ -275,10 +274,10 @@ export function refreshQueuedFollowupSession(params: {
       ) {
         bindConfiguredModelAuthProfileScope(run);
       }
-      if (typeof params.nextProvider === "string") {
+      if (params.nextProvider !== undefined) {
         run.provider = params.nextProvider;
       }
-      if (typeof params.nextModel === "string") {
+      if (params.nextModel !== undefined) {
         run.model = params.nextModel;
       }
       if (hasNextModelRoute) {

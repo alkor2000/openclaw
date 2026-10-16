@@ -248,14 +248,12 @@ describe("executeAgentTurn: CLI credential selection", () => {
     const result = executeAgentTurn(createMinimalRunAgentTurnParams({ followupRun }));
     if ("error" in testCase && testCase.error !== undefined) {
       expect(await result).toMatchObject({ kind: "final", payload: { isError: true } });
-      expect(cliAuthSpy.mock.results.find(({ type }) => type === "throw")?.value).toMatchObject({
-        message: expect.stringContaining(testCase.error),
-      });
+      expect(cliAuthSpy).toHaveBeenCalledOnce();
+      await expect(cliAuthSpy.mock.results[0]?.value).rejects.toThrow(testCase.error);
       expect(state.runCliAgentMock).not.toHaveBeenCalled();
       return;
     }
     const settled = await result;
-    expect(cliAuthSpy.mock.results.filter(({ type }) => type === "throw")).toEqual([]);
     expect(settled).toMatchObject({ kind: "success" });
     expect(state.runCliAgentMock).toHaveBeenCalledOnce();
     expectMockCallArgFields(state.runCliAgentMock, 0, "CLI credential handoff", {

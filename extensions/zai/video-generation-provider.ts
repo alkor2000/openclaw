@@ -4,15 +4,13 @@ import {
   resolveClosestSize,
   resolveGeneratedMediaMaxBytes,
 } from "openclaw/plugin-sdk/media-generation-runtime";
-import { isProviderApiKeyConfigured } from "openclaw/plugin-sdk/provider-auth";
+import { isProviderApiKeyConfiguredAsync } from "openclaw/plugin-sdk/provider-auth";
 import { resolveApiKeyForProvider } from "openclaw/plugin-sdk/provider-auth-runtime";
 import {
-  assertOkOrThrowHttpError,
   createProviderOperationDeadline,
   createProviderOperationTimeoutResolver,
   pollProviderOperationJson,
-  postJsonRequest,
-  readProviderJsonObjectResponse,
+  postJsonResponse,
   resolveProviderHttpRequestConfig,
   sanitizeConfiguredModelProviderRequest,
 } from "openclaw/plugin-sdk/provider-http";
@@ -142,7 +140,7 @@ export function buildZaiVideoGenerationProvider(): VideoGenerationProvider {
     defaultModel: DEFAULT_MODEL,
     defaultTimeoutMs: DEFAULT_TIMEOUT_MS,
     models: [DEFAULT_MODEL],
-    isConfigured: (ctx) => isProviderApiKeyConfigured({ provider: "zai", ...ctx }),
+    isConfiguredAsync: (ctx) => isProviderApiKeyConfiguredAsync({ provider: "zai", ...ctx }),
     capabilities: {
       generate: MODE_CAPABILITIES,
       imageToVideo: { ...MODE_CAPABILITIES, enabled: true, maxInputImages: 1 },
@@ -181,7 +179,7 @@ export function buildZaiVideoGenerationProvider(): VideoGenerationProvider {
           transport: "http",
           request: sanitizeConfiguredModelProviderRequest(providerConfig?.request),
         });
-      const { response, release } = await postJsonRequest({
+      const submitted = await postJsonResponse({
         url: `${baseUrl}/videos/generations`,
         headers,
         body,
@@ -189,23 +187,15 @@ export function buildZaiVideoGenerationProvider(): VideoGenerationProvider {
         fetchFn: fetch,
         allowPrivateNetwork,
         dispatcherPolicy,
+        errorLabel: "Z.AI video generation failed",
+        responseLabel: "Z.AI video generation",
+        errorOptions: { bodyTimeoutMs: timeoutMs, requestHeaders: headers },
+        readOptions: { timeoutMs },
+        objectResponse: true,
       });
-      let taskId: string;
-      try {
-        await assertOkOrThrowHttpError(response, "Z.AI video generation failed", {
-          bodyTimeoutMs: timeoutMs,
-          requestHeaders: headers,
-        });
-        const submitted = await readProviderJsonObjectResponse(response, "Z.AI video generation", {
-          timeoutMs,
-        });
-        const id = normalizeOptionalString(submitted.id);
-        if (!id) {
-          throw new Error("Z.AI video generation response missing task id");
-        }
-        taskId = id;
-      } finally {
-        await release();
+      const taskId = normalizeOptionalString(submitted.id);
+      if (!taskId) {
+        throw new Error("Z.AI video generation response missing task id");
       }
       const completed = await pollProviderOperationJson<Record<string, unknown>>({
         url: `${baseUrl}/async-result/${encodeURIComponent(taskId)}`,

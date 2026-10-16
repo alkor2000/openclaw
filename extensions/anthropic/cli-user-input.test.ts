@@ -6,8 +6,11 @@ function createContext(
   requestUserInput: CliBackendExecuteContextV2["requestUserInput"],
 ): CliBackendExecuteContextV2 {
   const context: CliBackendExecuteContextV2 = {
+    assertCurrent() {
+      this.abortSignal?.throwIfAborted();
+    },
     async prepareExecutionAdmission() {
-      this.assertCurrent?.();
+      this.assertCurrent();
       this.abortSignal?.throwIfAborted();
     },
     command: "/usr/local/bin/claude",

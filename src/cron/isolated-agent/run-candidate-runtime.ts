@@ -95,7 +95,7 @@ export function prepareCronCandidateAuthSelection(
 }
 
 /** Resolve the actual CLI account and retain its session restriction through dispatch. */
-export function prepareCronCliCandidateAuth(input: {
+export async function prepareCronCliCandidateAuth(input: {
   params: Pick<
     CronRunExecutionParams,
     "cfgWithAgentDefaults" | "agentId" | "agentDir" | "cronSession"
@@ -112,7 +112,7 @@ export function prepareCronCliCandidateAuth(input: {
     config: params.cfgWithAgentDefaults,
     agentId: params.agentId,
   })
-    ? resolveCliExecutionAuthProfileId({
+    ? await resolveCliExecutionAuthProfileId({
         cliExecutionProvider: input.executionProvider,
         authProfileProvider: input.provider,
         config: params.cfgWithAgentDefaults,

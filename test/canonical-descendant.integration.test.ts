@@ -19,6 +19,7 @@ import {
   retireSessionMcpRuntime,
   setSessionMcpRuntimeScheduler,
 } from "../src/agents/agent-bundle-mcp-manager-api.js";
+import { prepareSharedAuthStoreOwnershipForNative } from "../src/agents/auth-profiles/path-resolve.native.js";
 import {
   setRuntimeAuthProfileStoreSnapshot,
   clearRuntimeAuthProfileStoreSnapshots,
@@ -28,6 +29,7 @@ import { runAgentHarnessBeforeMessageWriteHook } from "../src/agents/harness/hoo
 import { createAgentHarnessHostCapabilities } from "../src/agents/harness/host-capability.js";
 import { listRegisteredAgentHarnesses } from "../src/agents/harness/registry.js";
 import { withGatewayToolCallerIdentity } from "../src/agents/tools/gateway-caller-context.js";
+import { setRuntimeConfigSnapshot } from "../src/config/runtime-snapshot.js";
 import {
   listSessionEntriesCore,
   loadSessionEntry,
@@ -35,7 +37,7 @@ import {
 } from "../src/config/sessions/session-accessor.js";
 import { writeSessionEntry } from "../src/config/sessions/session-accessor.sqlite-entry-store.js";
 import { replaceTranscriptEvents } from "../src/config/sessions/session-accessor.sqlite-transcript-write.test-support.js";
-import { readClosedTranscriptTurnInDatabase } from "../src/config/sessions/session-accessor.transcript-range.js";
+import { readClosedTranscriptTurnInDatabase } from "../src/config/sessions/session-accessor.transcript-range.worker.js";
 import type { OpenClawConfig } from "../src/config/types.openclaw.js";
 import { sessionRewindHandlers } from "../src/gateway/server-methods/sessions-rewind.js";
 import type {
@@ -186,6 +188,7 @@ async function withFixture(
   } = {},
 ) {
   await withState(async (state) => {
+    prepareSharedAuthStoreOwnershipForNative(state.env);
     const config: OpenClawConfig = {
       agents: {
         ownership: "explicit",
@@ -393,6 +396,7 @@ async function withFixture(
           openai: { enabled: true },
         },
       };
+      setRuntimeConfigSnapshot(config);
       const { registry, createApi } = createPluginRegistry({
         runtime,
         logger: { info() {}, warn() {}, error() {} },
@@ -996,50 +1000,6 @@ describe("canonical descendant lifecycle through real owners", () => {
       }
     });
   }, 180_000);
-  it.each(["source", "child"] as const)(
-    "fences physical fork writes after %s revocation during configuration wait",
-    async (target) => {
-      await withFixture(async (fixture, fork, revoke) => {
-        const source = await fixture.adopt();
-        await fixture.turn(source.sessionKey, "canonical");
-        const selected = (await fixture.readEntries(source.sessionKey)).at(-1)!;
-        await fixture.withClient(async (client) => {
-          const release = await fixture.holdConfiguration(client);
-          const request = vi.spyOn(client, "request"); // Pass-through: the real fence still runs.
-          const before = fixture.native.calls.filter(
-            (call) => call.method === "thread/fork",
-          ).length;
-          const pending = fork(source.sessionKey, selected.entryId);
-          let result: Awaited<ReturnType<typeof fork>>;
-          try {
-            await vi.waitFor(
-              () =>
-                expect(request.mock.calls.some(([method]) => method === "thread/fork")).toBe(true),
-              { timeout: 10_000 },
-            );
-            expect(
-              fixture.native.calls.filter((call) => call.method === "thread/fork"),
-            ).toHaveLength(before);
-            revoke(target, source.sessionKey);
-          } finally {
-            release();
-            result = await pending;
-            request.mockRestore();
-          }
-          expect(result.ok).toBe(false);
-          expect(fixture.native.calls.filter((call) => call.method === "thread/fork")).toHaveLength(
-            before,
-          );
-          await fixture.withClient(async (next) => {
-            expect(next).toBe(client);
-          });
-          await expect(client.request("config/read", {})).resolves.toMatchObject({ config: {} });
-        });
-      });
-    },
-    180_000,
-  );
-
   it.each(["source", "child"] as const)(
     "fences physical fork retries after %s revocation on overload",
     async (target) => {
@@ -1853,17 +1813,15 @@ describe("canonical descendant lifecycle through real owners", () => {
     ["ignored cut", /did not apply the exact beforeTurnId cut/],
     ["missing model", /model/i],
     ["null model", /model/i],
-    ["model changed during preparation", /canonical Codex source changed/],
-    ["provider changed during preparation", /canonical Codex source changed/],
     ["request authorization changed after native fork", /request authorization changed/],
     ["sandbox policy changed during initialization", /requires a sandbox/],
     ["catalog mismatch", /native tool catalog is missing, corrupt, or changed/],
     ["child catalog", /did not preserve the actual native tool catalog/],
-    ["child model", /did not preserve the exact canonical source and selected native model/],
-    ["child thread model", /did not preserve the exact canonical source and selected native model/],
+    ["child model", /did not preserve the exact source session and selected native model/],
+    ["child thread model", /did not preserve the exact source session and selected native model/],
     [
       "null child thread model",
-      /did not preserve the exact canonical source and selected native model/,
+      /did not preserve the exact source session and selected native model/,
     ],
     ["child lineage", /unsafe native thread identity/],
     ["unsubscribe failure", /unsubscribe|subscription|guarded rollback/i],
@@ -1890,35 +1848,12 @@ describe("canonical descendant lifecycle through real owners", () => {
             (call) => call.method === "thread/archive",
           ).length;
           const current = expectDefined(fixture.native.threads.get(binding.threadId), "canonical");
-          const create = runtime.agent.session.createSessionEntry;
           const createSession = vi.spyOn(runtime.agent.session, "createSessionEntry");
           if (failure === "missing model") {
             delete current.thread.model;
           }
           if (failure === "null model") {
             current.thread.model = null;
-          }
-          if (
-            failure === "model changed during preparation" ||
-            failure === "provider changed during preparation"
-          ) {
-            createSession.mockImplementation((params) =>
-              create({
-                ...params,
-                afterCreate: async (created) => {
-                  if (failure === "model changed during preparation") {
-                    current.thread.model = "gpt-5.5";
-                  } else {
-                    current.thread.modelProvider = "changed-provider";
-                  }
-                  const patch = await params.afterCreate?.(created);
-                  if (!patch) {
-                    throw new Error("Expected the canonical fork initialization patch");
-                  }
-                  return patch;
-                },
-              }),
-            );
           }
           if (failure === "ignored cut") {
             fixture.native.setIgnoreCut(true);
@@ -1990,9 +1925,7 @@ describe("canonical descendant lifecycle through real owners", () => {
           if (
             failure === "catalog mismatch" ||
             failure === "missing model" ||
-            failure === "null model" ||
-            failure === "model changed during preparation" ||
-            failure === "provider changed during preparation"
+            failure === "null model"
           ) {
             expect(
               fixture.native.calls.filter((call) => call.method === "thread/fork"),

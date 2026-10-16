@@ -6,14 +6,12 @@ import {
   normalizeMimeType,
 } from "openclaw/plugin-sdk/media-mime";
 import { canonicalizeBase64, estimateBase64DecodedBytes } from "openclaw/plugin-sdk/media-runtime";
-import { isProviderApiKeyConfigured } from "openclaw/plugin-sdk/provider-auth";
+import { isProviderApiKeyConfiguredAsync } from "openclaw/plugin-sdk/provider-auth";
 import { resolveApiKeyForProvider } from "openclaw/plugin-sdk/provider-auth-runtime";
 import {
-  assertOkOrThrowHttpError,
   createProviderOperationDeadline,
   pollProviderOperationJson,
-  postJsonRequest,
-  readProviderJsonResponse,
+  postJsonResponse,
   resolveProviderHttpRequestConfig,
   resolveProviderOperationTimeoutMs,
   sanitizeConfiguredModelProviderRequest,
@@ -212,7 +210,7 @@ export function buildDeepInfraVideoGenerationProvider(options?: {
     defaultModel,
     models: ids,
     resolveModelCapabilities: resolveDeepInfraVideoModelCapabilities,
-    isConfigured: (ctx) => isProviderApiKeyConfigured({ provider: "deepinfra", ...ctx }),
+    isConfiguredAsync: (ctx) => isProviderApiKeyConfiguredAsync({ provider: "deepinfra", ...ctx }),
     capabilities: {
       ...capabilities,
       generate: {
@@ -258,7 +256,7 @@ export function buildDeepInfraVideoGenerationProvider(options?: {
           ),
         });
 
-      const { response, release } = await postJsonRequest({
+      const submitted = await postJsonResponse<DeepInfraVideoJob>({
         url: `${baseUrl}/videos`,
         headers,
         body: buildDeepInfraVideoBody(req, model),
@@ -269,17 +267,8 @@ export function buildDeepInfraVideoGenerationProvider(options?: {
         fetchFn: fetch,
         allowPrivateNetwork,
         dispatcherPolicy,
+        errorLabel: "DeepInfra video generation failed",
       });
-      let submitted: DeepInfraVideoJob;
-      try {
-        await assertOkOrThrowHttpError(response, "DeepInfra video generation failed");
-        submitted = await readProviderJsonResponse<DeepInfraVideoJob>(
-          response,
-          "DeepInfra video generation failed",
-        );
-      } finally {
-        await release();
-      }
 
       const jobId = normalizeOptionalString(submitted.id);
       if (!jobId) {

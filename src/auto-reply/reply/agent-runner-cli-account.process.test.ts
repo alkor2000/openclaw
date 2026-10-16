@@ -1,4 +1,4 @@
-// Actual chat candidate and cron fallback process proof with owned protocol fixtures; no vendor inference.
+// Actual Chat and trusted cron-event CLI proof, plus scheduled account refusal; no vendor inference.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,11 +10,13 @@ import { resolveSessionAuthSelection } from "../../agents/auth-profiles/session-
 import { saveAuthProfileStore } from "../../agents/auth-profiles/store-runtime.js";
 import { classifyEmbeddedAgentRunResultForModelFallback } from "../../agents/embedded-agent-runner/result-fallback-classifier.js";
 import { createDeferredEmbeddedRunLifecycleManager } from "../../agents/embedded-agent-runner/run/deferred-lifecycle-owner.js";
+import { hasRecordedModelFallbackStop } from "../../agents/failover-error.js";
 import { FailoverError } from "../../agents/failover/error.js";
 import { createContextEngineLogicalTurnLease } from "../../agents/harness/context-engine-logical-turn.js";
 import { withPreparedModelRuntimePluginGenerationScope } from "../../agents/prepared-model-runtime-generation-scope.js";
 import { installSessionPlacementAdmissionProvider } from "../../agents/session-placement-admission.js";
 import { createDefaultDeps } from "../../cli/deps.js";
+import { captureRuntimeConfigAsyncReader } from "../../config/config.js";
 import { bindConfiguredModelAuthProfileScope } from "../../config/sessions/auth-profile-override-provenance.js";
 import {
   replaceSessionEntry,
@@ -68,7 +70,7 @@ const fixtureBackends = resolveGlobalMap<string, CliBackendPlugin[]>(
   Symbol.for("openclaw.test.cliAccountFixtureBackends"),
 );
 
-// Run each stage with an unchanged positive control before interpreting refusals.
+// Chat/event barriers retain an unchanged positive control; scheduled runs keep their account gate.
 it.each([
   { kind: "chat", stage: "placement", pin: null },
   { kind: "chat", stage: "placement", pin: "user" },
@@ -76,8 +78,9 @@ it.each([
   { kind: "chat", stage: "before-execution", pin: null },
   { kind: "chat", stage: "before-execution", pin: "user" },
   { kind: "chat", stage: "before-execution", pin: "user-link" },
-  { kind: "cron", stage: "before-execution", pin: null },
-  { kind: "cron", stage: "before-execution", pin: "user-link" },
+  { kind: "cron-event", stage: "before-execution", pin: null },
+  { kind: "cron-event", stage: "before-execution", pin: "user-link" },
+  { kind: "scheduled-cron", stage: "account-admission", pin: null },
 ] as const)(
   "protects $kind $pin intent at $stage before actual CLI launch",
   async ({ kind, stage, pin }) => {
@@ -88,6 +91,16 @@ it.each([
       const packageRoot = path.join(state.root, "self-cli-package");
       const command = path.join(packageRoot, "cli.mjs");
       const receipt = path.join(state.root, "cli-launches.jsonl");
+      const readLaunches = () =>
+        fs.readFile(receipt, "utf8").then(
+          (value) => value.trim().split("\n").filter(Boolean),
+          (error: unknown) => {
+            if (hasErrnoCode(error, "ENOENT")) {
+              return [];
+            }
+            throw error;
+          },
+        );
       await fs.mkdir(packageRoot);
       await fs.copyFile(SELF_FIXTURE_PACKAGE_JSON, path.join(packageRoot, "package.json"));
       const cliSource = await fs.readFile(SELF_FIXTURE_CLI_SOURCE, "utf8");
@@ -98,7 +111,7 @@ it.each([
           mode: 0o755,
         },
       );
-      if (kind === "cron") {
+      {
         for (const name of ["openclaw.plugin.json", "plugin.cjs"]) {
           await fs.copyFile(
             fileURLToPath(
@@ -151,7 +164,7 @@ it.each([
         },
         plugins: {
           allow: ["chat-cli-account-fixture"],
-          ...(kind === "cron" ? { load: { paths: [packageRoot] } } : {}),
+          load: { paths: [packageRoot] },
           entries: {
             "chat-cli-account-fixture": { enabled: true, config: { fixtureKey: command } },
           },
@@ -165,6 +178,7 @@ it.each([
         },
       };
       await state.writeConfig(cfg);
+      await captureRuntimeConfigAsyncReader()();
       const agentDir = state.agentDir("main");
       saveAuthProfileStore(
         {
@@ -219,6 +233,7 @@ it.each([
       try {
         const api = builder.createApi(record, { config: cfg, registrationMode: "full" });
         let capturedAuthProfile: string | undefined;
+        const preparedCliBackends: string[] = [];
         const destination: CliBackendPlugin = {
           id: runtime,
           modelProvider: "google",
@@ -242,6 +257,7 @@ it.each([
           // Normal public preparation hook only observes selected credential identity.
           // The production auth selector/materializer still owns all credential decisions.
           prepareExecution: async (context) => {
+            preparedCliBackends.push(runtime);
             capturedAuthProfile = context.authProfileId;
             return {
               beforeExecution: async () => {
@@ -256,7 +272,7 @@ it.each([
         if (kind === "chat") {
           api.registerCliBackend(destination);
         }
-        if (kind === "cron") {
+        if (kind !== "chat") {
           const primary: CliBackendPlugin = {
             id: "claude-cli",
             modelProvider: "anthropic",
@@ -277,6 +293,7 @@ it.each([
               systemPromptWhen: "never",
             },
             prepareExecution: (context) => {
+              preparedCliBackends.push("claude-cli");
               expect(context.authProfileId).toBe(CONFIGURED_PROFILE);
               throw new FailoverError("Synthetic primary billing refusal", {
                 reason: "billing",
@@ -401,7 +418,7 @@ it.each([
           });
           const common: AgentFallbackCandidateCommonParams = {
             agentHarnessRuntimeOverride: undefined,
-            assistantErrorTranscript: createAssistantErrorTranscript({ runId, config: cfg }),
+            assistantErrorTranscript: createAssistantErrorTranscript(),
             modelRoutingProvenance: {
               requestedProvider: "anthropic",
               requestedModel: "primary-fixture",
@@ -465,7 +482,8 @@ it.each([
           const job: CronStoredJob = {
             id: "cron-cli-account-fixture",
             agentId: "main",
-            name: "Owned cron account fixture",
+            name:
+              kind === "cron-event" ? "Owned immediate event fixture" : "Owned scheduled fixture",
             enabled: true,
             createdAtMs: now,
             updatedAtMs: now,
@@ -483,13 +501,15 @@ it.each([
             cfg,
             deps: createDefaultDeps(),
             job,
+            // Trusted immediate hook/join callers select event explicitly; stored jobs stay cron.
+            trigger: kind === "cron-event" ? ("event" as const) : ("cron" as const),
             deliveryAttemptFence: null,
             message: payload.message,
             sessionKey,
             agentId: "main",
             lane: "test:cron-cli-account",
             abortSignal: cancel.signal,
-            admissionSource: "operator-schedule" as const,
+            admissionSource: kind === "scheduled-cron" ? ("operator-schedule" as const) : undefined,
             skillsSnapshot: { prompt: "", skills: [] },
           };
           const prepared = await prepareCronRunContext({
@@ -549,6 +569,7 @@ it.each([
                       ...ctx,
                       cfg,
                       job,
+                      trigger: input.trigger,
                       runId,
                       lane: input.lane,
                       deliveryAttemptFence: null,
@@ -566,8 +587,6 @@ it.each([
                       thinkingCatalog: ctx.thinkingSelection.catalog,
                       loadThinkingCatalog: ctx.thinkingSelection.loadThinkingCatalog,
                       persistRunContinuationSession: ctx.runContinuationSession?.sync,
-                      setRunContinuationCliExecutionProvider:
-                        ctx.runContinuationSession?.setCliExecutionProvider,
                     }),
                   ),
                 ),
@@ -587,6 +606,22 @@ it.each([
             (error: unknown) => ({ kind: "failed" as const, error }),
           ),
         ]);
+        if (kind === "scheduled-cron") {
+          expect(gate.kind, "scheduled account refusal must precede CLI preparation").toBe(
+            "failed",
+          );
+          if (gate.kind !== "failed") {
+            return;
+          }
+          expect(formatErrorMessage(gate.error)).toContain(
+            "Automation has no recorded inference account",
+          );
+          expect(hasRecordedModelFallbackStop(gate.error)).toBe(true);
+          expect(preparedCliBackends).toEqual([]);
+          expect(await readLaunches()).toHaveLength(0);
+          expect(cronWinner).toBeUndefined();
+          return;
+        }
         if (gate.kind === "failed") {
           throw gate.error;
         }
@@ -629,15 +664,7 @@ it.each([
           (value) => ({ ok: true as const, value }),
           (error: unknown) => ({ ok: false as const, error }),
         );
-        const launches = await fs.readFile(receipt, "utf8").then(
-          (value) => value.trim().split("\n").filter(Boolean),
-          (error: unknown) => {
-            if (hasErrnoCode(error, "ENOENT")) {
-              return [];
-            }
-            throw error;
-          },
-        );
+        const launches = await readLaunches();
         if (pin) {
           const refusal = outcome.ok
             ? outcome.value.meta.error?.message
@@ -654,8 +681,9 @@ it.each([
           }
           expect(outcome.ok, "unchanged control must reach real prepared CLI").toBe(true);
           expect(launches).toHaveLength(1);
-          if (kind === "cron") {
+          if (kind === "cron-event") {
             expect(cronWinner).toBe("google");
+            expect(preparedCliBackends).toEqual(["claude-cli", runtime]);
           }
           expect(capturedAuthProfile).toBe(CLI_PROFILE);
           if (outcome.ok) {

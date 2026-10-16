@@ -8,6 +8,7 @@ import {
 } from "../../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import * as sessionEntries from "../../config/sessions/session-accessor.sqlite-entry.js";
+import { memorySessionActorOwners } from "../../config/sessions/session-actor-memory-owner.js";
 import {
   runExclusiveSessionLifecycleMutation,
   startSessionWorkAdmissionInterruption,
@@ -16,8 +17,15 @@ import {
   closeOpenClawAgentDatabaseByPathAsync,
   closeOpenClawAgentDatabasesAsync,
   closeOpenClawAgentDatabasesForTest,
+  getOpenClawAgentDatabaseIfOpen,
+  resolveIncognitoOpenClawAgentSqlitePath,
 } from "../../state/openclaw-agent-db.js";
+import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import * as registry from "./reply-run-registry.js";
+import {
+  acquireReplyOperationSessionActor,
+  getReplyOperationSessionTarget,
+} from "./reply-run-registry.state.js";
 import { testing } from "./reply-run-registry.test-support.js";
 import { admitReplyTurn } from "./reply-turn-admission.js";
 
@@ -25,6 +33,7 @@ const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
   afterEach(async () => {
     testing.resetReplyRunRegistry();
     await closeOpenClawAgentDatabasesAsync();
+    memorySessionActorOwners.reset();
     vi.restoreAllMocks();
     cleanup();
   }),
@@ -53,6 +62,67 @@ function complete(result: Awaited<ReturnType<typeof admitReplyTurn>> | undefined
     result.operation.complete();
   }
 }
+
+it("keeps incognito admission and its actor with the existing memory owner", async ({ signal }) => {
+  await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+    const key = "agent:main:dashboard:incognito-reply-admission";
+    const storePath = resolveIncognitoOpenClawAgentSqlitePath({ agentId: "main", env: state.env });
+    const scope = { agentId: "main", storePath, sessionKey: key };
+    await sessionEntries.replaceSessionEntry(scope, { sessionId, updatedAt: 1, incognito: true });
+    const owner = memorySessionActorOwners.read({
+      agentId: "main",
+      path: storePath,
+    });
+    expect(owner).toBeDefined();
+    const result = await admit(storePath, { agentId: "main", sessionKey: key });
+    try {
+      if (result.status !== "owned" || !result.databaseClaim) {
+        throw new Error("Incognito admission must retain its memory claim");
+      }
+      const { operation, databaseClaim } = result;
+      expect(getReplyOperationSessionTarget(operation)).toMatchObject({
+        agentId: "main",
+        storePath,
+        readSource: {
+          agentId: "main",
+          path: storePath,
+          databaseIdentity: owner?.identity.incarnation,
+        },
+        target: { canonicalKey: key, storeKeys: [key] },
+      });
+      expect(databaseClaim).toMatchObject({
+        kind: "memory",
+        identity: owner?.identity.handle,
+        incarnation: owner?.identity.incarnation,
+      });
+      const actor = await acquireReplyOperationSessionActor(operation);
+      expect(actor?.target).toEqual({ database: owner?.identity, sessionKey: key });
+      expect(sessionEntries.loadSessionEntry(scope)).toMatchObject({
+        sessionId,
+        incognito: true,
+        updatedAt: 1,
+      });
+      expect(memorySessionActorOwners.read({ agentId: "main", path: storePath })).toBe(owner);
+      expect(getOpenClawAgentDatabaseIfOpen({ agentId: "main", path: storePath })).toBeUndefined();
+      expect(fs.existsSync(storePath)).toBe(false);
+      expect(databaseClaim.isCurrent()).toBe(true);
+      operation.complete();
+      expect(() => acquireReplyOperationSessionActor(operation)).toThrow();
+      expect(() => getReplyOperationSessionTarget(operation)).toThrow();
+      expect(
+        await withinTest(registry.waitForReplyRunSuccessorAdmission(key, null), signal),
+      ).toMatchObject({ settled: true });
+      expect(databaseClaim.isCurrent()).toBe(false);
+      expect(sessionEntries.loadSessionEntry(scope)).toMatchObject({ sessionId, updatedAt: 1 });
+      expect(memorySessionActorOwners.read({ agentId: "main", path: storePath })).toBe(owner);
+      expect(getOpenClawAgentDatabaseIfOpen({ agentId: "main", path: storePath })).toBeUndefined();
+      expect(fs.existsSync(storePath)).toBe(false);
+    } finally {
+      complete(result);
+      await registry.waitForReplyRunSuccessorAdmission(key, null);
+    }
+  });
+});
 
 it.each(["cancelled", "request-changed", "later-rebound-store"] as const)(
   "does not admit a delayed healthy rotation after %s",

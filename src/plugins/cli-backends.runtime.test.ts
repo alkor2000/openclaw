@@ -101,6 +101,7 @@ describe("runtime CLI backend consumers", () => {
       systemPrompt: "synthetic",
       useResume: false,
       timeoutMs: 1000,
+      assertCurrent: () => {},
       prepareExecutionAdmission: async () => {},
       requestToolPermission: async () => ({ behavior: "deny", message: "No fixture tools." }),
       requestUserInput: async () => ({ status: "cancelled", message: "No fixture input." }),

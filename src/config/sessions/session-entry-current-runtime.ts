@@ -1,19 +1,8 @@
-import {
-  assertExistingDatabaseIdentity,
-  readDatabasePathIdentitySync,
-} from "../../infra/sqlite-worker-identity.js";
-import { isIncognitoSessionKey, parseAgentSessionKey } from "../../routing/session-key.js";
-import { getOpenIncognitoAgentDatabase } from "../../state/openclaw-agent-db-lifecycle.js";
-import {
-  isIncognitoOpenClawAgentSqlitePath,
-  resolveIncognitoOpenClawAgentSqlitePath,
-} from "../../state/openclaw-agent-db.paths.js";
+import { recordModelFallbackStop } from "../../agents/model-fallback-stop.js";
+import { readDatabasePathIdentitySync } from "../../infra/sqlite-worker-identity.js";
+import { parseAgentSessionKey } from "../../routing/session-key.js";
 import { resolveCollapsedSessionAuthPinSource } from "./auth-profile-override-provenance.js";
-import {
-  readIncognitoSessionEntryCurrent,
-  readCommittedIncognitoSessionAuthProfile,
-  type IncognitoSessionAuthProfileFacts,
-} from "./session-accessor.sqlite-incognito-sharing.js";
+import { captureMemoryExactSessionReader } from "./session-accessor.memory-exact-read.js";
 import type { SessionEntryReadScope } from "./session-accessor.types.js";
 import { assertCanonicalSessionKeyWrite } from "./session-canonical-key.js";
 import type {
@@ -21,84 +10,24 @@ import type {
   SessionEntryCurrentSource,
 } from "./session-entry-current.types.js";
 import type { SessionEntryReadWorkerOwner } from "./session-entry-read-runtime.js";
-import {
-  captureIncognitoSessionBinding,
-  type IncognitoSessionBinding,
-} from "./session-incognito-binding.js";
 import { isSessionStoreReadCandidateCurrent } from "./session-store-read-candidates.js";
 import { withSessionHistoryWorkerDatabase } from "./session-transcript-worker-runtime.js";
 import { captureSessionTranscriptStorageEnvironment } from "./transcript-target-binding.js";
 import type { SessionEntry } from "./types.js";
 
-function captureIncognitoSessionEntryCurrentRead(
-  binding: IncognitoSessionBinding,
-  sessionKey: string,
-): Exclude<CapturedSessionEntryCurrentRead, { kind: "file" }> & {
-  readAuthProfileCurrent(): IncognitoSessionAuthProfileFacts | undefined;
-} {
-  const { actor, admissionSignal } = binding;
-  const claim = actor.sessions.captureCurrent(sessionKey);
-  const assertSourceCurrent = () => {
-    admissionSignal?.throwIfAborted();
-    actor.assertReadable();
-    claim.assertCurrent();
-  };
+/** Read live effect facts from the memory owner selected at acquisition. */
+export function captureNativeSessionEntryCurrentRead(
+  scope: SessionEntryReadScope,
+): Exclude<CapturedSessionEntryCurrentRead, { kind: "file" }> {
+  const memory = captureMemoryExactSessionReader(scope);
+  if (!memory) {
+    throw new Error("Session current facts require a memory owner");
+  }
   return {
-    kind: "incognito",
-    assertSourceCurrent,
+    kind: memory.source ? "incognito" : "missing",
+    assertSourceCurrent: () => memory.assertCurrent(),
     readCurrent() {
-      assertSourceCurrent();
-      return actor.sessions.readSharing(sessionKey)?.entry;
-    },
-    readAuthProfileCurrent() {
-      assertSourceCurrent();
-      return actor.sessions.readAuthProfile(sessionKey);
-    },
-  };
-}
-
-/** Process-held currency consumes its original writer's published facts, never a native query. */
-export function captureNativeSessionEntryCurrentRead(scope: SessionEntryReadScope): Exclude<
-  CapturedSessionEntryCurrentRead,
-  { kind: "file" }
-> & {
-  readAuthProfileCurrent(): IncognitoSessionAuthProfileFacts | undefined;
-} {
-  const sessionKey = scope.sessionKey;
-  const agentId = scope.agentId ?? parseAgentSessionKey(sessionKey)?.agentId;
-  assertCanonicalSessionKeyWrite(sessionKey, agentId);
-  if (!agentId) {
-    throw new Error("Session currency requires its original agent");
-  }
-  const binding = captureIncognitoSessionBinding(scope);
-  if (binding) {
-    return captureIncognitoSessionEntryCurrentRead(binding, sessionKey);
-  }
-  const env = captureSessionTranscriptStorageEnvironment(scope.env ?? process.env);
-  const storePath = isIncognitoSessionKey(sessionKey)
-    ? resolveIncognitoOpenClawAgentSqlitePath({ agentId, env })
-    : scope.storePath;
-  if (!storePath) {
-    throw new Error("Session currency requires its original incognito store");
-  }
-  const database = getOpenIncognitoAgentDatabase(agentId, storePath);
-  const assertSourceCurrent = () => {
-    if (getOpenIncognitoAgentDatabase(agentId, storePath) !== database) {
-      throw new Error("Session currency incognito owner changed");
-    }
-  };
-  return {
-    kind: database ? "native" : "missing",
-    assertSourceCurrent,
-    readCurrent() {
-      assertSourceCurrent();
-      return database ? readIncognitoSessionEntryCurrent(database.db, sessionKey) : undefined;
-    },
-    readAuthProfileCurrent() {
-      assertSourceCurrent();
-      return database
-        ? readCommittedIncognitoSessionAuthProfile(database.db, sessionKey)
-        : undefined;
+      return memory.read(scope.sessionKey, "list");
     },
   };
 }
@@ -112,20 +41,7 @@ export function captureSessionEntryCurrentRead(
   const sessionKey = scope.sessionKey;
   const agentId = scope.agentId ?? parseAgentSessionKey(sessionKey)?.agentId;
   assertCanonicalSessionKeyWrite(sessionKey, agentId);
-  if (owner.incognito) {
-    return captureIncognitoSessionEntryCurrentRead(owner.incognito, sessionKey);
-  }
   if (owner.kind === "incognito") {
-    return {
-      kind: "missing",
-      assertSourceCurrent: owner.assertCurrent,
-      readCurrent() {
-        owner.assertCurrent();
-        return undefined;
-      },
-    };
-  }
-  if (owner.kind === "native") {
     return captureNativeSessionEntryCurrentRead(scope);
   }
   if (owner.kind !== "file" || !owner.scope || !owner.selectedStore) {
@@ -171,20 +87,16 @@ export function captureSessionEntryCurrentRead(
     databaseBirthtime: identity.birthtime,
     sessionKey,
   });
-  const assertSourceCurrent = () => {
-    assertExistingDatabaseIdentity(source.path, identity.key, identity.birthtime);
-    assertLogicalSourceCurrent();
-  };
   const options = { agentId: source.agentId, path: source.path, env: readScope.env };
   return {
     kind: "file",
     source,
-    assertSourceCurrent,
+    assertSourceCurrent: assertLogicalSourceCurrent,
     async readCurrent() {
       const entry = await withSessionHistoryWorkerDatabase(options, (reader) =>
         reader.readEntryCurrent({ scope: readScope, source }),
       );
-      assertSourceCurrent();
+      assertLogicalSourceCurrent();
       return entry;
     },
   };
@@ -197,7 +109,7 @@ type RuntimeAuthProfileExecution = {
   authProfileId?: string;
   [runtimeAuthProfileExecution]?: {
     target: SessionEntryReadScope & { sessionId: string };
-    nativeRead?: ReturnType<typeof captureNativeSessionEntryCurrentRead>;
+    memoryRead?: ReturnType<typeof captureMemoryExactSessionReader>;
     lifecycleRevision: SessionEntry["lifecycleRevision"];
     pin: string | undefined;
     selectedProfileId: string | undefined;
@@ -236,22 +148,11 @@ export function bindRuntimeAuthProfileExecution<T extends RuntimeAuthProfileExec
   if (!target) {
     return params;
   }
-  const agentId = target.agentId ?? parseAgentSessionKey(target.sessionKey)?.agentId;
-  const nativeRead =
-    (target.storePath && agentId && getOpenIncognitoAgentDatabase(agentId, target.storePath)) ||
-    isIncognitoSessionKey(target.sessionKey) ||
-    (target.storePath &&
-      agentId &&
-      isIncognitoOpenClawAgentSqlitePath(target.storePath, {
-        agentId,
-        env: target.env,
-      }))
-      ? captureNativeSessionEntryCurrentRead(target)
-      : undefined;
+  const memoryRead = captureMemoryExactSessionReader(target);
   return Object.assign(params, {
     [runtimeAuthProfileExecution]: {
       target: { ...target },
-      nativeRead,
+      memoryRead,
       lifecycleRevision: entry?.lifecycleRevision,
       pin: sessionAccountPin(entry),
       selectedProfileId: selectedProfileId?.trim(),
@@ -270,24 +171,29 @@ export async function prepareRuntimeAuthProfileExecution(
     return;
   }
   assertCurrent();
-  const { readSessionEntryInWorker, withSessionEntryReadOnlyInWorker } =
-    await import("./session-entry-read-runtime.js");
-  assertCurrent();
-  const target = {
-    ...binding.target,
-    readConsistency: "latest" as const,
-    hydrateSkillPromptRefs: false,
-  };
-  const entry = binding.nativeRead
-    ? binding.nativeRead.readAuthProfileCurrent()
-    : binding.readMode === "read-only"
-      ? await withSessionEntryReadOnlyInWorker(target, assertCurrent, async (read) => {
-          if (!read.ok) {
-            throw read.error;
-          }
-          return read.value;
-        })
-      : await readSessionEntryInWorker(target, assertCurrent);
+  let entry: SessionEntry | undefined;
+  if (binding.memoryRead) {
+    binding.memoryRead.assertCurrent();
+    entry = binding.memoryRead.read(binding.target.sessionKey, "list");
+  } else {
+    const { readSessionEntryInWorker, withSessionEntryReadOnlyInWorker } =
+      await import("./session-entry-read-runtime.js");
+    assertCurrent();
+    const target = {
+      ...binding.target,
+      readConsistency: "latest" as const,
+      hydrateSkillPromptRefs: false,
+    };
+    entry =
+      binding.readMode === "read-only"
+        ? await withSessionEntryReadOnlyInWorker(target, assertCurrent, async (read) => {
+            if (!read.ok) {
+              throw read.error;
+            }
+            return read.value;
+          })
+        : await readSessionEntryInWorker(target, assertCurrent);
+  }
   assertCurrent();
   const pin = sessionAccountPin(entry);
   if (
@@ -303,8 +209,10 @@ export async function prepareRuntimeAuthProfileExecution(
     pin !== binding.pin &&
     (!pin || (pin !== params.authProfileId?.trim() && pin !== binding.selectedProfileId))
   ) {
-    throw new Error(
+    const refusal = new Error(
       "Session account pin changed during preparation; retry with the current account.",
     );
+    recordModelFallbackStop(refusal);
+    throw refusal;
   }
 }

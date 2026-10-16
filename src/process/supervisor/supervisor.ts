@@ -231,14 +231,6 @@ export function createProcessSupervisor(): ProcessSupervisor & {
       return settleConstructionResult(startingTerminationReason);
     }
 
-    if (input.prepareSpawn) {
-      await input.prepareSpawn();
-      if (owner.terminationReason) {
-        return settleConstructionResult(owner.terminationReason);
-      }
-      input.assertCurrent?.();
-    }
-
     // Finish fallible argument preparation before affecting a surviving scope or arming cancellation.
     if (input.mode !== "anchored-shell" && input.argv.length === 0) {
       throw new Error("spawn argv cannot be empty");
@@ -261,6 +253,12 @@ export function createProcessSupervisor(): ProcessSupervisor & {
     }
     if (owner.terminationReason) {
       return settleConstructionResult(owner.terminationReason);
+    }
+    if (input.prepareSpawn) {
+      await input.prepareSpawn();
+      if (owner.terminationReason) {
+        return settleConstructionResult(owner.terminationReason);
+      }
     }
     input.assertCurrent?.();
     input.beforeSpawn?.();
@@ -388,7 +386,6 @@ export function createProcessSupervisor(): ProcessSupervisor & {
       overallDeadline.reset();
       outputDeadline.reset();
       const construction = {
-        prepareSpawn: input.prepareSpawn,
         assertCurrent: input.assertCurrent,
         beforeSpawn: input.beforeSpawn,
         initiateSpawn: input.initiateSpawn,
@@ -417,6 +414,7 @@ export function createProcessSupervisor(): ProcessSupervisor & {
                 exactEnv: input.exactEnv,
                 windowsVerbatimArguments: input.windowsVerbatimArguments,
                 input: input.input,
+                prepareInput: input.prepareInput,
                 stdinMode: input.stdinMode,
                 secretInput: input.secretInput,
               });
@@ -635,7 +633,7 @@ export function createProcessSupervisor(): ProcessSupervisor & {
         startedAtMs,
         stdin: adapter.stdin,
         wait: () => waitPromise,
-        ...(adapter.waitForExtinction && { waitForExtinction: () => cleanup.promise }),
+        waitForExtinction: () => cleanup.promise,
         cancel: (reason = "manual-cancel") => {
           requestCancel(reason);
         },

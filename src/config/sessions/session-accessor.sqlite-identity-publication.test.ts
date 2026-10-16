@@ -1,5 +1,6 @@
-import { expect, it, vi } from "vitest";
+import { expect, it } from "vitest";
 import { observeHostDataSql } from "../../../test/helpers/sqlite-statement-execution-counter.js";
+import { isRecordedModelFallbackStop } from "../../agents/model-fallback-stop.js";
 import { createSessionRowProjection } from "../../gateway/session-row-projection.js";
 import {
   emitSessionIdentityMutation,
@@ -9,40 +10,131 @@ import {
 import { readOpenClawAgentDatabaseIdentity } from "../../state/openclaw-agent-db-identity.js";
 import {
   openOpenClawAgentDatabase,
-  closeOpenClawAgentDatabaseByPath,
   runOpenClawAgentWriteTransaction,
 } from "../../state/openclaw-agent-db.js";
 import { resolveIncognitoOpenClawAgentSqlitePath } from "../../state/openclaw-agent-db.paths.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
-import { resolveRestartRecoverySteeringBlockReason } from "./restart-recovery-receipt.js";
 import {
   readPreparedSessionEntryChange,
   readPreparedSessionSharingChange,
 } from "./session-accessor.sqlite-entry-cache-publication.js";
-import {
-  readCommittedSessionEntryCache,
-  readSessionEntryCache,
-} from "./session-accessor.sqlite-entry-cache.js";
+import { readSessionEntryCache } from "./session-accessor.sqlite-entry-cache.js";
+import { readCommittedSessionEntryCache } from "./session-accessor.sqlite-entry-cache.test-support.js";
 import {
   readExactSessionEntryRow,
   writeSessionEntry,
 } from "./session-accessor.sqlite-entry-store.js";
 import { replaceSessionEntrySync } from "./session-accessor.sqlite-entry.js";
 import { publishCommittedSessionIdentity } from "./session-accessor.sqlite-identity.js";
-import {
-  readCommittedIncognitoSessionSharing,
-  readIncognitoSessionSteeringEntry,
-} from "./session-accessor.sqlite-incognito-sharing.js";
 import { applySessionEntryExactReplacements } from "./session-accessor.sqlite-replacement-projection.js";
+import { memorySessionActorOwners } from "./session-actor-memory-owner.js";
 import { prepareSessionDeliveryGeneration } from "./session-delivery-generation.js";
 import {
-  captureSessionEntryCurrentRead,
   bindRuntimeAuthProfileExecution,
   prepareRuntimeAuthProfileExecution,
 } from "./session-entry-current-runtime.js";
-import { withSessionEntryReadOnlyInWorker } from "./session-entry-read-runtime.js";
-import { addSessionMember } from "./session-sharing-store.native.js";
 import type { InternalSessionEntry } from "./types.js";
+
+it.each(["user", "user-link"] as const)(
+  "reads the original memory owner's current %s account intent without SQLite",
+  async (source) => {
+    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+      const agentId = "main";
+      const storePath = resolveIncognitoOpenClawAgentSqlitePath({ agentId, env: state.env });
+      const options = { agentId, path: storePath };
+      const sessionKey = "agent:main:dashboard:incognito-account";
+      const scope = { agentId, storePath, sessionKey, env: state.env };
+      const original = {
+        sessionId: "memory-account-session",
+        lifecycleRevision: "11111111-1111-4111-8111-111111111111",
+        incognito: true,
+        updatedAt: 1,
+      } satisfies InternalSessionEntry;
+      const owner = memorySessionActorOwners.get(options);
+      const authority = { assertCurrent() {}, authorize() {} };
+      const actor = await owner.acquire(
+        { database: owner.identity, sessionKey },
+        { assertCurrent() {}, assertReadable() {} },
+      );
+      const storage = actor.storage;
+      if (!storage) {
+        throw new Error("Expected the memory actor storage owner");
+      }
+      try {
+        expect(
+          (
+            await storage.mutate(
+              { type: "session.entry.create", input: { entry: original } },
+              authority,
+            )
+          ).kind,
+        ).toBe("committed");
+        const target = { ...scope, sessionId: original.sessionId };
+        const execution = bindRuntimeAuthProfileExecution(
+          { sessionId: original.sessionId },
+          target,
+          original,
+        );
+        const sql = observeHostDataSql();
+        try {
+          await prepareRuntimeAuthProfileExecution(execution, () => {});
+          const pinned = {
+            ...original,
+            authProfileOverride: "anthropic:memory-account",
+            authProfileOverrideSource: source,
+          };
+          expect(
+            (
+              await storage.mutate(
+                {
+                  type: "session.entry.patch",
+                  input: { operation: { kind: "fields", patch: pinned } },
+                },
+                authority,
+              )
+            ).kind,
+          ).toBe("committed");
+          const refusal = await prepareRuntimeAuthProfileExecution(execution, () => {}).then(
+            () => undefined,
+            (error: unknown) => error,
+          );
+          expect(refusal).toMatchObject({ message: expect.stringMatching(/account pin/) });
+          expect(isRecordedModelFallbackStop(refusal)).toBe(true);
+          const selected = bindRuntimeAuthProfileExecution(
+            { sessionId: original.sessionId, authProfileId: pinned.authProfileOverride },
+            target,
+            pinned,
+            pinned.authProfileOverride,
+          );
+          await prepareRuntimeAuthProfileExecution(selected, () => {});
+          memorySessionActorOwners.closeDatabase(options);
+          const replacement = memorySessionActorOwners.get(options);
+          const replacementActor = await replacement.acquire(
+            { database: replacement.identity, sessionKey },
+            { assertCurrent() {}, assertReadable() {} },
+          );
+          try {
+            await replacementActor.storage!.mutate(
+              { type: "session.entry.create", input: { entry: pinned } },
+              authority,
+            );
+            await expect(prepareRuntimeAuthProfileExecution(selected, () => {})).rejects.toThrow(
+              "Incognito session actor owner is closed",
+            );
+          } finally {
+            await replacementActor.release();
+          }
+          expect(sql.queries).toEqual([]);
+        } finally {
+          sql.restore();
+        }
+      } finally {
+        await actor.release();
+        memorySessionActorOwners.closeDatabase(options);
+      }
+    });
+  },
+);
 
 it("fences a delivery generation during native writes and restores it only on rollback", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async () => {
@@ -325,221 +417,3 @@ it.each(["session ID", "lifecycle revision"] as const)(
     });
   },
 );
-
-it("uses incognito transaction postimages for currency and steering while delivery retains committed facts", async () => {
-  await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-    const agentId = "main";
-    const storePath = resolveIncognitoOpenClawAgentSqlitePath({ agentId, env: state.env });
-    const options = { agentId, path: storePath, env: state.env };
-    const scope = {
-      agentId,
-      storePath,
-      env: state.env,
-      sessionKey: "agent:main:subagent:incognito-currency",
-    };
-    const originalCurrency = {
-      sessionId: "incognito-currency-session",
-      lifecycleRevision: "incognito-currency-lifecycle",
-      lifecycleRunId: "original-run",
-      activeWriterRunId: "original-writer",
-      subagentRecovery: { lastRunId: "original-hidden-run" },
-    };
-    const original = {
-      ...originalCurrency,
-      incognito: true,
-      updatedAt: 1,
-      restartRecoveryDeliveryRunId: "original-run",
-      restartRecoveryDeliverySourceRunId: "original-source",
-      restartRecoveryTerminalRunIds: ["earlier-source"],
-    } satisfies InternalSessionEntry;
-    const database = openOpenClawAgentDatabase(options);
-    const readSteeringBlockReason = () => {
-      const sql = observeHostDataSql();
-      try {
-        const entry = readIncognitoSessionSteeringEntry(database.db, scope.sessionKey);
-        const reason = resolveRestartRecoverySteeringBlockReason(
-          entry,
-          original.sessionId,
-          "original-source",
-        );
-        expect(sql.queries).toEqual([]);
-        return reason;
-      } finally {
-        sql.restore();
-      }
-    };
-    runOpenClawAgentWriteTransaction(
-      (writer) => writeSessionEntry(writer, scope.sessionKey, original),
-      options,
-    );
-    const reader = await withSessionEntryReadOnlyInWorker(
-      scope,
-      () => {},
-      async (read, owner) => {
-        expect(read.ok).toBe(true);
-        return captureSessionEntryCurrentRead(scope, owner);
-      },
-    );
-    if (reader.source) {
-      throw new Error("Expected a process-held incognito currency reader");
-    }
-    const generation = await prepareSessionDeliveryGeneration({
-      agentId,
-      storePath,
-      sessionKey: scope.sessionKey,
-      sessionId: original.sessionId,
-      lifecycleRevision: original.lifecycleRevision,
-    });
-    const rollback = new Error("roll back incognito currency postimage");
-    try {
-      expect(reader.readCurrent()).toMatchObject(originalCurrency);
-      expect(readSteeringBlockReason()).toBeUndefined();
-      expect(() =>
-        runOpenClawAgentWriteTransaction((writer) => {
-          writeSessionEntry(writer, scope.sessionKey, {
-            ...original,
-            lifecycleRunId: "pending-run",
-            activeWriterRunId: "pending-writer",
-            subagentRecovery: { lastRunId: "pending-hidden-run" },
-            updatedAt: 2,
-            restartRecoveryDeliveryReceiptState: "terminal-pending",
-            restartRecoveryDeliveryToolCallId: "pending-tool",
-          });
-          // A later field publication must retain the staged entry's currency fields.
-          addSessionMember(scope, { identityId: "member", addedBy: "operator" });
-          expect(reader.readCurrent()).toMatchObject({
-            lifecycleRunId: "pending-run",
-            activeWriterRunId: "pending-writer",
-            subagentRecovery: { lastRunId: "pending-hidden-run" },
-          });
-          expect(readSteeringBlockReason()).toBe("terminal-pending");
-          expect(() => readCommittedIncognitoSessionSharing(writer.db, scope.sessionKey)).toThrow(
-            "publication is pending",
-          );
-          expect(generation.assertCurrent).toThrow(
-            expect.objectContaining({ code: "SESSION_DELIVERY_GENERATION_UNAVAILABLE" }),
-          );
-          throw rollback;
-        }, options),
-      ).toThrow(rollback);
-      expect(database.db.isTransaction).toBe(false);
-      expect(reader.readCurrent()).toMatchObject(originalCurrency);
-      expect(readSteeringBlockReason()).toBeUndefined();
-      generation.assertCurrent();
-      runOpenClawAgentWriteTransaction(
-        (writer) =>
-          writeSessionEntry(writer, scope.sessionKey, {
-            ...original,
-            lifecycleRunId: "committed-run",
-            subagentRecovery: { lastRunId: "committed-hidden-run" },
-            updatedAt: 3,
-            restartRecoveryDeliveryReceiptState: "delivered-terminal",
-            restartRecoveryDeliveryToolCallId: "committed-tool",
-          }),
-        options,
-      );
-      expect(reader.readCurrent()).toMatchObject({
-        lifecycleRunId: "committed-run",
-        subagentRecovery: { lastRunId: "committed-hidden-run" },
-      });
-      expect(readSteeringBlockReason()).toBe("delivered-terminal");
-      // Delivery owns session/lifecycle identity, not recovery's execution predicate.
-      generation.assertCurrent();
-    } finally {
-      generation.release();
-    }
-  });
-});
-
-it("keeps native account restrictions current without SQL and retains the original handle", async () => {
-  await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-    const agentId = "main";
-    const storePath = resolveIncognitoOpenClawAgentSqlitePath({ agentId, env: state.env });
-    const options = { agentId, path: storePath, env: state.env };
-    const scope = {
-      agentId,
-      storePath,
-      env: state.env,
-      sessionKey: "agent:main:subagent:incognito-account",
-    };
-    const original = {
-      sessionId: "native-account-session",
-      lifecycleRevision: "11111111-1111-4111-8111-111111111111",
-      updatedAt: 1,
-      incognito: true,
-    } satisfies InternalSessionEntry;
-    const database = openOpenClawAgentDatabase(options);
-    runOpenClawAgentWriteTransaction(
-      (writer) => writeSessionEntry(writer, scope.sessionKey, original),
-      options,
-    );
-    const target = { ...scope, sessionId: original.sessionId };
-    const execution = bindRuntimeAuthProfileExecution(
-      { sessionId: original.sessionId },
-      target,
-      original,
-    );
-    const reads = vi.spyOn(database.db, "prepare");
-    try {
-      await prepareRuntimeAuthProfileExecution(execution, () => {});
-      expect(reads).not.toHaveBeenCalled();
-    } finally {
-      reads.mockRestore();
-    }
-    const pinned = {
-      ...original,
-      authProfileOverride: "anthropic:native-account-fixture",
-      authProfileOverrideSource: "user-link" as const,
-      updatedAt: 2,
-    };
-    runOpenClawAgentWriteTransaction((writer) => {
-      addSessionMember(scope, { identityId: "member", addedBy: "operator" });
-      writeSessionEntry(writer, scope.sessionKey, pinned);
-    }, options);
-    expect(
-      readCommittedIncognitoSessionSharing(database.db, scope.sessionKey)?.membership.has("member"),
-    ).toBe(true);
-    const pinnedReads = vi.spyOn(database.db, "prepare");
-    try {
-      await expect(prepareRuntimeAuthProfileExecution(execution, () => {})).rejects.toThrow(
-        /account pin/,
-      );
-      expect(pinnedReads).not.toHaveBeenCalled();
-    } finally {
-      pinnedReads.mockRestore();
-    }
-    const current = bindRuntimeAuthProfileExecution(
-      { sessionId: original.sessionId, authProfileId: pinned.authProfileOverride },
-      target,
-      pinned,
-      pinned.authProfileOverride,
-    );
-    const rollback = new Error("rollback native account intent");
-    expect(() =>
-      runOpenClawAgentWriteTransaction((writer) => {
-        writeSessionEntry(writer, scope.sessionKey, {
-          ...pinned,
-          authProfileOverride: "anthropic:uncommitted-fixture",
-        });
-        throw rollback;
-      }, options),
-    ).toThrow(rollback);
-    await prepareRuntimeAuthProfileExecution(current, () => {});
-    // Capture before the first check: identical row labels must not adopt a new native owner.
-    const retained = bindRuntimeAuthProfileExecution(
-      { sessionId: original.sessionId, authProfileId: pinned.authProfileOverride },
-      target,
-      pinned,
-      pinned.authProfileOverride,
-    );
-    expect(closeOpenClawAgentDatabaseByPath(storePath, agentId)).toBe(true);
-    openOpenClawAgentDatabase(options);
-    runOpenClawAgentWriteTransaction(
-      (writer) => writeSessionEntry(writer, scope.sessionKey, pinned),
-      options,
-    );
-    await expect(prepareRuntimeAuthProfileExecution(retained, () => {})).rejects.toThrow(
-      /incognito owner changed/,
-    );
-  });
-});

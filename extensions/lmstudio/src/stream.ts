@@ -20,7 +20,6 @@ import {
   asPositiveSafeInteger,
   asRecord,
   filterStringEntries,
-  isRecord,
   uniqueStrings,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { racePromiseWithAbortSignal } from "openclaw/plugin-sdk/time-runtime";
@@ -30,7 +29,7 @@ import {
   prepareLmstudioModelForInference,
   type LmstudioPreparedModel,
 } from "./models.fetch.js";
-import { resolveLmstudioInferenceBase } from "./models.js";
+import { normalizeLmstudioModelKey, resolveLmstudioInferenceBase } from "./models.js";
 import { resolveLmstudioProviderHeaders, resolveLmstudioRuntimeApiKey } from "./runtime.js";
 
 const log = createSubsystemLogger("extensions/lmstudio/stream");
@@ -81,16 +80,8 @@ function recordPreloadFailure(
   return entry;
 }
 
-function normalizeLmstudioModelKey(modelId: string): string {
-  const trimmed = modelId.trim();
-  if (trimmed.toLowerCase().startsWith("lmstudio/")) {
-    return trimmed.slice("lmstudio/".length).trim();
-  }
-  return trimmed;
-}
-
 function withLmstudioUsageCompat(model: StreamModel): StreamModel {
-  const compat = model.compat && typeof model.compat === "object" ? model.compat : {};
+  const compat = model.compat ?? {};
   const unsupportedToolSchemaKeywords =
     "unsupportedToolSchemaKeywords" in compat
       ? filterStringEntries(compat.unsupportedToolSchemaKeywords)
@@ -119,10 +110,7 @@ async function prepareLmstudioInference(params: {
 }): Promise<LmstudioPreparedModel> {
   const providerConfig = params.ctx.config?.models?.providers?.[LMSTUDIO_PROVIDER_ID];
   const providerHeaders = { ...providerConfig?.headers, ...params.modelHeaders };
-  const runtimeApiKey =
-    typeof params.options?.apiKey === "string" && params.options.apiKey.trim().length > 0
-      ? params.options.apiKey.trim()
-      : undefined;
+  const runtimeApiKey = params.options?.apiKey?.trim() || undefined;
   const headers = await resolveLmstudioProviderHeaders({
     config: params.ctx.config,
     headers: providerHeaders,
@@ -171,10 +159,7 @@ export function wrapLmstudioInferencePreload(ctx: ProviderWrapStreamFnContext): 
     if (asRecord(providerConfig?.params).preload === false) {
       return streamWithThinkingLevel(withLmstudioUsageCompat(model), context, options);
     }
-    const providerBaseUrl = providerConfig?.baseUrl;
-    const resolvedBaseUrl = resolveLmstudioInferenceBase(
-      typeof model.baseUrl === "string" ? model.baseUrl : providerBaseUrl,
-    );
+    const resolvedBaseUrl = resolveLmstudioInferenceBase(model.baseUrl ?? providerConfig?.baseUrl);
     const requestedContextLength =
       asPositiveSafeInteger(model.contextTokens) ?? asPositiveSafeInteger(model.contextWindow);
     const preloadKey = `${resolvedBaseUrl}::${modelKey}::${requestedContextLength ?? "default"}`;
@@ -197,7 +182,7 @@ export function wrapLmstudioInferencePreload(ctx: ProviderWrapStreamFnContext): 
                 ) ?? finiteSecondsToTimerSafeMilliseconds(providerConfig?.timeoutSeconds),
               options,
               ctx,
-              modelHeaders: isRecord(model.headers) ? model.headers : undefined,
+              modelHeaders: model.headers,
             })
               .then(
                 (preparedModel) => {

@@ -23,7 +23,7 @@ import { readChannelContextAdmissionEvidence } from "../../channels/message-acce
 import { copyChildSessionPublication } from "../../channels/message-access/child-session-publication.js";
 import { getRuntimeConfig } from "../../config/config.js";
 import { bindConfiguredModelAuthProfileScope } from "../../config/sessions/auth-profile-override-provenance.js";
-import { conversationIdentityFromMsgContext } from "../../config/sessions/conversation-identity.js";
+import { conversationIdentityFromMsgContext } from "../../config/sessions/conversation-identity-inbound.js";
 import { resolveGroupSessionKey } from "../../config/sessions/group.js";
 import { sessionPersonalProfileId } from "../../config/sessions/session-entry-provenance.js";
 import { getGatewayLocalUserIngress } from "../../gateway/local-user-ingress.js";
@@ -396,11 +396,14 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
     deliveryCorrelations: opts?.queuedDeliveryCorrelations,
     turnAdoptionLifecycle: opts?.turnAdoptionLifecycle,
     runObservers: {
+      awaitSessionDiffBaseline: opts?.awaitSessionDiffBaseline,
       onAgentRunStart: opts?.onAgentRunStart,
+      onPreparedAgentRunStart: opts?.onPreparedAgentRunStart,
       onAgentRunTerminalOutcome: opts?.onAgentRunTerminalOutcome,
       onModelSelected: opts?.onModelSelected,
       prepareAssistantTranscriptMessage: opts?.prepareAssistantTranscriptMessage,
       resolveReplyDelivery: opts?.resolveReplyDelivery,
+      resolveReplyDeliveryFacts: opts?.resolveReplyDeliveryFacts,
       onDeliberateSilentTerminalReply: opts?.onDeliberateSilentTerminalReply,
     },
     ...(opts?.onFollowupQueueDisposition
@@ -504,6 +507,7 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
       authProfileIdSource,
       thinkingCatalog,
       thinkLevel: resolvedThinkLevel,
+      thinkingExplicit: params.thinkingExplicit,
       thinkLevelOverride,
       ...(() => {
         if (useFastReplyRuntime) {
@@ -517,7 +521,9 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
           sessionEntry: preparedSessionState.sessionEntry,
         });
         return {
-          fastMode: params.resolvedFastMode ?? fastModeState.mode,
+          fastMode: params.resolvedFastModeOverride
+            ? params.resolvedFastMode
+            : fastModeState.requestMode,
           fastModeAutoOnSeconds:
             params.resolvedFastModeAutoOnSeconds ?? fastModeState.fastAutoOnSeconds,
           ...(params.resolvedFastModeOverride ? { fastModeOverride: true } : {}),
@@ -643,7 +649,7 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
       shouldFollowup,
       hasQueuedFollowups,
       isActive,
-      isRunActive: () => {
+      isRunActive: async () => {
         const latestSessionState = resolvePreparedSessionState();
         const latestActiveSessionId =
           resolveActiveEmbeddedSessionId(latestSessionState.sessionFile) ??

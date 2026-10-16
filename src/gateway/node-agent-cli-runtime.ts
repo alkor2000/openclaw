@@ -12,7 +12,7 @@ import type { NodeInvokeResult } from "./node-registry.js";
 
 export async function invokeNodeClaudeCliRun(params: {
   assertCurrent?: () => void;
-  prepareDispatch?: () => Promise<void>;
+  assertReadable?: () => void | Promise<void>;
   nodeId: string;
   argv: string[];
   stdin: string;
@@ -66,6 +66,7 @@ export async function invokeNodeClaudeCliRun(params: {
     };
   }
   params.skillRuntime?.assertCurrent();
+  const assertReadable = params.assertReadable;
   const invocation: Parameters<typeof context.nodeRegistry.invoke>[0] = {
     nodeId: params.nodeId,
     expectedConnId: node.connId,
@@ -91,7 +92,13 @@ export async function invokeNodeClaudeCliRun(params: {
     idempotencyKey: randomUUID(),
     onProgress: params.onProgress,
     ...(params.signal ? { signal: params.signal } : {}),
-    ...(params.prepareDispatch ? { prepareDispatch: params.prepareDispatch } : {}),
+    authorizeDispatch: assertReadable
+      ? async () => {
+          await assertReadable();
+          params.assertCurrent?.();
+          return true;
+        }
+      : undefined,
     isDispatchAuthorized: () => {
       params.assertCurrent?.();
       return true;

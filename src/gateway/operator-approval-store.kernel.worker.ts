@@ -1,5 +1,3 @@
-// Approval creation and bounded query transactions, executed in workers.
-import type { DatabaseSync } from "node:sqlite";
 import { normalizeNullableString } from "@openclaw/normalization-core/string-coerce";
 import { normalizeUniqueTrimmedStringList } from "@openclaw/normalization-core/string-normalization";
 import { buildApprovalResolutionRef } from "../infra/approval-resolution-ref.js";
@@ -9,7 +7,10 @@ import {
   getNodeSqliteKysely,
   iterateSqliteQuerySync,
 } from "../infra/kysely-sync.js";
+// Approval creation and bounded query transactions, executed in workers.
+import type { EngineConnection } from "../infra/sql-connection.js";
 import { createSqliteSchemaEnsurer } from "../infra/sqlite-schema-ensure.js";
+import { runSqliteDeferredTransactionSync } from "../infra/sqlite-transaction.js";
 import type { OpenClawStateDatabaseOptions } from "../state/openclaw-state-db-contract.js";
 import { tableExists } from "../state/openclaw-state-db-schema-helpers.js";
 import { runOpenClawStateWriteTransaction } from "../state/openclaw-state-db.js";
@@ -253,7 +254,7 @@ type PendingApprovalInput = {
 
 export function readPendingOperatorApprovalsInDatabase(
   params: PendingApprovalInput,
-  db: DatabaseSync,
+  db: EngineConnection,
 ) {
   const nowMs = params.nowMs ?? Date.now();
   const stateDb = getNodeSqliteKysely<OperatorApprovalDatabase>(db);
@@ -307,7 +308,7 @@ export function readPendingOperatorApprovalsInDatabase(
   return { records, corrupt };
 }
 
-export function hasDueOperatorApprovalsInDatabase(nowMs: number, db: DatabaseSync): boolean {
+function hasDueOperatorApprovalsInDatabase(nowMs: number, db: EngineConnection): boolean {
   return (
     executeSqliteQueryTakeFirstSync(
       db,
@@ -319,6 +320,18 @@ export function hasDueOperatorApprovalsInDatabase(nowMs: number, db: DatabaseSyn
         .limit(1),
     ) !== undefined
   );
+}
+
+export function readOperatorApprovalReplayInDatabase(
+  params: PendingApprovalInput & { nowMs: number },
+  db: EngineConnection,
+) {
+  return runSqliteDeferredTransactionSync(db, () => {
+    if (hasDueOperatorApprovalsInDatabase(params.nowMs, db)) {
+      return { outcome: "expiry-required" as const };
+    }
+    return { outcome: "pending" as const, ...readPendingOperatorApprovalsInDatabase(params, db) };
+  });
 }
 
 export function listPendingOperatorApprovalsInDatabase(
@@ -340,7 +353,7 @@ export function listPendingOperatorApprovalsInDatabase(
 
 export function listTerminalOperatorApprovalsInDatabase(
   params: ListTerminalOperatorApprovalsInput,
-  db: DatabaseSync,
+  db: EngineConnection,
 ): ListTerminalOperatorApprovalsResult {
   const requestedLimit = Number.isSafeInteger(params.limit)
     ? (params.limit ?? OPERATOR_APPROVAL_HISTORY_DEFAULT_LIMIT)

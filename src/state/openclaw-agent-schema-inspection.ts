@@ -29,6 +29,7 @@ import { OPENCLAW_SQLITE_BUSY_TIMEOUT_MS } from "./openclaw-state-db-contract.js
 export type AgentSchemaInspectionInput = {
   pathname: string;
   agentId?: string;
+  env?: NodeJS.ProcessEnv;
   supportedVersion: number;
   verifyCurrentSchemaShape?: boolean;
   inspectOwnership?: boolean;
@@ -88,6 +89,9 @@ export function inspectAgentDatabaseSchema(
       } else {
         assertSqliteIntegrity(database, input.pathname);
         inspection.integrityGateOutcome = "healthy";
+      }
+      if (migrationPending && version === input.supportedVersion) {
+        inspection.preparationPending = true;
       }
       assertCanonicalAgentPersistenceVersion(database, input.pathname, version);
     }

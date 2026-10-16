@@ -7,6 +7,7 @@ import {
   executeSqliteQueryTakeFirstSync,
   prepareSqliteQueryTakeFirstSync,
 } from "../../infra/kysely-sync.js";
+import { isPostgresSqlConnection, type EngineConnection } from "../../infra/sql-connection.js";
 import {
   sqliteSessionIdWriteScope,
   withoutSqliteDatabaseWriteScope,
@@ -47,7 +48,7 @@ import {
   resolveDeliveryProvenCanonicalSessionKey,
 } from "./store-entry.js";
 
-const transcriptContextVersionQuery = createSqliteQueryCache((database) => {
+const transcriptContextVersionQuery = createSqliteQueryCache((database: EngineConnection) => {
   const db = getSessionKysely(database);
   return prepareSqliteQueryTakeFirstSync<
     string,
@@ -419,7 +420,7 @@ export function readNextTranscriptSeq(database: OpenClawAgentDatabase, sessionId
 }
 
 // Only compilation is retained; writer transactions must see their latest mutation fences.
-const transcriptMutationStateQuery = createSqliteQueryCache((database) => {
+const transcriptMutationStateQuery = createSqliteQueryCache((database: EngineConnection) => {
   const db = getSessionKysely(database);
   return prepareSqliteQueryTakeFirstSync<
     string,
@@ -490,7 +491,7 @@ export function advanceTranscriptMutationAtInTransaction(
       .set((eb) => {
         const nextUpdatedAt =
           options.strictly && !actor?.window
-            ? eb.fn<number>("max", [
+            ? eb.fn<number>(isPostgresSqlConnection(database.db) ? "greatest" : "max", [
                 eb.val(transcriptUpdatedAt),
                 eb(eb.fn.coalesce("transcript_updated_at", eb.val(-1)), "+", 1),
                 eb(eb.fn.coalesce("transcript_observed_at", eb.val(-1)), "+", 1),

@@ -2,6 +2,7 @@
 import type { BigIntStats } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { isMainThread } from "node:worker_threads";
 import { sameFileIdentity } from "@openclaw/fs-safe/advanced";
 import { isPathInside } from "@openclaw/fs-safe/path";
 import { walkDirectory } from "@openclaw/fs-safe/walk";
@@ -19,6 +20,7 @@ import { resolvePluginMetadataSnapshot } from "../plugins/plugin-metadata-snapsh
 import { normalizeAgentId } from "../routing/session-key.js";
 import { capturePostgresBackup, readBackupEngineImage } from "../snapshot/database-backup.js";
 import { listDefaultAgentDatabasePaths } from "../state/agent-database-path-discovery.js";
+import type { OpenClawRegisteredAgentDatabase } from "../state/openclaw-agent-db-contract.js";
 import { assertOpenClawAgentDatabaseOwner } from "../state/openclaw-agent-db-maintenance.js";
 import { readOpenClawAgentDatabaseRegistryRows } from "../state/openclaw-agent-db-registry.read.js";
 import { assertOpenClawStateDatabaseOwner } from "../state/openclaw-state-db-maintenance.js";
@@ -38,6 +40,7 @@ import {
   type BackupSqliteSourceGroup,
 } from "./backup-sqlite-source-groups.js";
 import { isTransientSqliteBackupPath } from "./backup-volatile-filter.js";
+import { resolveAgentPortRoots } from "./database-engine/agent-port.js";
 import { listDatabaseEngineStores } from "./database-engine/registry.js";
 import { hasErrnoCode } from "./errno.js";
 import { collectErrorGraphCandidates, formatErrorMessage } from "./errors.js";
@@ -128,6 +131,7 @@ export function classifyBackupSqliteSource(
 
 async function discoverBackupSqliteSources(params: {
   inventory: BackupResourceInventory;
+  resourceRoots?: readonly string[];
 }): Promise<{ snapshotPaths: string[]; discoveredSourcePaths: Set<string> }> {
   const snapshotPaths = new Set<string>();
   const discoveredSourcePaths = new Set<string>();
@@ -136,6 +140,11 @@ async function discoverBackupSqliteSources(params: {
 
   const isRetainedPath = (pathname: string) =>
     !isPathInside(gatewayLockDir, pathname) && !params.inventory.isVolatile(pathname);
+  const isSelectedPath = (pathname: string) =>
+    !params.resourceRoots ||
+    params.resourceRoots.some(
+      (root) => isPathInside(root, pathname) || isPathInside(pathname, root),
+    );
   for (const directory of [
     params.inventory.stateDir,
     ...params.inventory.agentRoots.map(({ sourcePath }) => sourcePath),
@@ -149,11 +158,13 @@ async function discoverBackupSqliteSources(params: {
       symlinks: "include",
       include: (entry) =>
         (entry.kind === "file" || entry.kind === "symlink") &&
+        isSelectedPath(entry.path) &&
         isRetainedPath(entry.path) &&
         classifyBackupSqliteSource(entry.path, params.inventory) === "sqlite",
       descend: (entry) => {
         if (
           visitedDirectories.has(entry.path) ||
+          !isSelectedPath(entry.path) ||
           !isRetainedPath(entry.path) ||
           !params.inventory.isTraversable(entry.path) ||
           params.inventory.isPackageContent(entry.path)
@@ -193,11 +204,22 @@ export async function discoverBackupDatabasePaths(params: {
   stateDir: string;
   config: OpenClawConfig;
   env?: NodeJS.ProcessEnv;
+  agentRegistry?: readonly OpenClawRegisteredAgentDatabase[];
 }): Promise<string[]> {
+  if (isMainThread && params.config.database?.engine === "postgres") {
+    const { preparePostgresBackupDiscovery } = await import("./backup-database-discovery.js");
+    return (await preparePostgresBackupDiscovery(params)).paths;
+  }
   const discovered = await collectStateDatabasePaths(params);
   const paths = [...discovered.values()].flatMap((database) => database.spellings);
+  paths.push(
+    ...(await resolveAgentPortRoots(
+      { ...params, env: params.env ?? process.env },
+      params.agentRegistry,
+    )),
+  );
   const plugins = resolvePluginMetadataSnapshot(params);
-  const capable = new Set(
+  const capable = new Set<string>(
     listDatabaseEngineStores()
       .filter((store) => store.postgres)
       .map((store) => store.id),
@@ -221,7 +243,15 @@ export async function discoverBackupDatabasePaths(params: {
     pluginRoots: plugins.plugins.map((plugin) => plugin.rootDir),
   });
   const inventory = sealBackupResourceInventory(resources, []);
-  paths.push(...(await discoverBackupSqliteSources({ inventory })).snapshotPaths);
+  // Core paths are already known; unrelated state cannot contribute plugin stores.
+  paths.push(
+    ...(
+      await discoverBackupSqliteSources({
+        inventory,
+        resourceRoots: resources.pluginResourceRoots,
+      })
+    ).snapshotPaths,
+  );
   const existing: string[] = [];
   for (const file of new Set(paths)) {
     const info = await fs.stat(file).catch(ignoreMissingSource);

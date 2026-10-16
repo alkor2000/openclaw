@@ -20,8 +20,10 @@ import { hasOperatorReadAccess } from "../app/operator-access.ts";
 import { getCanvasWidgetFrameConnectionGeneration } from "../lib/chat/canvas-widget-frame-generation.ts";
 import { formatUiError } from "../lib/format-error.ts";
 import { isAwaitingGatewayFailure, isGatewayAvailable } from "../lib/gateway-availability.ts";
+import { projectGateway } from "../lib/reactive/application.ts";
 import { useApplication } from "../lib/reactive/context.ts";
 import { t } from "../lib/reactive/i18n.ts";
+import { defineSolidBridge, type SolidBridgeElement } from "../lib/solid-bridge.ts";
 import { generateUUID } from "../lib/uuid.ts";
 import {
   WidgetSandboxHost,
@@ -29,7 +31,6 @@ import {
   WIDGET_LOAD_NOTICE_MS,
 } from "../lib/widget-sandbox-host.ts";
 import { registerWidgetThemeFrame, postWidgetTheme } from "../lib/widget-theme.ts";
-import { defineSolidBridge, type SolidBridgeElement } from "../lit/solid-bridge.ts";
 import { forwardChatWheelToTranscript } from "../pages/chat/chat-scroll-input.ts";
 import { allowWidgetPrompt, dispatchWidgetPrompt } from "./mcp-app-security.ts";
 import { resolveSandboxHostUrl } from "./sandbox-host.ts";
@@ -545,8 +546,8 @@ export const CanvasWidgetView = defineSolidBridge<CanvasWidgetViewProps>(
     host.style.display = "contents";
     host.style.minHeight = "";
     const context = useApplication();
+    const gateway = projectGateway(context.gateway);
     const [revision, setRevision] = createSignal(0, { ownedWrite: true });
-    const [gatewayRevision, setGatewayRevision] = createSignal(0, { ownedWrite: true });
     const controller = new CanvasWidgetController(host, host, context, () =>
       setRevision((n) => n + 1),
     );
@@ -570,7 +571,6 @@ export const CanvasWidgetView = defineSolidBridge<CanvasWidgetViewProps>(
       configurable: true,
       get: () => controller.documentHtml,
     });
-    const unsubscribe = context?.gateway.subscribe(() => setGatewayRevision((n) => n + 1));
     createRenderEffect(
       () => [
         props.docId,
@@ -578,7 +578,7 @@ export const CanvasWidgetView = defineSolidBridge<CanvasWidgetViewProps>(
         props.connectionGeneration,
         props.allowScripts,
         props.presentationActive,
-        gatewayRevision(),
+        gateway.read(),
       ],
       () => {
         controller.reconcile();
@@ -592,7 +592,6 @@ export const CanvasWidgetView = defineSolidBridge<CanvasWidgetViewProps>(
     onSettled(() => controller.connect());
     onCleanup(() => {
       Object.defineProperty(host, "allowScripts", scriptProperty);
-      unsubscribe?.();
       controller.dispose();
     });
     const retry = () => {

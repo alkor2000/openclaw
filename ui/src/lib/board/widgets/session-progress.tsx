@@ -1,20 +1,16 @@
 import type { BoardGetParams, ProgressCardGetParams } from "@openclaw/gateway-protocol";
 import { createEffect, createMemo, createSignal, Show } from "solid-js";
 import { SessionProgressCardController } from "../../../components/session-progress-card-controller.ts";
-import { renderSessionProgressCard } from "../../../components/session-progress-card.ts";
-import {
-  defineSolidBridge,
-  LitContent,
-  type SolidBridgeElement,
-} from "../../../lit/solid-bridge.ts";
-import { useSolidControllerHost } from "../../../lit/solid-controller-host.ts";
+import { SessionProgressCard } from "../../../components/session-progress-card-solid.tsx";
 import { useOptionalApplication } from "../../reactive/context.ts";
 import { t } from "../../reactive/i18n.ts";
 import { projectSource } from "../../reactive/projection.ts";
+import { useSolidControllerHost } from "../../reactive/solid-controller-host.ts";
 import { resolveSessionProgressCardTarget } from "../../session-progress-cards.ts";
 import { isSessionRunActive } from "../../session-run-state.ts";
 import { parseAgentSessionKey } from "../../sessions/session-key.ts";
 import { sessionProgressTargetQuery } from "../../sessions/session-requests.ts";
+import { defineSolidBridge, type SolidBridgeElement } from "../../solid-bridge.ts";
 import type { BoardWidget } from "../types.ts";
 
 type SessionProgressWidgetProps = {
@@ -144,18 +140,13 @@ function SessionProgressWidgetContent(
             }
           >
             {(card) => (
-              <LitContent
-                render={() =>
-                  renderSessionProgressCard(
-                    card(),
-                    "board",
-                    undefined,
-                    row()?.status,
-                    row()?.startedAt,
-                    row()?.endedAt,
-                    isSessionRunActive(row() ?? {}),
-                  )
-                }
+              <SessionProgressCard
+                card={card()}
+                placement="board"
+                sessionStatus={row()?.status}
+                startedAt={row()?.startedAt}
+                endedAt={row()?.endedAt}
+                hasActiveRun={isSessionRunActive(row() ?? {})}
               />
             )}
           </Show>

@@ -1,4 +1,6 @@
 import type { HeapSpaceInfo } from "node:v8";
+import type { GcSample } from "./gc-observer.js";
+import type { WorkerMessageMetric } from "./worker-message-metrics.js";
 import type { WorkerRequestKind } from "./worker-request-kind.js";
 
 export type DiagnosticRuntimeMeasurementFields =
@@ -12,8 +14,21 @@ export type DiagnosticRuntimeMeasurementFields =
       delayMaxMs: number;
     }
   | {
+      type: "gateway.main_thread.stall";
+      stalls: { task: string; durationMs: number }[];
+      dropped: number;
+    }
+  | {
       type: "diagnostic.gc";
       durationMs: number;
+      /** Optional for existing SDK event producers; native observers always supply attribution. */
+      kind?: GcSample["kind"];
+      /** Bounded Node GC callback flags; absent or unrecognized values become other. */
+      reason?: GcSample["reason"];
+      /** main or an allowlisted worker script basename (other for unknown scripts). */
+      thread?: string;
+      /** Reusable Code Mode isolate slot (1–64), owned until native worker exit. */
+      workerSlot?: number;
     };
 
 export type DiagnosticWorkerRequestFields = {
@@ -81,9 +96,13 @@ export type DiagnosticMemoryUsage = {
     script: string;
     heapUsed: number;
     heapTotal: number;
+    /** Node's finite native space set; absent for native-only fallback samples and Bun. */
+    heapSpaces?: Pick<HeapSpaceInfo, "space_name" | "space_used_size">[];
     /** Actual V8 isolate limit; unavailable on runtimes without V8. */
     heapSizeLimitBytes?: number;
     threadId?: number;
+    /** Same bounded slot as diagnostic.gc; absent for overflow and other scripts. */
+    workerSlot?: number;
     external?: number;
     /** Missing for native-only samplers; zero is a measured value. Included in external. */
     arrayBuffers?: number;
@@ -95,6 +114,8 @@ export type DiagnosticMemoryUsage = {
     started: number;
     retired: { reason: string; count: number }[];
   }[];
+  /** Main-thread transport totals; unknown payload sizes remain separate from known zero bytes. */
+  workerMessages?: WorkerMessageMetric[];
 };
 
 export const DIAGNOSTIC_MEMORY_PRESSURE_METRICS = [

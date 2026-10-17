@@ -5,7 +5,6 @@ import { Menu, type MenuHandle, type MenuItem } from "../../../components/solid/
 import { registerModelControlsEnglish } from "../../../i18n/locales/en-model-controls.ts";
 import { buildExternalLinkRel, EXTERNAL_LINK_TARGET } from "../../../lib/external-link.ts";
 import { registerEnglishCatalog, t } from "../../../lib/reactive/i18n.ts";
-import { closeOtherChatComposerPickers } from "./chat-picker-overlay.ts";
 
 registerEnglishCatalog(registerModelControlsEnglish);
 
@@ -86,7 +85,10 @@ export function ChatPermissionPicker(props: ChatPermissionPickerProps) {
         type: "radio",
         checked: selected,
         disabled: disabled() || locked,
-        class: `chat-controls__permission-option${selected ? " chat-controls__permission-option--selected" : ""}`,
+        class: [
+          "chat-controls__permission-option",
+          { "chat-controls__permission-option--selected": selected },
+        ],
         attributes: {
           "data-chat-permission-option": value,
           "data-chat-permission-shortcut": String(index + 1),
@@ -177,11 +179,6 @@ export function ChatPermissionPicker(props: ChatPermissionPickerProps) {
         menu = handle;
         handle.overlay.surface.addEventListener("keydown", keydown, true);
         handle.overlay.trigger?.addEventListener("keydown", keydown, true);
-      }}
-      onBeforeShow={() => {
-        if (menu?.overlay.trigger) {
-          closeOtherChatComposerPickers(menu.overlay.trigger);
-        }
       }}
       onSelect={(item) => {
         const mode = permissionSelection(item.id);

@@ -13,7 +13,7 @@ import {
   waitForConfirmDialogActions,
 } from "../../test-helpers/modal-dialog.ts";
 import { mountSolid } from "../../test-helpers/mount-solid.ts";
-import { flush } from "../../test-helpers/solid-settle.ts";
+import { flush, waitForSolid } from "../../test-helpers/solid-settle.ts";
 import {
   resolveChatPanePlacement,
   resolveChatPaneWorkerPresentation,
@@ -186,7 +186,15 @@ describe("chat pane worker stop", () => {
       expect(container.querySelector(".chat-pane__placement-chip")?.textContent?.trim()).toBe(
         copy.label,
       );
-      const stop = container.querySelector<HTMLElement>(".chat-pane__placement-reclaim");
+      container.querySelector<HTMLButtonElement>(".chat-pane__placement-chip")!.click();
+      await waitForSolid(() =>
+        expect(
+          container
+            .querySelector('.chat-pane__placement-menu > [role="menu"]')
+            ?.matches(":popover-open"),
+        ).toBe(true),
+      );
+      const stop = container.querySelector<HTMLButtonElement>(".chat-pane__placement-reclaim");
       expect(stop?.textContent?.trim()).toBe(copy.stopLabel);
       stop?.click();
       const actions = await waitForConfirmDialogActions();
@@ -523,19 +531,21 @@ describe("chat pane worker stop", () => {
       const pendingReclaim = dialogs.track(pane.changeHeaderPlacement(sessionA, "reclaim"));
       const actions = await waitForConfirmDialogActions();
       answerConfirmDialog(actions, "confirm");
-      await vi.waitFor(() => expect(pane.headerPlacementReclaimingKey).toBe(sessionA.key));
+      await vi.waitFor(() =>
+        expect(pane.headerPresentation.placementReclaimingKey).toBe(sessionA.key),
+      );
 
       state.sessionKey = sessionB.key;
       const placementA = resolveChatPanePlacement({
         gatewaySnapshot: pane.context.gateway.snapshot,
         movingKey: null,
-        reclaimingKey: pane.headerPlacementReclaimingKey,
+        reclaimingKey: pane.headerPresentation.placementReclaimingKey,
         row: sessionA,
       });
       const placementB = resolveChatPanePlacement({
         gatewaySnapshot: pane.context.gateway.snapshot,
         movingKey: null,
-        reclaimingKey: pane.headerPlacementReclaimingKey,
+        reclaimingKey: pane.headerPresentation.placementReclaimingKey,
         row: sessionB,
       });
       expect(placementA.reclaimDisabledReason).toBe(t("common.loading"));
@@ -544,7 +554,7 @@ describe("chat pane worker stop", () => {
       response.resolve({ ok: true });
       await pendingReclaim;
 
-      expect(pane.headerPlacementReclaimingKey).toBeNull();
+      expect(pane.headerPresentation.placementReclaimingKey).toBeNull();
     } finally {
       response.resolve({ ok: true });
     }

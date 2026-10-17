@@ -39,6 +39,7 @@ function renderControls(
     modelCatalog: models,
     modelCatalogState: { hasSnapshot: true, status: "ready" },
     modelSwitching: false,
+    modelPickerOpen: true,
     sending: false,
     sessionKey: "main",
     selectedSession: result.sessions[0],
@@ -50,6 +51,7 @@ function renderControls(
   if (update) {
     update(props);
   } else {
+    document.body.append(container);
     const [current, setCurrent] = createSignal(props);
     const view = mountSolid(() => createComponent(ChatModelControls, merge(current)), {
       container,
@@ -58,6 +60,7 @@ function renderControls(
     onTestFinished(() => {
       view.unmount();
       mountedControls.delete(container);
+      container.remove();
     });
   }
   flush();
@@ -295,6 +298,8 @@ describe("chat model runtime choices", () => {
       },
       "codex",
     );
+    container.querySelector<HTMLElement>(".chat-controls__effort-picker summary")!.click();
+    flush();
     expect(container.querySelector('[data-chat-thinking-option="high"]')).not.toBeNull();
     expect(container.querySelector('[data-chat-thinking-option="medium"]')).toBeNull();
   });

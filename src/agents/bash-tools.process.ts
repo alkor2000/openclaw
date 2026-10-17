@@ -1,8 +1,3 @@
-/**
- * Process-control tool factory.
- * Lists, polls, logs, writes to, sends keys to, pastes into, kills, clears,
- * and removes background exec sessions.
- */
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import type { Static } from "typebox";
 import { getAgentToolExecutionContext } from "../../packages/agent-core/src/tool-execution-context.js";
@@ -50,9 +45,8 @@ import type { AgentToolResult } from "./runtime/index.js";
 import { attachInternalToolResultAcknowledgement } from "./runtime/internal-hooks.js";
 import { PROCESS_TOOL_DISPLAY_SUMMARY } from "./tool-description-presets.js";
 import { ToolInputError, type AgentToolWithMeta } from "./tools/common.js";
-import { textResult } from "./tools/tool-results.js";
+import { failText, textResult } from "./tools/tool-results.js";
 
-/** Defaults injected by tests, agent scopes, and scoped process registries. */
 export type ProcessToolDefaults = {
   hasCronTool?: boolean;
   inputWaitIdleMs?: number;
@@ -131,10 +125,6 @@ function resolvePollWaitMs(value: unknown) {
     }
   }
   return 0;
-}
-
-function failText(text: string): AgentToolResult<unknown> {
-  return textResult(text, { status: "failed", error: text });
 }
 
 function recordPollRetrySuggestion(sessionId: string, hasNewOutput: boolean): number | undefined {
@@ -253,7 +243,6 @@ function assertSupportedProcessParams(args: unknown): void {
   }
 }
 
-/** Build the process-control tool with optional scope and input-idle defaults. */
 export function createProcessTool(
   defaults?: ProcessToolDefaults,
 ): AgentToolWithMeta<typeof processSchema, unknown> {
@@ -435,16 +424,21 @@ export function createProcessTool(
             if (signal?.aborted) {
               throw createAbortError(signal.reason);
             }
-            const deadline = Date.now() + pollWaitMs;
+            // The wait budget is elapsed time, so a wall-clock step cannot end it early
+            // or stretch it past the requested timeout.
+            const deadline = performance.now() + pollWaitMs;
             // Interactive children cannot progress until their pending prompt reaches the model.
             while (
               !scopedSession.exited &&
               !hasPendingPollDelivery(scopedSession) &&
               scopedSession.pendingOutput.length === 0 &&
               !scopedSession.pendingOutputDropped &&
-              Date.now() < deadline
+              performance.now() < deadline
             ) {
-              await sleepPollInterval(Math.max(0, Math.min(250, deadline - Date.now())), signal);
+              await sleepPollInterval(
+                Math.max(0, Math.min(250, deadline - performance.now())),
+                signal,
+              );
             }
           }
           return await runWithAgentToolSourceExecutionScope(assertSourceCurrent, async () => {
@@ -599,6 +593,7 @@ export function createProcessTool(
                   `Unable to ${removing ? "remove" : "terminate"} session ${sessionId}: no active supervisor cancellation handle. Use process poll to check whether it is already exiting.`,
                 );
               }
+              await scopedSession.clearExitNotification?.();
               if (removing) {
                 // Hide the record now; the supervisor still owns process settlement.
                 scopedSession.backgrounded = false;
@@ -617,6 +612,7 @@ export function createProcessTool(
             }
             if (scopedFinished) {
               resetPollRetrySuggestion(sessionId);
+              await scopedFinished.clearExitNotification?.();
               deleteSession(sessionId);
               return textResult(
                 `${params.action === "clear" ? "Cleared" : "Removed"} session ${sessionId}.`,
@@ -635,5 +631,4 @@ export function createProcessTool(
   };
 }
 
-/** Shared process-control tool instance used by the default Bash tool barrel. */
 export const processTool = createProcessTool();

@@ -2,7 +2,7 @@
 // caching behavior, delivery context, and policy filtering.
 
 import { expectDefined } from "@openclaw/normalization-core";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { ErrorCodes } from "../../../packages/gateway-protocol/src/index.js";
 import type { McpToolCatalog } from "../../agents/agent-bundle-mcp-types.js";
 import { makeProviderModelFixture } from "../../agents/test-helpers/provider-model-fixture.js";
@@ -13,6 +13,7 @@ import { resolveIncognitoOpenClawAgentSqlitePath } from "../../state/openclaw-ag
 import { toolsEffectiveHandlers, testing } from "./tools-effective.js";
 
 type InventoryModule = typeof import("../../agents/tools-effective-inventory.js");
+type SessionLookup = typeof import("../session-utils.js").loadGatewaySessionEntryReadOnlyAsync;
 type SessionMcpRuntimeView = Pick<
   NonNullable<
     ReturnType<typeof import("../../agents/agent-bundle-mcp-tools.js").peekSessionMcpRuntime>
@@ -64,33 +65,33 @@ const runtimeMocks = vi.hoisted(() => ({
   resolveRuntimeConfigCacheKey: vi.fn(() => "runtime:1:test"),
   resolveAgentDir: vi.fn(() => "/tmp/agents/main/agent"),
   getRuntimeConfig: vi.fn(() => ({})),
-  loadSessionEntry: vi.fn<typeof import("../session-utils.js").loadGatewaySessionEntryReadOnly>(
-    () => ({
-      cfg: {},
-      agentId: "main",
-      storePath: "/tmp/sessions.json",
-      store: {},
-      canonicalKey: "main:abc",
-      entry: {
-        sessionId: "session-1",
-        updatedAt: 1,
-        lastChannel: "telegram",
-        lastAccountId: "acct-1",
-        lastThreadId: "thread-2",
-        lastTo: "channel-1",
-        groupId: "group-4",
-        groupChannel: "#ops",
-        space: "workspace-5",
-        chatType: "group",
-        modelProvider: "openai",
-        model: "gpt-4.1",
-        spawnedBy: "agent:main:telegram:group:parent-group",
-        spawnedWorkspaceDir: undefined as string | undefined,
-      },
-      storeKeys: ["main:abc"],
-      legacyKey: undefined,
-    }),
-  ),
+  loadSessionEntry: vi.fn<
+    (...args: Parameters<SessionLookup>) => Awaited<ReturnType<SessionLookup>>
+  >(() => ({
+    cfg: {},
+    agentId: "main",
+    storePath: "/tmp/sessions.json",
+    store: {},
+    canonicalKey: "main:abc",
+    entry: {
+      sessionId: "session-1",
+      updatedAt: 1,
+      lastChannel: "telegram",
+      lastAccountId: "acct-1",
+      lastThreadId: "thread-2",
+      lastTo: "channel-1",
+      groupId: "group-4",
+      groupChannel: "#ops",
+      space: "workspace-5",
+      chatType: "group",
+      modelProvider: "openai",
+      model: "gpt-4.1",
+      spawnedBy: "agent:main:telegram:group:parent-group",
+      spawnedWorkspaceDir: undefined as string | undefined,
+    },
+    storeKeys: ["main:abc"],
+    legacyKey: undefined,
+  })),
   peekSessionMcpRuntime: vi.fn<() => SessionMcpRuntimeView | undefined>(() => undefined),
   resolveSessionMcpConfigSummary: vi.fn(() => ({
     fingerprint: "mcp:1:test",
@@ -174,7 +175,11 @@ vi.mock("../session-utils-store-worker.js", () => ({
     >[0],
   ) => runtimeMocks.loadSessionEntry(params.key, { agentId: params.agentId }),
 }));
-vi.mock("../node-plugin-tool-snapshot.js", () => nodePluginToolSnapshotMocks);
+vi.mock("../node-plugin-tool-snapshot.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../node-plugin-tool-snapshot.js")>()),
+  getConnectedNodePluginToolsVersion:
+    nodePluginToolSnapshotMocks.getConnectedNodePluginToolsVersion,
+}));
 
 const { applyFinalEffectiveToolPolicy } = await vi.importActual<
   typeof import("../../agents/embedded-agent-runner/effective-tool-policy.js")
@@ -360,7 +365,6 @@ describe("tools.effective handler", () => {
       mock.mockReset();
     }
     testing.resetToolsEffectiveCacheForTest();
-    testing.setToolsEffectiveNowForTest();
     nodePluginToolSnapshotMocks.version = 1;
     runtimeMocks.resolveAgentWorkspaceDir.mockReturnValue("/tmp/workspace-main");
     runtimeMocks.resolveAgentDir.mockReturnValue("/tmp/agents/main/agent");
@@ -506,6 +510,35 @@ describe("tools.effective handler", () => {
     expect(resolveEffectiveToolInventoryArg(1)?.workspaceDir).toBe("/tmp/workspace-sandbox");
   });
 
+  it("updates returned web_search availability when only the saved override changes", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    onTestFinished(() => clock.mockRestore());
+    const { resolveEffectiveToolInventory } = await vi.importActual<InventoryModule>(
+      "../../agents/tools-effective-inventory.js",
+    );
+    runtimeMocks.resolveEffectiveToolInventory.mockImplementation(resolveEffectiveToolInventory);
+    const cfg: OpenClawConfig = {
+      tools: { web: { search: { enabled: true, provider: "brave" } } },
+    };
+    const loaded = runtimeMocks.loadSessionEntry("main:abc");
+    const entry = expectDefined(loaded.entry, "session fixture");
+
+    // Keep all other cache inputs and time fixed across both override transitions.
+    for (const webSearch of [undefined, false, true, undefined]) {
+      runtimeMocks.loadSessionEntry.mockReturnValueOnce({
+        ...loaded,
+        cfg,
+        entry: { ...entry, toolOverrides: { webSearch } },
+      });
+      const { respond, invoke } = createInvokeParams({ sessionKey: "main:abc" }, cfg);
+      await invoke();
+      expectResponsesOk(respond);
+      const payload = firstRespondCall(respond)?.[1] as ToolsEffectivePayload;
+      const toolIds = payload.groups?.flatMap((group) => group.tools?.map((tool) => tool.id) ?? []);
+      expect(toolIds?.includes("web_search")).toBe(webSearch !== false);
+    }
+  });
+
   it("coalesces identical base inventory cache misses while inventory resolution is pending", async () => {
     const first = createInvokeParams({ sessionKey: "main:abc" });
     const second = createInvokeParams({ sessionKey: "main:abc" });
@@ -518,7 +551,8 @@ describe("tools.effective handler", () => {
 
   it("returns stale cached base inventory immediately while refreshing in the background", async () => {
     let now = 1_000;
-    testing.setToolsEffectiveNowForTest(() => now);
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    onTestFinished(() => clock.mockRestore());
     const stalePayload = makeCoreInventory({
       id: "read",
       label: "Read",

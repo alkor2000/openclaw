@@ -14,12 +14,12 @@ import {
   type WorkspaceInspectionResult,
 } from "../../worker/workspace-inspection-protocol.js";
 import { captureSessionMutationRouting } from "../session-sharing-preparation.js";
-import type { loadGatewaySessionEntryReadOnly } from "../session-utils.js";
+import type { GatewaySessionEntryRead } from "../session-utils.js";
 import type { WorkerSessionPlacementStore } from "../worker-environments/placement-store.js";
 import { readSessionWorkerPlacementAsync } from "../worker-environments/session-placement-lifecycle.js";
 import type { GatewayRequestContext } from "./types.js";
 
-type LoadedSession = ReturnType<typeof loadGatewaySessionEntryReadOnly>;
+type LoadedSession = GatewaySessionEntryRead;
 type Operation = WorkspaceInspectionInput["operation"];
 
 /** Repository identity never resolves through the Gateway's local workspace defaults. */
@@ -165,6 +165,7 @@ export async function resolveRepositoryWorkspaceAccess(
     };
     return {
       kind: "active" as const,
+      assertCurrent: () => assertCurrent(repository.revision),
       repository,
       [Symbol.dispose]: release,
       async inspect<T extends Operation>(

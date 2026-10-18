@@ -17,7 +17,7 @@ type WorkerAdmissionBoundaryResult =
   | { ok: true; identity: WorkerConnectionIdentity }
   | { ok: false; reason: WorkerProtocolCloseReason | "rate-limited" | "claim-rejected" };
 
-/** Serialize public credential checks without charging server outages. */
+/** Serialize public credential checks and charge only failed admission attempts. */
 export async function runWorkerAdmissionBoundary(params: {
   service: WorkerAdmissionService | undefined;
   admission: WorkerConnectParams["admission"];
@@ -25,6 +25,13 @@ export async function runWorkerAdmissionBoundary(params: {
   claim(identity: WorkerConnectionIdentity): boolean;
 }): Promise<WorkerAdmissionBoundaryResult> {
   const { clientIp, rateLimiter } = params.publicAdmission;
+  // Admission checks the credential before environment state, so an unavailable environment
+  // (Gateway starting, worker service absent, teardown) is a server-side outage, not a bad credential.
+  const chargeFailure = (reason: WorkerProtocolCloseReason) => {
+    if (reason !== "environment-unavailable") {
+      rateLimiter?.recordFailure(clientIp, AUTH_RATE_LIMIT_SCOPE_WORKER_ADMISSION);
+    }
+  };
   const run = async (): Promise<WorkerAdmissionBoundaryResult> => {
     const rateCheck = rateLimiter?.check(clientIp, AUTH_RATE_LIMIT_SCOPE_WORKER_ADMISSION);
     if (rateCheck && !rateCheck.allowed) {
@@ -34,16 +41,12 @@ export async function runWorkerAdmissionBoundary(params: {
       (await params.service?.admitWorker(params.admission)) ??
       ({ ok: false, reason: "environment-unavailable" } as const);
     if (!admission.ok) {
-      if (admission.reason !== "environment-unavailable") {
-        rateLimiter?.recordFailure(clientIp, AUTH_RATE_LIMIT_SCOPE_WORKER_ADMISSION);
-      }
+      chargeFailure(admission.reason);
       return admission;
     }
     const ownershipFailure = params.service?.validateWorkerConnection(admission.identity);
     if (ownershipFailure) {
-      if (ownershipFailure !== "environment-unavailable") {
-        rateLimiter?.recordFailure(clientIp, AUTH_RATE_LIMIT_SCOPE_WORKER_ADMISSION);
-      }
+      chargeFailure(ownershipFailure);
       return { ok: false, reason: ownershipFailure };
     }
     if (!params.claim(admission.identity)) {

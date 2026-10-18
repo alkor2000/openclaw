@@ -77,6 +77,13 @@ export function createPluginApiFactory(
       capturePluginLifecycleAuthority(getPluginRecordRegistry(registry, record), record, {
         registration: true,
       })?.() === true;
+    // Run-local scratch state bridges admitted hooks and services without
+    // granting a scoped registration process-global workflow side effects.
+    const shouldAccessRunContext = () =>
+      capturePluginLifecycleAuthority(getPluginRecordRegistry(registry, record), record, {
+        registration: true,
+        admittedRuntime: true,
+      })?.() === true;
     const boundRegistrars = Object.fromEntries(
       Object.entries(registrars).map(([name, register]) => [
         name,
@@ -195,6 +202,7 @@ export function createPluginApiFactory(
                   // SAFETY: The host helper reads the SDK's readonly view of the same config data.
                   cfg: registryParams.runtime.config.current() as OpenClawConfig,
                   pluginId: record.id,
+                  pluginName: record.name,
                   input,
                   assertCurrent,
                 });
@@ -214,20 +222,15 @@ export function createPluginApiFactory(
                 });
               },
               setRunContext: (patch) =>
-                registryParams.activateGlobalSideEffects !== false &&
-                shouldCommitWorkflowSideEffect()
+                shouldAccessRunContext()
                   ? setPluginRunContext({ pluginId: record.id, patch })
                   : false,
               getRunContext: (get) =>
-                registryParams.activateGlobalSideEffects !== false &&
-                shouldCommitWorkflowSideEffect()
+                shouldAccessRunContext()
                   ? getPluginRunContext({ pluginId: record.id, get })
                   : undefined,
               clearRunContext: (paramsLocal) => {
-                if (
-                  registryParams.activateGlobalSideEffects === false ||
-                  !shouldCommitWorkflowSideEffect()
-                ) {
+                if (!shouldAccessRunContext()) {
                   return;
                 }
                 clearPluginRunContext({

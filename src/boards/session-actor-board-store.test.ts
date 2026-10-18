@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SessionActorAuthority } from "../config/sessions/session-actor-contract.js";
 import { memorySessionActorOwners } from "../config/sessions/session-actor-memory-owner.js";
-import { acquireSessionActorStorage } from "../config/sessions/session-actor-storage-binding.js";
+import { failSessionActorMemoryPublication } from "../config/sessions/session-actor-memory-publication.test-support.js";
+import {
+  acquireSessionActorStorage,
+  runWithSessionActorStorage,
+} from "../config/sessions/session-actor-storage-binding.js";
 import { resolveIncognitoOpenClawAgentSqlitePath } from "../state/openclaw-agent-db.paths.js";
 import { BoardValidationError } from "./board-layout.js";
 import { SqliteBoardStore } from "./sqlite-board-store.js";
@@ -71,6 +75,44 @@ const app = (serverName = "server") => ({
 });
 
 describe("session actor BoardStore", () => {
+  it("inherits the selected memory owner's custom state root after async preparation", () =>
+    withStore(async () => {
+      const binding = (await acquireSessionActorStorage(
+        { agentId: "main", storePath, sessionKey, env },
+        { authority, lifetime: { assertCurrent() {}, assertReadable() {} } },
+      ))!;
+      try {
+        await runWithSessionActorStorage(binding, async () => {
+          const store = new SqliteBoardStore({
+            resolveSession: async () => ({ agentId: "main", sessionKey }),
+          });
+          await store.putWidget(html("inherited"));
+          expect(await store.getSnapshot(target)).toMatchObject({
+            revision: 1,
+            widgets: [{ name: "inherited" }],
+          });
+        });
+      } finally {
+        await binding.actor.release();
+      }
+    }));
+
+  it("reports publication failure after retaining the committed widget", () =>
+    withStore(async (store) => {
+      const stop = failSessionActorMemoryPublication(sessionKey);
+      try {
+        await expect(store.putWidget(html("saved"))).rejects.toMatchObject({
+          name: "SessionActorStorageCommittedError",
+        });
+      } finally {
+        stop();
+      }
+      expect(await store.getSnapshot(target)).toMatchObject({
+        revision: 1,
+        widgets: [{ name: "saved" }],
+      });
+    }));
+
   it("reads absent sessions without creating them and rejects writes", async () => {
     const store = storeForSession();
     expect(await store.getSnapshot(target)).toEqual({

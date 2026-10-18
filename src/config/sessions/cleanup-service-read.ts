@@ -66,6 +66,7 @@ export function withSessionCleanupStore<T>(
         read: async (fixMissing = false) => {
           assertCurrent();
           const snapshot = await reader.readCleanup({
+            target,
             env: database.env,
             expectedIdentity: identity && { ...identity, canonicalPath: database.path },
             continuation,
@@ -92,13 +93,14 @@ export function withSessionCleanupStore<T>(
         if (captured.key.startsWith("file:")) {
           if (
             !original ||
-            original.key !== captured.key ||
-            original.birthtime !== captured.birthtime
+            (original.key.startsWith("file:") &&
+              (original.key !== captured.key || original.birthtime !== captured.birthtime))
           ) {
             throw new Error("Session cleanup changed its physical owner during discovery");
           }
-          assertExistingDatabaseIdentity(database.path, original.key, original.birthtime);
-          identity = original;
+          // An absent path binds its first file when the read is admitted.
+          assertExistingDatabaseIdentity(database.path, captured.key, captured.birthtime);
+          identity = captured;
         }
       },
     },
@@ -155,7 +157,7 @@ async function withMemorySessionCleanupStore<T>(
           }
         }
       }
-      return { kind: "session-cleanup", store, missing };
+      return { kind: "session-cleanup", store, missing, retainedArtifactPaths: [] };
     },
   });
 }

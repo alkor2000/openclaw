@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { GatewayClientRequestError } from "../../../packages/gateway-client/src/index.js";
 import { isExecutionIdentityCollectionEnabled } from "../../audit/audit-config.js";
-import { sanitizePendingFinalDeliveryText } from "../../auto-reply/reply/pending-final-delivery-state.js";
+import { stripInternalMetadataForDisplay } from "../../auto-reply/reply/display-text-sanitize.js";
 import type { InternalSessionEntry as SessionEntry } from "../../config/sessions.js";
 import { applySessionEntryReplacements } from "../../config/sessions/session-accessor.js";
 import { retainPreparedSessionEntryPredicate } from "../../config/sessions/session-accessor.sqlite-entry-cache-publication-state.js";
@@ -15,7 +15,6 @@ import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { GatewayRecoveryRuntime } from "../../gateway/server-instance-runtime.types.js";
 import type { AgentRunRequest } from "../../gateway/server-methods/agent-request-types.js";
 import { getAgentEventLifecycleGeneration } from "../../infra/agent-events.js";
-import { CommandLane } from "../../process/lanes.js";
 import { MAIN_SESSION_RESTART_RECOVERY_SOURCE_TOOL } from "../../sessions/input-provenance.js";
 import { formatSystemTurnPrompt } from "../../sessions/system-turn-prompt.js";
 import { getOwedHarnessCompletionTask } from "../agent-harness-completion-recovery.js";
@@ -31,16 +30,11 @@ import {
   runWithMainSessionRecoveryAdmission,
   type MainSessionRecoveryAdmission,
 } from "./main-session-recovery-admission.js";
-import {
-  repairMainSessionRecoveryMutation,
-  retryMainSessionRecoveryMutation,
-  scheduleMainSessionRecoveryMutation,
-} from "./main-session-recovery-lifecycle.js";
+import { repairMainSessionRecoveryMutation } from "./main-session-recovery-lifecycle.js";
 import { scheduleMainSessionRecoveryPendingTarget } from "./main-session-recovery-owner-release.js";
-import {
-  isMainSessionRecoveryPending,
-  type MainSessionRecoveryObservation,
-  type MainSessionRecoveryReservation,
+import type {
+  MainSessionRecoveryObservation,
+  MainSessionRecoveryReservation,
 } from "./main-session-recovery-state.js";
 import {
   commitMainSessionRecovery,
@@ -81,13 +75,12 @@ function buildResumeMessage(
   forceRestartSafeTools?: boolean,
   childRecoveryRoster?: string,
 ): string {
-  const sanitizedPendingText = sanitizePendingFinalDeliveryText(pendingFinalDeliveryText);
   const instructions = forceRestartSafeTools
     ? `${RESTART_RECOVERY_RESUME_MESSAGE}\n\n${RESTART_SAFE_TOOLS_NOTICE}`
     : RESTART_RECOVERY_RESUME_MESSAGE;
   const base = childRecoveryRoster ? `${instructions}\n\n${childRecoveryRoster}` : instructions;
-  return sanitizedPendingText
-    ? `${base}\n\nNote: The interrupted final reply was captured: "${sanitizedPendingText}"`
+  return pendingFinalDeliveryText
+    ? `${base}\n\nNote: The interrupted final reply was captured: "${pendingFinalDeliveryText}"`
     : base;
 }
 
@@ -99,41 +92,10 @@ async function rollbackRestartRecoveryReservation(
     reservation: MainSessionRecoveryReservation;
   },
 ) {
-  return await retryMainSessionRecoveryMutation(async () =>
-    commitMainSessionRecovery({
-      command: { kind: params.kind, reservation: params.reservation },
-      requireWriteSuccess: true,
-      target: params,
-    }),
-  );
-}
-
-function scheduleRestartRecoveryReservationRollback(
-  params: Parameters<typeof rollbackRestartRecoveryReservation>[0],
-): void {
-  // Keep the exact reservation token alive after transient store outages.
-  // A Gateway restart safely retires the timer and its stale-generation slot.
-  scheduleMainSessionRecoveryMutation({
-    mutation: () => rollbackRestartRecoveryReservation(params),
-    onError: (error) => {
-      log.warn(
-        `failed delayed restart recovery reservation rollback ${params.sessionKey}: ${String(error)}`,
-      );
-    },
-    onSuccess: ({ entry, sessionKey }) => {
-      if (
-        entry?.sessionId === params.reservation.sessionId &&
-        sessionKey &&
-        isMainSessionRecoveryPending(entry, sessionKey)
-      ) {
-        scheduleMainSessionRecoveryPendingTarget({
-          agentId: params.agentId,
-          sessionId: entry.sessionId,
-          sessionKey,
-          storePath: params.storePath,
-        });
-      }
-    },
+  return await commitMainSessionRecovery({
+    command: { kind: params.kind, reservation: params.reservation },
+    requireWriteSuccess: true,
+    target: params,
   });
 }
 
@@ -192,20 +154,19 @@ export async function resumeMainSession(
   const isCurrent = () => {
     return source ? matchesRequester(source.readCurrent()) : retained?.isCurrent() === true;
   };
-  return (
-    (await runWithMainSessionRecoveryAdmission({
-      ...params,
-      sessionId: params.entry.sessionId,
-      admission: params.recoveryAdmission,
-      isCurrent,
-      run: (recoveryAdmission) =>
-        resumeMainSessionWithinAdmission({
-          ...params,
-          recoveryAdmission,
-          shouldContinue: recoveryAdmission.shouldContinue,
-        }),
-    })) ?? "skipped"
-  );
+  const result = await runWithMainSessionRecoveryAdmission({
+    ...params,
+    sessionId: params.entry.sessionId,
+    admission: params.recoveryAdmission,
+    isCurrent,
+    run: (recoveryAdmission) =>
+      resumeMainSessionWithinAdmission({
+        ...params,
+        recoveryAdmission,
+        shouldContinue: recoveryAdmission.shouldContinue,
+      }),
+  });
+  return result ?? "skipped";
 }
 
 async function resumeMainSessionWithinAdmission(
@@ -230,7 +191,7 @@ async function resumeMainSessionWithinAdmission(
   const lifecycleGeneration = params.lifecycleGeneration ?? getAgentEventLifecycleGeneration();
   const sanitizedPendingText =
     typeof params.pendingFinalDeliveryText === "string"
-      ? sanitizePendingFinalDeliveryText(params.pendingFinalDeliveryText)
+      ? stripInternalMetadataForDisplay(params.pendingFinalDeliveryText)
       : "";
   const deliveryContext = resolveRestartRecoveryDeliveryContext({
     cfg: params.cfg,
@@ -331,7 +292,6 @@ async function resumeMainSessionWithinAdmission(
   const repairAcceptedRecovery = async () => {
     const restored = await repairMainSessionRecoveryMutation({
       mutation: restoreAcceptedRecovery,
-      onDeferredSuccess: scheduleMainSessionRecoveryPendingTarget,
       onError: (restoreError) => {
         if (params.shouldContinue?.() !== false) {
           log.warn(
@@ -369,8 +329,7 @@ async function resumeMainSessionWithinAdmission(
       await rollbackReservation("cancel_reservation");
       return "skipped";
     }
-    // Persist one stable RPC id before dispatch. A transport rejection is
-    // ambiguous; retries must reuse this id so accepted work cannot duplicate.
+    // Reuse one RPC id on retries: transport rejection does not prove the dispatch was rejected.
     const recoveryStatePrepared = await applySessionEntryReplacements({
       agentId: target.agentId,
       sessionKeys: [params.sessionKey],
@@ -452,7 +411,7 @@ async function resumeMainSessionWithinAdmission(
       deliver:
         Boolean(deliveryContext) &&
         params.entry.restartRecoverySourceReplyDeliveryMode !== "message_tool_only",
-      lane: CommandLane.Background,
+      lane: params.recoveryAdmission.lane,
       ...(params.entry.restartRecoverySourceReplyDeliveryMode
         ? { sourceReplyDeliveryMode: params.entry.restartRecoverySourceReplyDeliveryMode }
         : {}),
@@ -568,6 +527,7 @@ async function resumeMainSessionWithinAdmission(
     if (resumeResult === "started" && agentParams.deliver && deliveryContext && taskRemainsOwed()) {
       deliveryCurrent = await prepareRestartRecoveryDeliveryCurrent({
         ...target,
+        storePath: requesterStorePath,
         sessionKey: dispatchSessionKey,
         sessionId: params.entry.sessionId,
         recoveryRunId,
@@ -668,11 +628,6 @@ async function resumeMainSessionWithinAdmission(
         log.warn(
           `failed to roll back interrupted main session recovery attempt ${params.sessionKey}: ${String(rollbackError)}`,
         );
-        scheduleRestartRecoveryReservationRollback({
-          ...target,
-          kind: rollbackKind,
-          reservation: reservation!,
-        });
       });
     }
     if (params.shouldContinue?.() === false) {

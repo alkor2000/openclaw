@@ -77,6 +77,9 @@ export function createAgentDatabaseInspectionRefusal(params: {
     resolveUpdateRehearsalRoot(process.env) &&
     params.reason.includes("creating its private snapshot:") &&
     /(?:code=(?:ENOSPC|EDQUOT)\b|errcode=13\b)/u.test(params.reason);
+  const serializationFailure = collectNestedErrorCandidates(params.cause).some(
+    (error) => error instanceof Error && error.name === "DataCloneError",
+  );
   const refusal: AgentDatabaseAdmissionRefusal = {
     agentId: params.agentId,
     paths: params.paths,
@@ -84,9 +87,11 @@ export function createAgentDatabaseInspectionRefusal(params: {
     reason: params.reason,
     repairHint: candidateSnapshotCapacity
       ? "Free space in the reported snapshot cache, then retry the update. This candidate snapshot failure does not require repairing the serving database."
-      : params.pending
-        ? 'Sessions remain unavailable until background inspection and preparation finish. If they cannot complete, stop the Gateway, run "openclaw doctor --fix", and restart.'
-        : `Sessions remain unavailable. ${formatAgentDatabaseCorruptionRepairHint(params.agentId, params.cause) ?? 'Stop the Gateway, run "openclaw doctor --fix" to inspect and repair this agent database, and restart.'}`,
+      : serializationFailure
+        ? "A worker request could not be serialized. Update OpenClaw and restart the Gateway; repeating database migration will not repair this request."
+        : params.pending
+          ? 'Sessions remain unavailable until background inspection and preparation finish. If they cannot complete, stop the Gateway, run "openclaw doctor --fix", and restart.'
+          : `Sessions remain unavailable. ${formatAgentDatabaseCorruptionRepairHint(params.agentId, params.cause) ?? 'Stop the Gateway, run "openclaw doctor --fix" to inspect and repair this agent database, and restart.'}`,
   };
   refusalCauses.set(refusal, params.cause);
   return refusal;
@@ -382,13 +387,16 @@ export async function evaluateAgentDatabaseAdmissions(
   const { resolveConfiguredAgentDatabaseCandidatePaths } =
     await import("../config/sessions/targets.js");
   const env = options.env ?? process.env;
-  const result = await preflightOpenClawDatabaseSchemas({
-    env,
-    configuredAgentDatabaseTargets: [],
-    configuredAgentDatabaseCandidatePaths: resolveConfiguredAgentDatabaseCandidatePaths(config, {
+  const result = await preflightOpenClawDatabaseSchemas(
+    {
       env,
-    }),
-    agentAdmissionConfig: config,
-  });
+      configuredAgentDatabaseTargets: [],
+      configuredAgentDatabaseCandidatePaths: resolveConfiguredAgentDatabaseCandidatePaths(config, {
+        env,
+      }),
+      agentAdmissionConfig: config,
+    },
+    "runtime",
+  );
   return result.agentRefusals ?? [];
 }

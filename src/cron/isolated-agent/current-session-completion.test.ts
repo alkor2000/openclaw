@@ -8,6 +8,10 @@ import {
   readTranscriptEventId,
   readTranscriptEventMessage,
 } from "../../config/sessions/session-accessor.sqlite-read.js";
+import {
+  MANAGED_OUTGOING_IMAGE_ARTIFACT_ID_PREFIX,
+  resolveManagedOutgoingMediaArtifactDownload,
+} from "../../gateway/managed-image-attachments.js";
 import * as operationAdmission from "../../infra/sqlite-worker-operation-admission.js";
 import { sqliteWorkerOwnerProbe as probe } from "../../infra/sqlite-worker-owner-probe.test-support.js";
 import {
@@ -37,14 +41,14 @@ import { dispatchCronDelivery } from "./delivery-dispatch.js";
 import { resolveDeliveryTarget } from "./delivery-target.js";
 
 describe("current-session completion delivery", () => {
-  it.each(["leading-token", "silent-media-caption"] as const)(
-    "normalizes %s output before committing the conversation",
+  it.each(["literal-text", "prepared-media"] as const)(
+    "preserves %s output when committing the conversation",
     async (mode) => {
       await withOpenClawTestState({ layout: "state-only" }, async (state) => {
         const fixture = await createCompletionFixture(state);
         try {
-          const hasMedia = mode === "silent-media-caption";
-          const text = hasMedia ? "Report complete.\nNO_REPLY" : "NO_REPLY\nReport complete.";
+          const hasMedia = mode === "prepared-media";
+          const text = hasMedia ? undefined : "NO_REPLY";
           fixture.params.deliveryPayloads = [
             { text, ...(hasMedia ? { mediaUrl: fixture.payload.mediaUrl } : {}) },
           ];
@@ -58,7 +62,7 @@ describe("current-session completion delivery", () => {
           expect(messages).toHaveLength(1);
           const message = readTranscriptEventMessage(messages[0]);
           expect(message?.content).toEqual([
-            { type: "text", text: hasMedia ? "report.png" : "Report complete." },
+            { type: "text", text: hasMedia ? "report.png" : "NO_REPLY" },
           ]);
           if (hasMedia) {
             expect(readAssistantDisplayContent(message)).toEqual([
@@ -233,7 +237,28 @@ describe("current-session completion media", () => {
           expect(sendMedia).toHaveBeenCalledTimes(stage === "commit" ? 1 : 0);
           expect(await fixture.messages()).toHaveLength(0);
           if (stage === "commit") {
-            expect(await fixture.records(), deliveryWarning).toEqual([]);
+            // File deletion is best effort; a durable cleanup claim must stay unservable.
+            const entries = await fixture.records();
+            expect(entries.length, deliveryWarning).toBeLessThanOrEqual(1);
+            for (const entry of entries) {
+              expect(entry).toMatchObject({
+                cleanupPending: true,
+                record: {
+                  sessionKey: fixture.scope.sessionKey,
+                  retentionClass: "transient",
+                  messageId: null,
+                  alt: "report.png",
+                },
+              });
+              expect(
+                await resolveManagedOutgoingMediaArtifactDownload({
+                  sessionKey: fixture.scope.sessionKey,
+                  agentId: "main",
+                  stateDir: state.stateDir,
+                  artifactId: `${MANAGED_OUTGOING_IMAGE_ARTIFACT_ID_PREFIX}${entry.record.attachmentId}`,
+                }),
+              ).toBeNull();
+            }
           }
         } finally {
           cron.stop();

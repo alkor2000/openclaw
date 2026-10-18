@@ -1,3 +1,4 @@
+import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 // Gateway tool invocation engine.
 // Shared implementation behind HTTP and RPC tool invocation adapters.
 import {
@@ -10,6 +11,7 @@ import { resolveAgentWorkspaceDir } from "../agents/agent-scope-config.js";
 import { runBeforeToolCallHook } from "../agents/agent-tools.before-tool-call.js";
 import { resolveToolLoopDetectionConfig } from "../agents/agent-tools.js";
 import { getChannelAgentToolMeta } from "../agents/channel-tool-metadata.js";
+import { readEmbeddedMessageDeliveryFact } from "../agents/embedded-agent-message-delivery.js";
 import { resolveIngressWorkspaceOverrideForSessionRun } from "../agents/spawned-context.js";
 import { isKnownCoreToolId } from "../agents/tool-catalog.js";
 import { resolveStoredSessionPermissionPolicy } from "../agents/tool-fs-policy.js";
@@ -22,6 +24,7 @@ import {
   normalizeConversationReadInvocationOrigin,
   type ConversationReadInvocationOrigin,
 } from "../channels/plugins/conversation-read-origin.js";
+import { isMessageToolSendActionName } from "../channels/plugins/message-action-names.js";
 import { getRuntimeConfig } from "../config/io.js";
 import { withSessionActorStorage } from "../config/sessions/session-actor-storage-binding.js";
 import { captureSessionEntryMetadataRead } from "../config/sessions/session-entry-source-authority.js";
@@ -217,6 +220,7 @@ type InvokeGatewayToolParams = {
   /** Host-minted authority from the calling connection; never derived from wire params. */
   operatorRoleActor?: NonNullable<GatewayClient["internal"]>["operatorRoleActor"];
   operatorScopes?: readonly string[];
+  approvalReviewerDeviceId?: string;
   senderIsOwner?: boolean;
   clientCaps?: string[];
   conversationReadOrigin?: ConversationReadInvocationOrigin;
@@ -241,9 +245,12 @@ async function invokeGatewayToolWithSignal(
     }
   };
   const sessionChecks: Array<() => void> = [];
-  const assertInvocationCurrent = () => {
+  const assertCallerCurrent = () => {
     params.signal.throwIfAborted();
     params.assertInvocationCurrent?.();
+  };
+  const assertInvocationCurrent = () => {
+    assertCallerCurrent();
     for (const check of sessionChecks) {
       check();
     }
@@ -500,6 +507,7 @@ async function invokeGatewayToolWithSignal(
       accountId: params.accountId,
       agentTo: params.agentTo,
       agentThreadId: params.agentThreadId,
+      approvalReviewerDeviceId: params.approvalReviewerDeviceId,
       senderIsOwner: params.senderIsOwner,
       clientCaps: params.clientCaps,
       conversationReadOrigin,
@@ -548,6 +556,7 @@ async function invokeGatewayToolWithSignal(
         agentId,
         config: params.cfg,
         sessionKey,
+        approvalReviewerDeviceId: params.approvalReviewerDeviceId,
         workspaceDir,
         loopDetection: resolveToolLoopDetectionConfig({ cfg: params.cfg, agentId }),
       },
@@ -575,7 +584,23 @@ async function invokeGatewayToolWithSignal(
         return await tool.execute?.(toolCallId, hookResult.params, params.signal);
       },
     );
-    assertInvocationCurrent();
+    const executedAction = asOptionalRecord(hookResult.params)?.action;
+    const delivery =
+      toolName === "message" &&
+      resolveToolSource(tool) === "core" &&
+      (isMessageToolSendActionName(executedAction) ||
+        executedAction === "poll" ||
+        executedAction === "broadcast")
+        ? readEmbeddedMessageDeliveryFact(
+            asOptionalRecord(asOptionalRecord(result)?.details)?.messageDelivery,
+          )
+        : undefined;
+    // The send may create its session row. Returning its receipt still requires live caller authority.
+    if (delivery?.status === "settled" || delivery?.partialDelivery === true) {
+      assertCallerCurrent();
+    } else {
+      assertInvocationCurrent();
+    }
     return {
       ok: true,
       status: 200,

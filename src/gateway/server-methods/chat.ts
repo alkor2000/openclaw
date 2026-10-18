@@ -20,7 +20,8 @@ import {
 } from "../chat-display-projection.js";
 import { resolveRequestedSessionAgentId } from "../session-request-agent.js";
 import { findCanonicalStoreMatch } from "../session-utils-store-selection.js";
-import { loadGatewaySessionEntryReadOnlyInWorker, loadSessionEntry } from "../session-utils.js";
+import { loadGatewaySessionEntryReadOnlyInWorker } from "../session-utils-store-worker.js";
+import { loadIncognitoGatewaySessionEntryReadOnly } from "../session-utils.js";
 import { formatForLog } from "../ws-log.js";
 import {
   resolveGlobalAwareNodeChatDeliveryKeys,
@@ -28,6 +29,7 @@ import {
 } from "./chat-broadcast.js";
 import { chatHistoryHandlers } from "./chat-history-handler.js";
 import { chatMessageGetHandlers } from "./chat-message-get-handler.js";
+import { chatPredictionHandlers } from "./chat-prediction-handler.js";
 import { appendInjectedAssistantMessageToTranscript } from "./chat-transcript-inject.js";
 import type { GatewayRequestHandlerOptions, GatewayRequestHandlers } from "./types.js";
 import { assertValidParams } from "./validation.js";
@@ -35,6 +37,7 @@ import { assertValidParams } from "./validation.js";
 export const chatHandlers: GatewayRequestHandlers = {
   ...chatHistoryHandlers,
   ...chatMessageGetHandlers,
+  ...chatPredictionHandlers,
   "chat.toolTitles": async ({ params, respond }) => {
     if (!assertValidParams(params, validateChatToolTitlesParams, "chat.toolTitles", respond)) {
       return;
@@ -91,7 +94,7 @@ async function injectChat(
     entry,
     canonicalKey: sessionKey,
   } = isIncognitoSessionKey(rawSessionKey)
-    ? loadSessionEntry(rawSessionKey, sessionLoadOptions, cfg)
+    ? loadIncognitoGatewaySessionEntryReadOnly(rawSessionKey, sessionLoadOptions, cfg)
     : await loadGatewaySessionEntryReadOnlyInWorker({
         excludeInternalEffects: true,
         cfg,
@@ -132,7 +135,7 @@ async function injectChat(
           throw new Error(`Session "${sessionKey}" changed while starting work. Retry.`);
         }
         const latestEntry = isIncognitoSessionKey(sessionKey)
-          ? loadSessionEntry(rawSessionKey, sessionLoadOptions).entry
+          ? loadIncognitoGatewaySessionEntryReadOnly(rawSessionKey, sessionLoadOptions).entry
           : (current?.entry ?? entry);
         if (latestEntry?.sessionId !== sessionId) {
           throw new Error(`Session "${sessionKey}" changed while starting work. Retry.`);

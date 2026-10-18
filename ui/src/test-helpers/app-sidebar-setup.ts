@@ -1,11 +1,11 @@
 import { gatewayOriginScope } from "@openclaw/gateway-client/browser";
+import { flush } from "solid-js";
 import { afterEach, beforeEach, onTestFinished, vi } from "vitest";
 import type { AgentsListResult } from "../api/types.ts";
 import type { ApplicationGateway } from "../app/context.ts";
-import type { AppSidebarSessionNavigationElement } from "../components/app-sidebar-session-navigation.ts";
 import { storeSidebarSessionOwnerFilter } from "../components/app-sidebar-session-types.ts";
+import type { AppSidebarElement } from "../components/app-sidebar.tsx";
 import { disposeSidebarContextLifecycles } from "./app-sidebar-context-lifecycle.ts";
-import { settleLitElements } from "./lit-settle.ts";
 import { createStorageMock } from "./storage.ts";
 
 export function setupSidebarTest() {
@@ -27,6 +27,8 @@ export function setupSidebarTest() {
       // Fake clocks must leave this fixture's frame scheduler in place.
       vi.setConfig({
         fakeTimers: {
+          // jsdom can retire its native frame timer after the fake clock is installed.
+          shouldClearNativeTimers: true,
           toFake: [
             "setTimeout",
             "clearTimeout",
@@ -78,25 +80,6 @@ export function setupSidebarTest() {
         value: (id: number) => frames.delete(id),
       });
     }
-    // JSDOM has no media queries or layout observation. Real browser tests keep
-    // their native implementations and own the layout and motion assertions.
-    if (typeof matchMedia === "undefined") {
-      Object.defineProperty(globalThis, "matchMedia", {
-        configurable: true,
-        writable: true,
-        value: (media: string) => ({
-          media,
-          matches: false,
-          onchange: null,
-          addListener() {},
-          removeListener() {},
-          addEventListener() {},
-          removeEventListener() {},
-          dispatchEvent: () => true,
-        }),
-      });
-    }
-
     for (const name of ["ResizeObserver", "IntersectionObserver"] as const) {
       if (globalThis[name] !== undefined) {
         continue;
@@ -127,18 +110,26 @@ export function setupSidebarTest() {
     vi.unstubAllGlobals();
     vi.useRealTimers();
     vi.resetConfig();
+    const sidebars = document.body.querySelectorAll<AppSidebarElement>("openclaw-app-sidebar");
+    // Open native menus keep scheduling frames while imports settle.
+    for (const sidebar of sidebars) {
+      // Lazy shell fixtures can retain an unupgraded sidebar tag.
+      if (sidebar.matches(":defined")) {
+        sidebar.dismissTransientMenus();
+      }
+    }
     await vi.dynamicImportSettled();
     // Removing a prompt's DOM does not settle its promise or release its reentrancy guard.
     for (const modal of document.body.querySelectorAll("openclaw-modal-dialog")) {
       modal.dispatchEvent(new CustomEvent("modal-cancel", { cancelable: true }));
     }
     await vi.dynamicImportSettled();
-    const sidebars =
-      document.body.querySelectorAll<AppSidebarSessionNavigationElement>("openclaw-app-sidebar");
     document.body.replaceChildren();
+    await Promise.resolve();
+    flush();
     disposeSidebarContextLifecycles();
-    // Disconnection queues Lit updates; finish them before retiring the DOM globals.
-    await settleLitElements(sidebars);
+    // A disconnected Solid sidebar resolves abandoned rendering as false, not another update.
+    await Promise.all(Array.from(sidebars, (sidebar) => sidebar.updateComplete));
     frameChannel?.port1.close();
     frameChannel?.port2.close();
     frameChannel = undefined;
@@ -173,7 +164,7 @@ export function focusSidebarPersonWithKeyboard(target: HTMLElement): void {
 
 /** Select a view through its actual fixed rail control. */
 export async function selectSidebarView(
-  sidebar: HTMLElement & Pick<AppSidebarSessionNavigationElement, "updateComplete">,
+  sidebar: HTMLElement & Pick<AppSidebarElement, "updateComplete">,
   view: "pages" | "sessions" | "online",
 ): Promise<void> {
   const button = sidebar.querySelector<HTMLButtonElement>(`[data-navigation-view="${view}"]`);

@@ -8,9 +8,11 @@ import {
   withSessionActorStorage,
   type SessionActorStorageBinding,
 } from "../config/sessions/session-actor-storage-binding.js";
+import { readSessionActorStorageResult } from "../config/sessions/session-actor-storage-result.js";
 import { captureSessionStoreReadCandidates } from "../config/sessions/session-store-target-inventory.js";
 import { withSessionStoreTarget } from "../config/sessions/session-store-target-runtime.js";
 import { withSessionHistoryWorkerReadCandidates } from "../config/sessions/session-transcript-worker-resources.js";
+import { createSessionWorkerExecutionSource } from "../config/sessions/session-worker-execution-source.js";
 import { resolveStateDir } from "../config/state-dir.js";
 import { IncognitoSessionMissingError } from "../state/incognito-session-error.js";
 import { resolveOpenClawAgentSqlitePath } from "../state/openclaw-agent-db.paths.js";
@@ -32,7 +34,6 @@ import type { MessageToolRunOutcomeWorkerOperations } from "./message-tool-run-o
 import { runtimeProcessEntrypoints } from "./runtime-process-entrypoints.js";
 import { resolveRuntimeWorkerUrl } from "./runtime-worker-url.js";
 import { throwSqliteLifecycleErrors } from "./sqlite-lifecycle-errors.js";
-import { createSqliteWorkerOperationAdmission } from "./sqlite-worker-operation-admission.js";
 
 /** Records one bounded completion fact before the run's owner retires. */
 export async function recordMessageToolRunOutcome(params: {
@@ -75,9 +76,7 @@ export async function recordMessageToolRunOutcome(params: {
           { type: "session.messageToolOutcome.record", input: values },
           selectedAuthority,
         );
-        if (result.kind === "rolled-back") {
-          throw new Error(result.error.message);
-        }
+        readSessionActorStorageResult(result);
         return true;
       },
     );
@@ -118,20 +117,11 @@ export async function recordMessageToolRunOutcome(params: {
                 await owner.refreshBeforeDispatch(() => execution.assertCurrent());
                 await runOpenClawAgentWorkerWrite(options, () =>
                   execution.prepare({
-                    assertCurrent,
+                    ...createSessionWorkerExecutionSource(
+                      assertCurrent,
+                      "Message-tool outcome preparation authority expired",
+                    ),
                     onRegistryChange: owner.onRegistryChange,
-                    createAdmission(binding) {
-                      return () => ({
-                        nativeLocations: binding.nativeLocations,
-                        admission: createSqliteWorkerOperationAdmission((request, grant) => {
-                          binding.authorize(request);
-                          assertCurrent();
-                          if (!grant()) {
-                            throw new Error("Message-tool outcome preparation authority expired");
-                          }
-                        }, binding.attachment),
-                      });
-                    },
                   }),
                 );
                 await owner.revalidateTarget();

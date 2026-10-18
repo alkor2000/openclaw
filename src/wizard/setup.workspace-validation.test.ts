@@ -14,8 +14,8 @@ const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const writeConfig = vi.hoisted(() => vi.fn());
 vi.mock("./setup.shared.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./setup.shared.js")>()),
-  readSetupConfigFileSnapshot: async () =>
-    createConfigFileSnapshot({
+  readSetupConfigAuthority: async () => ({
+    snapshot: createConfigFileSnapshot({
       path: "/tmp/openclaw.json",
       exists: false,
       raw: null,
@@ -27,6 +27,8 @@ vi.mock("./setup.shared.js", async (importOriginal) => ({
       warnings: [],
       legacyIssues: [],
     }),
+    assertCurrent: () => {},
+  }),
   requireRiskAcknowledgement: async ({ config }: { config: OpenClawConfig }) => config,
   requestTelemetryConsent: async ({ config }: { config: OpenClawConfig }) => config,
   resolveQuickstartGatewayDefaults: () => ({ port: 19791 }),

@@ -1,10 +1,13 @@
 // Shared setup-wizard steps used by the classic wizard and the bootstrap onboarding flow.
+import fs from "node:fs";
 import { formatConfigReadFailureForCli } from "../cli/config-validation-output.js";
 import type { OnboardOptions } from "../commands/onboard-types.js";
 import { setConfigValueAtPath } from "../config/config-paths.js";
 import { createConfigIO, resolveGatewayPort } from "../config/config.js";
 import type { ConfigWriteOptions } from "../config/io.js";
+import { assertBaseSnapshotStillCurrent } from "../config/io.write-safety.js";
 import { applyMergePatch, createMergePatch } from "../config/merge-patch.js";
+import { ConfigMutationConflictError } from "../config/mutation-conflict.js";
 import { isMergePatchObjectKeyAllowed } from "../config/patch-replace-paths.js";
 import type { ConfigWriteAfterWrite } from "../config/runtime-snapshot.js";
 import type { GatewayAuthMode } from "../config/types.gateway.js";
@@ -125,7 +128,6 @@ export type WizardConfigWriteOptions = {
   writeOptions?: ConfigWriteOptions;
   /** Runtime follow-up intent for the Gateway config watcher. */
   afterWrite?: ConfigWriteAfterWrite;
-  onPreparedCommit?: (snapshot: ConfigFileSnapshot, config: OpenClawConfig) => void;
 };
 
 /**
@@ -169,7 +171,7 @@ export async function writeWizardConfigFile(
         : {}),
       ...(opts.baseSnapshot ? { baseSnapshot: opts.baseSnapshot } : {}),
     },
-    transform: (current, context) => {
+    transform: (current) => {
       // SAFETY: Both sides of the wizard delta are typed configs.
       const nextConfig = opts.mergeBase
         ? (applyMergePatch(current, createMergePatch(opts.mergeBase, config)) as OpenClawConfig)
@@ -177,7 +179,6 @@ export async function writeWizardConfigFile(
       for (const path of explicitNullPaths) {
         setConfigValueAtPath(nextConfig, path, null);
       }
-      opts.onPreparedCommit?.(context.snapshot, nextConfig);
       return { nextConfig };
     },
   });
@@ -191,18 +192,17 @@ export function createWizardInferenceConfigTarget(
     options: SetupInferenceConfigWriteOptions,
     baseSnapshot?: ConfigFileSnapshot,
   ) => {
-    const result = await commit(config, {
+    const { snapshot, nextConfig } = await commit(config, {
       baseSnapshot,
       writeOptions: options.writeOptions,
-      onPreparedCommit: (snapshot, next) =>
-        options.captureUndo(
-          captureSetupInferenceFileUndo(
-            { ...snapshot, sourceConfig: stripPendingPluginInstallRecords(snapshot.sourceConfig) },
-            stripPendingPluginInstallRecords(next),
-          ),
-        ),
     });
-    return result.nextConfig;
+    options.captureUndo(
+      captureSetupInferenceFileUndo(
+        { ...snapshot, sourceConfig: stripPendingPluginInstallRecords(snapshot.sourceConfig) },
+        nextConfig,
+      ),
+    );
+    return nextConfig;
   };
   return {
     write,
@@ -218,6 +218,27 @@ export function createWizardInferenceConfigTarget(
 
 export async function readSetupConfigFileSnapshot() {
   return await createConfigIO({ pluginValidation: "skip" }).readConfigFileSnapshot();
+}
+
+export async function readSetupConfigAuthority(env?: NodeJS.ProcessEnv) {
+  const io = createConfigIO({ env, pluginValidation: "skip", observe: false });
+  const { snapshot, writeOptions } = await io.readConfigFileSnapshotForWrite();
+  if (snapshot.readError || (snapshot.exists && snapshot.raw === null)) {
+    throw new ConfigMutationConflictError(
+      formatConfigReadFailureForCli(snapshot) ?? "Setup config could not be read; rerun setup.",
+    );
+  }
+  const includeGraph = {
+    hashes: writeOptions.includeFileHashesForWrite ?? {},
+    targets: writeOptions.includeFileTargetsForWrite ?? {},
+  };
+  return {
+    snapshot,
+    assertCurrent: () => {
+      writeOptions.assertConfigPathForWrite?.();
+      assertBaseSnapshotStillCurrent(snapshot, io.configPath, fs, includeGraph);
+    },
+  };
 }
 
 export async function readValidSetupConfigFile(): Promise<OpenClawConfig> {

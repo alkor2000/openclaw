@@ -1,3 +1,4 @@
+import { isConfigReadFailure } from "../config/io.invalid-config.js";
 import type { ConfigFileSnapshot, OpenClawConfig } from "../config/types.openclaw.js";
 import type { BareRootLaunchTarget } from "./run-main.gateway-types.js";
 
@@ -34,9 +35,11 @@ export async function shouldStartLocalOnboarding(
   }
   // Inference persists before setup finishes; only its owning receipt can
   // distinguish interrupted local onboarding from an authored model-only config.
-  const { readLocalOnboardingStateForConfig } = await import("../state/local-onboarding-state.js");
+  const { readLocalOnboardingStateForConfigAsync } =
+    await import("../state/local-onboarding-state.js");
   return (
-    readLocalOnboardingStateForConfig(snapshot.path, snapshot.sourceConfig)?.status === "pending"
+    (await readLocalOnboardingStateForConfigAsync(snapshot.path, snapshot.sourceConfig))?.status ===
+    "pending"
   );
 }
 
@@ -46,8 +49,15 @@ export async function resolveBareRootLaunchTarget(
     options: { hasConfiguredGateway: boolean },
   ) => Promise<BareRootLaunchTarget>,
 ): Promise<BareRootLaunchTarget> {
+  const { readConfigSnapshotForEngineSelection } =
+    await import("../commands/config-preflight-snapshot.js");
+  const selected = await readConfigSnapshotForEngineSelection();
   const { readConfigFileSnapshot } = await import("../config/config.js");
-  const snapshot = await readConfigFileSnapshot();
+  const snapshot =
+    isConfigReadFailure(selected) ||
+    selected.issues.some((issue) => issue.errorCode === "CONFIG_SOURCE_INVALID")
+      ? selected
+      : await readConfigFileSnapshot();
   if (!snapshot.valid) {
     const { formatConfigReadFailureForCli } = await import("./config-validation-output.js");
     const diagnostic = formatConfigReadFailureForCli(snapshot);

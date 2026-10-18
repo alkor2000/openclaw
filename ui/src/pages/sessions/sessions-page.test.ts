@@ -52,7 +52,12 @@ const sessionRow = (key: string, extra: Partial<GatewaySessionRow> = {}): Gatewa
 async function mountMutation(sessions = createSessions()) {
   const connection = createGateway();
   const context = createContext(connection.gateway, sessions);
-  return { page: await createPage(context), connection, context, sessions };
+  return {
+    page: await createRenderedPage(context, sessionsResult([], 1), "all"),
+    connection,
+    context,
+    sessions,
+  };
 }
 async function openRowMenu(page: TestSessionsPage, target: GatewaySessionRow) {
   page.openSessionMenu(target, { x: 10, y: 20 }, document.createElement("button"));
@@ -108,6 +113,26 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 describe("sessions page lifecycle", () => {
+  it("disables refresh during transport loss and restores it after reconnect", async () => {
+    const { page, connection, sessions } = await mountMutation();
+    const refreshList = vi.mocked(sessions.refreshList);
+    const refresh = () => page.querySelector<HTMLButtonElement>('button[aria-label="Refresh"]')!;
+    await vi.waitFor(() => expect(refresh().disabled).toBe(false));
+    for (const phase of ["reconnecting", "offline"] as const) {
+      connection.emit({ phase });
+      await page.updateComplete;
+      const requests = refreshList.mock.calls.length;
+      expect(refresh().disabled).toBe(true);
+      refresh().click();
+      expect(refreshList).toHaveBeenCalledTimes(requests);
+    }
+    connection.emit({ phase: "connected", hello: sessionMutationGatewayHello() });
+    await vi.waitFor(() => expect(refresh().disabled).toBe(false));
+    const requests = refreshList.mock.calls.length;
+    refresh().click();
+    await vi.waitFor(() => expect(refreshList).toHaveBeenCalledTimes(requests + 1));
+  });
+
   it("pins from the page menu without changing shared pin metadata", async () => {
     const row = sessionRow("personal-pin", { pinned: true, sharingRole: "viewer" });
     const sessions = createSessions();
@@ -246,7 +271,6 @@ describe("sessions page lifecycle", () => {
           expect(sessions.state.result?.sessions[0]?.key).toBe("agent:main:sidebar"),
         );
         mutableGateway.emit({ sessionKey: "agent:main:other" });
-        page.context = { ...context };
         await page.updateComplete;
         expect(pageRequests).toBe(expectedRequests);
         expect(page.result?.sessions[0]?.key).toBe(`agent:main:current-${expectedRequests}`);
@@ -378,7 +402,10 @@ describe("sessions page lifecycle", () => {
     page.selectedSessions = new Map([[target.key, target]]);
     const deleting = page.deleteSelected();
     expect(showConfirmDialog).toHaveBeenCalledOnce();
-    page.result = sessionsResult([{ ...target, sessionId: "replacement", archived: false }], 2);
+    sessions.state.result = sessionsResult(
+      [{ ...target, sessionId: "replacement", archived: false }],
+      2,
+    );
     confirmation.resolve(true);
     await deleting;
     expect(sessions.deleteMany).toHaveBeenCalledWith([
@@ -401,18 +428,15 @@ describe("sessions page lifecycle", () => {
     vi.mocked(showConfirmDialog).mockResolvedValue(true);
     const deleting = page.deleteSelected();
     await vi.waitFor(() => expect(deleteRequest).toHaveBeenCalledOnce());
-    expect(page.sessionMutationPending).toBe(true);
     expect(page.result?.sessions).toEqual([]);
     setRows([target, arrived]);
     await sessions.refreshList({ ...query, force: true });
-    expect(page.sessionMutationPending).toBe(true);
     expect(page.result?.sessions.map(({ key }) => key)).toEqual([arrived.key]);
     setRows([arrived]);
     deleted.resolve({ deleted: true });
     await deleting;
     expect(page.result?.sessions).toEqual([arrived]);
     expect(page.selectedSessions.size).toBe(0);
-    expect(page.sessionMutationPending).toBe(false);
   });
 
   it("does not delete after the Gateway changes during confirmation", async () => {
@@ -505,7 +529,6 @@ describe("sessions page lifecycle", () => {
         loading: false,
         error: null,
       });
-      expect(page.sessionMutationPending).toBe(true);
       expect(page.result?.sessions[0]?.label).toBe("Updated while stopping");
       stopped.resolve({ ok: true });
       await stopping;
@@ -517,7 +540,6 @@ describe("sessions page lifecycle", () => {
       );
       expect(managed.refreshList).toHaveBeenCalledWith({ ...query, force: true });
       expect(page.result?.sessions[0]?.label).toBe("Updated while stopping");
-      expect(page.sessionMutationPending).toBe(false);
     },
   );
 
@@ -560,8 +582,6 @@ describe("sessions page lifecycle", () => {
     expect([...page.selectedSessions.keys()]).toEqual(["main"]);
     expect(page.error).toBeNull();
     expect(page.sessionMenu).toBeNull();
-    expect(page.sessionMenuTrigger).toBeNull();
-    expect(page.sessionMutationPending).toBe(false);
     expect(connection.setSessionKey).not.toHaveBeenCalled();
     expect(context.navigate).not.toHaveBeenCalled();
   });

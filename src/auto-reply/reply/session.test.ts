@@ -5,7 +5,6 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterAll, afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
-import * as bootstrapCache from "../../agents/bootstrap-cache.js";
 import {
   clearEmbeddedSessionPromptStates,
   retainEmbeddedSessionPromptState,
@@ -871,7 +870,7 @@ describe("initSessionState thread forking", () => {
         }),
       ).rejects.toThrow(
         locked
-          ? /cannot be replaced while model selection is locked.*WebChat.*Resume in new session/i
+          ? /cannot be replaced while model selection is locked.*WebChat and use Resume\./i
           : /ended during restart recovery/i,
       );
 
@@ -1746,18 +1745,11 @@ describe("initSessionState RawBody", () => {
 });
 
 describe("initSessionState reset policy", () => {
-  let clearBootstrapSnapshotOnSessionRolloverSpy: ReturnType<typeof vi.spyOn>;
-
   beforeEach(() => {
     vi.useFakeTimers({ toFake: ["Date"] });
-    clearBootstrapSnapshotOnSessionRolloverSpy = vi.spyOn(
-      bootstrapCache,
-      "clearBootstrapSnapshotOnSessionBoundary",
-    );
   });
 
   afterEach(() => {
-    clearBootstrapSnapshotOnSessionRolloverSpy.mockRestore();
     vi.useRealTimers();
   });
 
@@ -1946,17 +1938,6 @@ describe("initSessionState reset policy", () => {
       expect(result.resetTriggered).toBe(false);
       expect(result.isNewSession).toBe(!authorized);
       expect(result.sessionId).toBe(existingSessionId);
-      if (authorized) {
-        expect(clearBootstrapSnapshotOnSessionRolloverSpy).not.toHaveBeenCalledWith({
-          boundaryAppended: true,
-          sessionKey,
-        });
-      } else {
-        expect(clearBootstrapSnapshotOnSessionRolloverSpy).toHaveBeenCalledWith({
-          boundaryAppended: true,
-          sessionKey,
-        });
-      }
     },
   );
 });

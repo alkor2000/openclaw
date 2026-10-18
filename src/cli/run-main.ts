@@ -60,7 +60,7 @@ import {
   isDebugProxyCaptureEnvEnabled,
   isGatewayRunFastPathArgv,
   isRemoteAgentDispatchInvocation,
-  resolveBareRootLaunchError,
+  resolveBareRootLaunchPolicy,
   resolveMissingPluginCommandMessage,
   shouldHandleBareRoot,
   shouldBootstrapCliProxyBeforeFastPath,
@@ -69,6 +69,7 @@ import {
   shouldStartProxyForCli,
   shouldUseRootHelpFastPath,
   shouldUseSetupOnboardConfigureHelpFastPath,
+  TUI_REQUIRES_TTY,
 } from "./run-main-policy.js";
 import { tryRunUpdateAdmissionBeforeStartup } from "./run-main-update-admission.js";
 import type {
@@ -90,8 +91,6 @@ import {
 import { normalizeWindowsArgv } from "./windows-argv.js";
 
 const UNKNOWN_COMMAND_DISPLAY_LIMIT = 128;
-const TUI_REQUIRES_TTY =
-  "OpenClaw TUI needs an interactive TTY. Use `openclaw agent --local ...` for automation.";
 
 function requireInteractiveTty(message: string): boolean {
   if (process.stdin.isTTY && process.stdout.isTTY) {
@@ -681,14 +680,7 @@ export async function runCli(
               }
             } finally {
               if (resources) {
-                await runCliDisposer("plugin-registration-resources", async () => {
-                  try {
-                    await resources.release();
-                  } catch (error) {
-                    console.error(`Plugin CLI resource disposal failed: ${String(error)}`);
-                    throw error;
-                  }
-                });
+                await runCliDisposer("plugin-registration-resources", () => resources.release());
               }
               pauseNonTtyStdinForCliExit();
             }
@@ -844,6 +836,13 @@ async function runCliWithPreparedOutputMode(
         loadCliDotEnv({ loadGlobalEnv, quiet: true });
       }
     });
+  }
+  const { prepareCliDatabaseEngine } = await import("./database-engine-selection.js");
+  const selectionHandled = await startupTrace.measure("database-engine-selection", () =>
+    prepareCliDatabaseEngine(normalizedArgv),
+  );
+  if (selectionHandled) {
+    return;
   }
   let doctorDatabasePreflight: DoctorDatabasePreflight | undefined;
   if (!isHelpOrVersionInvocation && normalizedInvocation.primary === "doctor") {
@@ -1105,14 +1104,18 @@ async function runCliWithPreparedOutputMode(
       : null;
 
     if (bareRootLaunchTarget) {
-      const launchError = resolveBareRootLaunchError(
-        bareRootLaunchTarget,
-        process.stdin.isTTY && process.stdout.isTTY,
-      );
-      if (launchError) {
-        console.error(launchError);
+      if (bareRootLaunchTarget.kind === "config-read-failure") {
+        console.error(bareRootLaunchTarget.diagnostic);
         process.exitCode = 1;
         return;
+      }
+      const launchPolicy = resolveBareRootLaunchPolicy(bareRootLaunchTarget);
+      if (!requireInteractiveTty(launchPolicy.ttyMessage)) {
+        return;
+      }
+      if (launchPolicy.startProxy) {
+        const config = await withConsoleLogsRoutedToStderr(readBestEffortCliConfig);
+        await replaceStartedProxy(config?.proxy ?? undefined);
       }
       if (bareRootLaunchTarget.kind === "remote-gateway-inference") {
         const { runRemoteGatewayInferenceOnboarding } =
@@ -1125,29 +1128,27 @@ async function runCliWithPreparedOutputMode(
         await setupWizardCommand(bareRootLaunchTarget.classic ? { classic: true } : {});
         return;
       }
-      if (bareRootLaunchTarget.kind === "tui") {
-        const { runTui } = await import("../tui/tui.js");
-        await runTui({
-          deliver: false,
-          ...(bareRootLaunchTarget.local
-            ? { local: true }
-            : {
-                config: bareRootLaunchTarget.config,
-                boundGateway: {
-                  url: bareRootLaunchTarget.gatewayUrl,
-                  ...(bareRootLaunchTarget.configuredRemote ? { configuredRemote: true } : {}),
-                  ...(bareRootLaunchTarget.token ? { token: bareRootLaunchTarget.token } : {}),
-                  ...(bareRootLaunchTarget.password
-                    ? { password: bareRootLaunchTarget.password }
-                    : {}),
-                  ...(bareRootLaunchTarget.tlsFingerprint
-                    ? { tlsFingerprint: bareRootLaunchTarget.tlsFingerprint }
-                    : {}),
-                },
-              }),
-        });
-        return;
-      }
+      const { runTui } = await import("../tui/tui.js");
+      await runTui({
+        deliver: false,
+        ...(bareRootLaunchTarget.local
+          ? { local: true }
+          : {
+              config: bareRootLaunchTarget.config,
+              boundGateway: {
+                url: bareRootLaunchTarget.gatewayUrl,
+                ...(bareRootLaunchTarget.configuredRemote ? { configuredRemote: true } : {}),
+                ...(bareRootLaunchTarget.token ? { token: bareRootLaunchTarget.token } : {}),
+                ...(bareRootLaunchTarget.password
+                  ? { password: bareRootLaunchTarget.password }
+                  : {}),
+                ...(bareRootLaunchTarget.tlsFingerprint
+                  ? { tlsFingerprint: bareRootLaunchTarget.tlsFingerprint }
+                  : {}),
+              },
+            }),
+      });
+      return;
     }
 
     const shouldUseCliEnvProxy =
@@ -1261,7 +1262,7 @@ async function runCliWithPreparedOutputMode(
         for (const message of runFatalErrorHooks({ reason: "uncaught_exception", error })) {
           console.error("[openclaw]", message);
         }
-        restoreRuntimeTerminalState("uncaught exception", { resumeStdinIfPaused: false });
+        restoreRuntimeTerminalState("uncaught exception");
         exitAfterSignalExitBarriers(1, "uncaught exception");
       });
 

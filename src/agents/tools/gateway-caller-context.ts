@@ -87,6 +87,10 @@ type GatewayToolCallerIdentity = {
   assertToolAllowed?: (toolName: string) => void;
   /** Exact Gateway-owned worker claim; never sourced from model or RPC arguments. */
   workerTurnClaim?: WorkerSessionTurnClaim;
+  /** Prepared caller sandbox for the explicit current-workspace base refresh; never RPC data. */
+  workspaceBaseRefreshSandbox?: import("../sandbox/types.js").SandboxContext;
+  /** Current tool's filesystem owner for inspected PR evidence; never serialized in RPC data. */
+  workspaceEvidenceSandbox?: import("../sandbox/types.js").SandboxContext;
   /** Closure-bound Gateway capability; revalidates both owners at child admission. */
   workerTurnExecutionIdentityCapability?: WorkerTurnExecutionIdentityCapability;
   /** Instance-bound routing only; delegated authority is revalidated separately. */
@@ -592,6 +596,8 @@ export async function withGatewayToolCallerIdentity<T>(
               inheritedOwner.sessionEventToolsAllow!.includes(name),
             )
           : (identity.sessionEventToolsAllow ?? inheritedOwner?.sessionEventToolsAllow),
+      workspaceBaseRefreshSandbox: inheritedValue("workspaceBaseRefreshSandbox"),
+      workspaceEvidenceSandbox: inheritedValue("workspaceEvidenceSandbox"),
       personalToolParticipants: inheritedValue("personalToolParticipants"),
       personalToolUser: inheritedValue("personalToolUser"),
       personalToolIdentityScoped: inheritedValue("personalToolIdentityScoped"),

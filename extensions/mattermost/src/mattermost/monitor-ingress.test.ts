@@ -16,6 +16,19 @@ type MattermostIngressQueue = NonNullable<
 type MattermostIngressPayload = Parameters<MattermostIngressQueue["enqueue"]>[1];
 type MattermostIngressDispatch = Parameters<typeof createMattermostIngressMonitor>[0]["dispatch"];
 
+function interceptAdmission(
+  queue: MattermostIngressQueue,
+  intercept: <T>(write: () => Promise<T>) => Promise<T>,
+) {
+  const enqueue = queue.enqueue.bind(queue);
+  queue.enqueue = (...args) => intercept(() => enqueue(...args));
+  // Idle ingress can append and claim atomically; storage gates must cover both entry points.
+  const enqueueAndClaim = queue.enqueueAndClaim?.bind(queue);
+  if (enqueueAndClaim) {
+    queue.enqueueAndClaim = (...args) => intercept(() => enqueueAndClaim(...args));
+  }
+}
+
 function postedEvent(params?: {
   postId?: string;
   channelId?: string;
@@ -130,13 +143,12 @@ describe("Mattermost durable ingress", () => {
       const monitorBBeforeRestart = startMonitor(queueB, dispatchBBeforeRestart, "account-b");
       const admissionStored = createDeferred<void>();
       const releaseAdmission = createDeferred<void>();
-      const enqueueB = queueB.enqueue.bind(queueB);
-      queueB.enqueue = async (...args) => {
-        const result = await enqueueB(...args);
+      interceptAdmission(queueB, async (write) => {
+        const result = await write();
         admissionStored.resolve();
         await releaseAdmission.promise;
         return result;
-      };
+      });
       let admittingB: Promise<void> | undefined;
       let stoppingB: Promise<void> | undefined;
 
@@ -227,14 +239,13 @@ describe("Mattermost durable ingress", () => {
   it("preserves same-channel arrival order across an append retry backoff", async () => {
     await withQueue(async (queue) => {
       let failFirst = true;
-      const enqueue = queue.enqueue.bind(queue);
-      queue.enqueue = async (...args) => {
+      interceptAdmission(queue, async (write) => {
         if (failFirst) {
           failFirst = false;
           throw new Error("sqlite busy");
         }
-        return await enqueue(...args);
-      };
+        return await write();
+      });
       const dispatched: string[] = [];
       const ingress = startMonitor(queue, async (post, _payload, lifecycle) => {
         dispatched.push(post.id);
@@ -281,14 +292,13 @@ describe("Mattermost durable ingress", () => {
   it("retries a transient append failure and escalates a persistent one", async () => {
     await withQueue(async (queue) => {
       let failures = 2;
-      const enqueue = queue.enqueue.bind(queue);
-      queue.enqueue = async (...args) => {
+      interceptAdmission(queue, async (write) => {
         if (failures > 0) {
           failures -= 1;
           throw new Error("sqlite busy");
         }
-        return await enqueue(...args);
-      };
+        return await write();
+      });
       const dispatch = vi.fn();
       const ingress = startMonitor(queue, dispatch);
       try {

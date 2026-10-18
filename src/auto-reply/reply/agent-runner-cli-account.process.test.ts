@@ -563,7 +563,7 @@ it.each([
                     sessionId: ctx.cronSession.sessionEntry.sessionId,
                     agentId: ctx.agentId,
                     lifecycleGeneration: generation,
-                    cronRunsByJobId: new Map([[job.id, { pacingEnabled: false }]]),
+                    cronRunsByJobId: new Map([[job.id, { nextCheckEnabled: false }]]),
                   },
                   { trackOwner: true, ownsContext: true },
                 );

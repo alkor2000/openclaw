@@ -16,6 +16,7 @@ export async function observeGatewayRunExecution(selection?: { method: "agent"; 
   const admission = await import("../process/gateway-work-admission.js");
   const asyncWork = await import("../shared/async-work-scope.js");
   const sessionWork = await import("../sessions/session-controller.lifecycle.js");
+  const requestScope = await import("../plugins/runtime/gateway-request-scope.js");
   const chatModule = selection
     ? undefined
     : await import("./server-methods/chat-send-dispatch-errors.js");
@@ -25,14 +26,33 @@ export async function observeGatewayRunExecution(selection?: { method: "agent"; 
   const continueWork = admission.runWithGatewayIndependentRootWorkContinuation;
   const trackWork = asyncWork.trackAsyncWork;
   const beginSessionWork = sessionWork.beginSessionEffect;
+  const withRequestScope = requestScope.withPluginRuntimeGatewayRequestScope;
   type ObservedRequest = {
     runId?: string;
     request?: Promise<void>;
     executions: Promise<void>[];
     effects: Set<Promise<unknown>>;
+    rootRelease: Promise<void> | null | undefined;
   };
   const requests: ObservedRequest[] = [];
   const observedRequest = new AsyncLocalStorage<ObservedRequest>();
+  const observeRequestScope: typeof withRequestScope = (scope, run) =>
+    withRequestScope(scope, () => {
+      const observed = observedRequest.getStore();
+      if (observed && observed.rootRelease === undefined) {
+        const observeRelease = admission.captureGatewayRootWorkReleaseObserver();
+        observed.rootRelease = null;
+        if (observeRelease) {
+          const released = createDeferred();
+          observed.rootRelease = released.promise;
+          observeRelease(() => released.resolve());
+        }
+      }
+      return run();
+    });
+  const requestScopeSpy = vi
+    .spyOn(requestScope, "withPluginRuntimeGatewayRequestScope")
+    .mockImplementation(observeRequestScope);
   const captureEffect = <T>(pending: Promise<T>): Promise<T> => {
     const observed = observedRequest.getStore();
     if (observed) {
@@ -82,6 +102,8 @@ export async function observeGatewayRunExecution(selection?: { method: "agent"; 
         runId: typeof runId === "string" ? runId : undefined,
         executions: [],
         effects: new Set(),
+        // Nested requests borrow the caller's root; waiting for it here would deadlock its owner.
+        rootRelease: admission.captureGatewayRootWorkReleaseObserver() ? null : undefined,
       };
       requests.push(observed);
       observed.request = observedRequest.run(observed, () => handleRequest(options, diagnostics));
@@ -130,6 +152,7 @@ export async function observeGatewayRunExecution(selection?: { method: "agent"; 
     while (observed.effects.size > 0) {
       await Promise.allSettled(observed.effects);
     }
+    await observed.rootRelease;
   };
   return {
     // Queued custody intentionally retains effects until a later execution settles.
@@ -155,6 +178,7 @@ export async function observeGatewayRunExecution(selection?: { method: "agent"; 
         }
       } finally {
         chatSpy?.mockRestore();
+        requestScopeSpy.mockRestore();
         sessionWorkSpy.mockRestore();
         asyncWorkSpy.mockRestore();
         executionSpy.mockRestore();

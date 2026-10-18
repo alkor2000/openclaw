@@ -78,6 +78,7 @@ export function useMenuMachine(
   options: MenuNavigationOptions = {},
 ): MenuBinding {
   let lastPointerX: number | undefined;
+  let lastPointerY: number | undefined;
   let focusFromKeyboard = false;
   const ownsTarget = (target: HTMLElement) =>
     ![...overlay.children].some((child) => child.open && containsComposed(child.surface, target)) &&
@@ -253,6 +254,10 @@ export function useMenuMachine(
     closeOnSelect: false,
     "aria-label": overlay.id,
     onOpenChange({ open }) {
+      // Keyboard entry must focus a submenu that pointer hover already opened.
+      if (open && overlay.open && focusFromKeyboard) {
+        focusItem(service.service);
+      }
       const restore = !open && containsComposed(overlay.surface, service.scope.getActiveElement());
       // A retired sibling can still own focus through its return trigger.
       const handoff =
@@ -329,14 +334,14 @@ export function useMenuMachine(
       }
     };
   });
+  // Keep Zag's imperative highlight within the currently enabled catalog.
   createEffect(
-    () => [options.items?.(), read().highlightedValue, options.value?.()] as const,
-    ([items, _highlighted, selected]) => {
+    () => [options.items?.(), read(), options.value?.()] as const,
+    ([items, api, selected]) => {
       if (!items) {
         return;
       }
       const enabled = items.filter((item) => !item.disabled);
-      const api = untrack(read);
       if (!enabled.some((item) => item.value === api.highlightedValue)) {
         const next =
           enabled.find((item) => item.value === selected)?.value ?? enabled[0]?.value ?? null;
@@ -462,7 +467,8 @@ export function useMenuMachine(
           }
         },
         onPointerMove: (event: PointerEvent) => {
-          if (event.movementX === 0 && event.movementY === 0) {
+          // WebKit can report zero movement offsets for a real mouse move.
+          if (event.clientX === lastPointerX && event.clientY === lastPointerY) {
             return;
           }
           focusFromKeyboard = false;
@@ -493,7 +499,12 @@ export function useMenuMachine(
           if (!focusFromKeyboard) {
             overlay.trigger?.focus({ preventScroll: true });
           }
-          result.onClick?.(event);
+          if (parentBinding && !event.defaultPrevented) {
+            // Zag ignores TRIGGER_CLICK while its submenu hover delay is pending.
+            api.setOpen(true);
+          } else {
+            result.onClick?.(event);
+          }
         },
         onKeyDown: (e: KeyboardEvent) => {
           if (disabled || e.key === "Escape") {
@@ -557,6 +568,7 @@ export function useMenuMachine(
         tabIndex: -1,
         onPointerMove: (event: PointerEvent) => {
           lastPointerX = event.clientX;
+          lastPointerY = event.clientY;
         },
         onKeyDown: (e: KeyboardEvent) => {
           const target = e.target;

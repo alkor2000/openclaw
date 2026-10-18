@@ -20,7 +20,10 @@ import {
 import type { SessionRowReadView } from "../session-row-prepared-read.js";
 import { getSessionRowProjection } from "../session-row-projection-access.js";
 import { resolveSessionStoreKey } from "../session-store-key.js";
-import { resolveSessionSubscriptionKey } from "../session-subscription-keys.js";
+import {
+  resolveSessionSubscriptionKey,
+  resolveSessionSubscriptionKeys,
+} from "../session-subscription-keys.js";
 import { resolveVisibleActiveSessionRunState } from "./session-active-runs.js";
 import type { GatewayRequestContext } from "./types.js";
 
@@ -224,6 +227,14 @@ function broadcastSessionsChanged(
   const projection = getSessionRowProjection(context);
   const broadcastOptions = {
     ...routingOptions,
+    sessionEventSubscriptionKeys:
+      payload.sessionKey && routingAgentId
+        ? resolveSessionSubscriptionKeys(
+            payload.sessionKey,
+            routingAgentId,
+            compatibilityOwnerAgentId,
+          )
+        : [],
     ...resolvePrivateSessionEventBroadcastScope(payload.sessionKey, scope),
     ...(read && projection
       ? { prepareSessionProjection: prepareSessionEventProjection(projection, read) }
@@ -417,7 +428,7 @@ export function emitSessionsChanged(
   if (!catalogOnly && options.accessChanged !== false) {
     bumpGatewayAccessRevision();
   }
-  if (!catalogOnly) {
+  if (!catalogOnly && options.rowScope !== "runtime") {
     // Inbox subscriptions are independent of session-list subscriptions, including a closed sidebar.
     void context.mentionInbox?.invalidateAsync(payload.sessionKey);
   }
@@ -498,6 +509,8 @@ export function emitSessionTitleChanged(
       { ...target, reason: "chat.title" },
       { accessChanged: false, rowScope: "runtime" },
     );
+    // Title completion follows a metadata commit even though naming state is runtime-only.
+    void context.mentionInbox?.invalidateAsync(target.sessionKey);
   } catch (error) {
     log.warn("Session title state publication failed", {
       error: formatErrorMessageWithCode(error),

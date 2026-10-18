@@ -1,10 +1,11 @@
-import { createEffect, createSignal } from "solid-js";
+import { onSettled } from "solid-js";
 import { createOverlayAnchor } from "../../../components/overlay-anchor.ts";
 import { createOverlay, findOverlayParent } from "../../../components/overlay-lifecycle.ts";
 import { registryFor } from "../../../components/overlay-registry.ts";
 import "../../../components/solid/overlay.css";
 import { consumeTooltipEscape } from "../../../components/tooltip.ts";
 import { acquireNativeOverlaySurface } from "../../../lib/native-overlay-occlusion.ts";
+import { listen } from "../../../lib/reactive/listener.ts";
 import { clearChatModelSearchOnEscape } from "./chat-model-picker-search.ts";
 
 const MOBILE_COMPOSER_OVERLAY_QUERY =
@@ -19,7 +20,10 @@ const INVOCATION_MENUS = ".agent-chat__input > :is(.slash-menu, .skill-menu)";
 let nextPickerId = 0;
 
 /** Keep native details selectors while the shared overlay owns visibility and dismissal. */
-function bindChatPickerOverlay(details: HTMLDetailsElement): () => void {
+function bindChatPickerOverlay(
+  details: HTMLDetailsElement,
+  onOpenChange?: (details: HTMLDetailsElement) => void,
+): () => void {
   const trigger = details.querySelector<HTMLElement>(":scope > summary")!;
   const surface = details.querySelector<HTMLElement>(":scope > [data-anchored-overlay]")!;
   const overlay = createOverlay(`chat-picker-${++nextPickerId}`, findOverlayParent(trigger), {
@@ -36,7 +40,7 @@ function bindChatPickerOverlay(details: HTMLDetailsElement): () => void {
   surface.setAttribute("aria-labelledby", trigger.id);
   overlay.bindSurface(surface);
   overlay.bindTrigger(trigger);
-  const anchor = createOverlayAnchor(surface);
+  const anchor = createOverlayAnchor(surface, { sameRoot: true });
   const sync = () => {
     const mobile = details.ownerDocument.defaultView?.matchMedia?.(
       MOBILE_COMPOSER_OVERLAY_QUERY,
@@ -50,13 +54,38 @@ function bindChatPickerOverlay(details: HTMLDetailsElement): () => void {
     }
   };
   details.setAttribute("data-chat-native-picker", "");
+  let lastOpen = overlay.open;
+  // Mirror each open/close edge into native details and its dismissal callback synchronously.
   const stop = overlay.subscribe((open) => {
     details.open = open;
+    if (open !== lastOpen) {
+      lastOpen = open;
+      onOpenChange?.(details);
+    }
   });
-  details.addEventListener("toggle", sync);
+  const toggle = () => {
+    if (details.open === overlay.open) {
+      return;
+    }
+    sync();
+  };
+  const activate = (event: Event) => {
+    if (event.defaultPrevented || !event.composedPath().includes(trigger)) {
+      return;
+    }
+    event.preventDefault();
+    if (trigger.getAttribute("aria-disabled") === "true") {
+      return;
+    }
+    details.open = !details.open;
+    toggle();
+  };
+  const stopClick = listen(details, "click", activate);
+  const stopToggle = listen(details, "toggle", toggle);
   sync();
   return () => {
-    details.removeEventListener("toggle", sync);
+    stopClick();
+    stopToggle();
     stop();
     details.removeAttribute("data-chat-native-picker");
     overlay.dispose();
@@ -65,10 +94,14 @@ function bindChatPickerOverlay(details: HTMLDetailsElement): () => void {
 }
 
 /** The ref only publishes the node; the component owner binds and releases its surface. */
-export function createChatPickerOverlay(): (details: HTMLDetailsElement) => void {
-  const [element, setElement] = createSignal<HTMLDetailsElement>();
-  createEffect(element, (details) => (details ? bindChatPickerOverlay(details) : undefined));
-  return (details) => setElement(details);
+export function createChatPickerOverlay(
+  onOpenChange?: (details: HTMLDetailsElement) => void,
+): (details: HTMLDetailsElement) => void {
+  let element!: HTMLDetailsElement;
+  onSettled(() => bindChatPickerOverlay(element, onOpenChange));
+  return (details) => {
+    element = details;
+  };
 }
 
 // Split panes and Home can overlap New Session. Keep one document listener set
@@ -94,7 +127,7 @@ function connectChatComposerPickerDismissal(ownerDocument: Document): () => void
   const controller = new AbortController();
   const options = { capture: true, signal: controller.signal };
 
-  function dismissChatComposerPickersOutside(event: PointerEvent): void {
+  function dismissChatComposerPickersOutside(event: Event): void {
     const path = event.composedPath();
     for (const menu of ownerDocument.querySelectorAll<HTMLElement>(INVOCATION_MENUS)) {
       if (!path.includes(menu)) {
@@ -133,13 +166,20 @@ function connectChatComposerPickerDismissal(ownerDocument: Document): () => void
       ?.focus({ preventScroll: true });
   }
 
-  ownerDocument.addEventListener("pointerdown", dismissChatComposerPickersOutside, options);
+  listen(ownerDocument, "pointerdown", dismissChatComposerPickersOutside, options);
   // Native surfaces consume Escape before invocation menus beneath them.
-  ownerDocument.defaultView?.addEventListener(
-    "keydown",
-    dismissChatComposerPickersOnEscape,
-    options,
-  );
+  if (ownerDocument.defaultView) {
+    listen(
+      ownerDocument.defaultView,
+      "keydown",
+      (event) => {
+        if (event instanceof KeyboardEvent) {
+          dismissChatComposerPickersOnEscape(event);
+        }
+      },
+      options,
+    );
+  }
 
   return () => controller.abort();
 }

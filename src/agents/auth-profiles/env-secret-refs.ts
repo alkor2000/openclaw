@@ -5,6 +5,7 @@ import type { Result } from "@openclaw/normalization-core/result";
 import { collectEnvSecretRefIds } from "../../config/resolution-facts.js";
 import { parseSecretRef } from "../../config/types.secrets.js";
 import { isDeletedAgentDatabasePath } from "../../infra/agent-database-readers.js";
+import { getDatabaseEngineInput } from "../../infra/database-engine/context.js";
 import { SqliteSnapshotCleanupError } from "../../infra/sqlite-readonly-location-cleanup.js";
 import {
   openSqliteReadOnlyDatabase,
@@ -39,7 +40,7 @@ export function collectAuthProfileEnvSecretRefIds(params: {
         continue;
       }
       const inspection =
-        target.kind === "agent"
+        target.kind === "agent" && !getDatabaseEngineInput("agent")
           ? (() => {
               // Even readonly SQLite opens can create or change a source's WAL/SHM.
               const source = prepareSqliteReadOnlyLocationSync(target.path);

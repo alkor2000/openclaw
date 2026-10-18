@@ -270,15 +270,24 @@ async function guardGatewayRunSelectedConfig(
         { collectAuthProfileEnvSecretRefIds },
         { collectCandidateAgentDirs },
         { AuthProfileStoreUnreadableError },
+        { resolveDatabaseEngineSelection },
+        { withDatabaseEngineSelection },
+        { withEngineStoreAdmission },
       ] = await Promise.all([
         import("../../agents/auth-profiles/env-secret-refs.js"),
         import("../../secrets/runtime-fast-path.js"),
         import("../../agents/auth-profiles/store-unreadable-error.js"),
+        import("../../infra/database-engine/config.js"),
+        import("../../infra/database-engine/context.js"),
+        import("../../infra/database-engine/admission-scope.js"),
       ]);
       return {
         collectAuthProfileEnvSecretRefIds,
         collectCandidateAgentDirs,
         AuthProfileStoreUnreadableError,
+        resolveDatabaseEngineSelection,
+        withDatabaseEngineSelection,
+        withEngineStoreAdmission,
       };
     })(),
   ]);
@@ -364,10 +373,22 @@ async function guardGatewayRunSelectedConfig(
     const managedKeys = readManagedSystemdServiceEnvKeysFromEnvironment(process.env);
     if (authProfileEnv && managedKeys.size > 0) {
       try {
-        for (const id of authProfileEnv.collectAuthProfileEnvSecretRefIds({
-          agentDirs: authProfileEnv.collectCandidateAgentDirs(snapshot.sourceConfig, process.env),
-          env: process.env,
-        })) {
+        const selection = await authProfileEnv.resolveDatabaseEngineSelection(
+          snapshot.config,
+          process.env,
+        );
+        const references = authProfileEnv.withDatabaseEngineSelection(selection, () =>
+          authProfileEnv.withEngineStoreAdmission(() =>
+            authProfileEnv.collectAuthProfileEnvSecretRefIds({
+              agentDirs: authProfileEnv.collectCandidateAgentDirs(
+                snapshot.sourceConfig,
+                process.env,
+              ),
+              env: process.env,
+            }),
+          ),
+        );
+        for (const id of references) {
           preserveKeys.add(id);
         }
       } catch (error) {

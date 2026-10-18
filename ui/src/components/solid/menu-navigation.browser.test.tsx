@@ -17,33 +17,27 @@ import { Menu, type MenuEntry, type MenuItem, type MenuProps } from "./menu.tsx"
 afterEach(cleanup);
 
 describe("Solid menu navigation", () => {
-  it("keeps submenu icons and details in the visible trigger", async () => {
-    let icon!: HTMLSpanElement;
-    let details!: HTMLSpanElement;
-    render(() => (
-      <Menu
-        id="people"
-        label="People"
-        items={[
-          {
-            id: "view",
-            label: "View",
-            icon: <span ref={(node) => (icon = node)}>Eye</span>,
-            details: <span ref={(node) => (details = node)}>V</span>,
-            children: [{ id: "reasoning", label: "Reasoning" }],
-          },
-        ]}
-      />
-    ));
+  it("releases transient rows on close and restores current rows with keyboard focus", async () => {
+    const [label, setLabel] = createSignal("First");
+    const view = mountMenu({
+      lazy: "while-open",
+      get items() {
+        return [{ id: "current", label: label() }];
+      },
+    });
+    expect(surface().querySelector("[role=menuitem]")).toBeNull();
+    trigger().focus();
+    await userEvent.keyboard("{ArrowDown}");
+    await phase(surface(), "open");
+    expect(document.activeElement).toBe(item("First"));
+    expect(document.querySelectorAll(":popover-open")).toHaveLength(1);
+    await userEvent.keyboard("{Escape}");
+    await phase(surface(), "hidden");
+    expect(surface().querySelector("[role=menuitem]")).toBeNull();
+    setLabel("Second");
     flush();
-    await openMenu();
-    const view = item("View");
-    expect(view.contains(icon)).toBe(true);
-    expect(view.contains(details)).toBe(true);
-    await userEvent.click(view);
-    await phase(surface("people-view"), "open");
-    expect(view.contains(icon)).toBe(true);
-    expect(view.contains(details)).toBe(true);
+    expect(view.handle.open()).toBe(true);
+    expect(document.activeElement).toBe(item("Second"));
   });
 
   it("materializes lazy content at first keyboard admission and retains it when reopened", async () => {

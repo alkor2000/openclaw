@@ -9,7 +9,6 @@ import {
   clearRuntimeConfigSnapshot,
   setRuntimeConfigSnapshot,
 } from "../../config/runtime-snapshot.js";
-import type { SessionEntry } from "../../config/sessions.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { McpLoopbackRequestContext } from "../../gateway/mcp-grant-store.js";
 import { handleMcpJsonRpc } from "../../gateway/mcp-http.handlers.js";
@@ -88,9 +87,7 @@ describe("CLI attempt session MCP overrides", () => {
       const [client, transport] = InMemoryTransport.createLinkedPair();
       const server = new Server(
         { name: "session-override-proof", version: "1" },
-        {
-          capabilities: { tools: {} },
-        },
+        { capabilities: { tools: {} } },
       );
       server.setRequestHandler(ListToolsRequestSchema, async () => ({
         tools: [{ name: "read_docs", inputSchema: { type: "object" } }],
@@ -164,7 +161,7 @@ describe("CLI attempt session MCP overrides", () => {
   ])(
     "serializes global=$globalEnabled session=$sessionEnabled as enabled=$expectedEnabled",
     async ({ globalEnabled, sessionEnabled, expectedEnabled }) => {
-      const sessionEntry: SessionEntry = makeSessionEntry(
+      const sessionEntry = makeSessionEntry(
         "session-mcp",
         sessionEnabled !== undefined
           ? { toolOverrides: { mcpServers: { docs: sessionEnabled } } }

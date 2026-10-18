@@ -1,3 +1,4 @@
+import type { ModelThinkingLevel } from "@openclaw/llm-core/types";
 import type { NormalizedUsage } from "../agents/usage.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { ContextEngineHostCapability } from "../context-engine/types.js";
@@ -126,15 +127,7 @@ export type CliBackendPreparedExecutionV2 = Omit<CliBackendPreparedExecution, "e
   execute?: CliBackendExecuteV2;
 };
 
-export type CliBackendThinkingLevel =
-  | "off"
-  | "minimal"
-  | "low"
-  | "medium"
-  | "high"
-  | "xhigh"
-  | "adaptive"
-  | "max";
+export type CliBackendThinkingLevel = ModelThinkingLevel | "adaptive";
 
 export type CliBackendExecutionMode = "agent" | "side-question";
 
@@ -302,7 +295,7 @@ type CliBackendResolveModelIdContext = {
 
 export type CliBackendJsonlUsage = Pick<
   NormalizedUsage,
-  "input" | "output" | "cacheRead" | "cacheWrite" | "total"
+  "input" | "output" | "cacheRead" | "cacheWrite" | "cacheWrite1h" | "total"
 >;
 
 export type CliBackendParsedJsonlEvent =
@@ -552,6 +545,8 @@ type CliBackendPluginBase = {
    * renders them but does not treat them as host tool execution or delivery evidence.
    */
   parseJsonlEvent?: CliBackendParseJsonlEvent;
+  /** Normalize backend-native failures into diagnostic codes without changing retry policy. */
+  classifyErrorCode?: (message: string) => string | undefined;
   /**
    * Optional lifecycle parser kept separate from the legacy JSONL event union.
    * Existing plugins can continue exhaustively matching `parseJsonlEvent` results.

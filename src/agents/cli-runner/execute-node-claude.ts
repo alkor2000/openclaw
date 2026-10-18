@@ -62,17 +62,25 @@ export function stripGatewayLocalClaudeArgs(args: readonly string[]): string[] {
   return result;
 }
 
-function parseNodeClaudeResultPayload(result: { payload?: unknown; payloadJSON?: string | null }): {
+function parseNodeClaudePayload(result: {
+  payload?: unknown;
+  payloadJSON?: string | null;
+}): Record<string, unknown> | null {
+  const value = result.payloadJSON ? (JSON.parse(result.payloadJSON) as unknown) : result.payload;
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function parseNodeClaudeResultPayload(record: Record<string, unknown> | null): {
   exitCode: number;
   stderrTail: string;
   truncated: boolean;
   timeoutKind?: "hard" | "idle";
 } {
-  const value = result.payloadJSON ? (JSON.parse(result.payloadJSON) as unknown) : result.payload;
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
+  if (!record) {
     throw new Error("paired node returned an invalid Claude CLI result");
   }
-  const record = value as Record<string, unknown>;
   if (
     !Number.isInteger(record.exitCode) ||
     typeof record.stderrTail !== "string" ||
@@ -97,19 +105,12 @@ type NodeClaudeApprovalRequired = {
   ask: ExecAsk;
 };
 
-function parseNodeClaudeApprovalRequired(result: {
-  ok: boolean;
-  payload?: unknown;
-  payloadJSON?: string | null;
-}): NodeClaudeApprovalRequired | null {
-  if (!result.ok) {
+function parseNodeClaudeApprovalRequired(
+  record: Record<string, unknown> | null,
+): NodeClaudeApprovalRequired | null {
+  if (!record) {
     return null;
   }
-  const value = result.payloadJSON ? (JSON.parse(result.payloadJSON) as unknown) : result.payload;
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return null;
-  }
-  const record = value as Record<string, unknown>;
   if (
     record.approvalRequired !== true ||
     !record.systemRunPlan ||
@@ -180,6 +181,7 @@ export async function executeNodeClaudeRun(params: {
     },
   });
   let nodeResult: Awaited<ReturnType<typeof invokeNodeClaudeCliRun>>;
+  let nodePayload: Record<string, unknown> | null | undefined;
   let skillRuntime: Awaited<ReturnType<typeof prepareNodeClaudeSkillRuntime>>;
   try {
     assertCurrent();
@@ -232,7 +234,8 @@ export async function executeNodeClaudeRun(params: {
       );
     };
     nodeResult = await invokeNode();
-    const approval = parseNodeClaudeApprovalRequired(nodeResult);
+    nodePayload = nodeResult.ok ? parseNodeClaudePayload(nodeResult) : null;
+    const approval = parseNodeClaudeApprovalRequired(nodePayload);
     if (approval) {
       skillRuntime?.assertCurrent();
       const approvalId = crypto.randomUUID();
@@ -262,6 +265,7 @@ export async function executeNodeClaudeRun(params: {
         () =>
           params.deps.resolveRegisteredExecApprovalDecision({
             approvalId: registration.id,
+            expiresAtMs: registration.expiresAtMs,
             preResolvedDecision: registration.finalDecision,
           }),
         skillRuntime?.signal ?? nodeAbortController.signal,
@@ -269,6 +273,7 @@ export async function executeNodeClaudeRun(params: {
       );
       if (decision === "allow-once" || decision === "allow-always") {
         nodeResult = await invokeNode({ decision, plan: approval.systemRunPlan });
+        nodePayload = undefined;
       } else {
         nodeResult = {
           ok: false,
@@ -299,7 +304,9 @@ export async function executeNodeClaudeRun(params: {
   const errorCode = nodeResult.ok ? undefined : nodeResult.error?.code;
   const failureDurationMs = nodeResult.ok ? undefined : Date.now() - startedAt;
   const payload = nodeResult.ok
-    ? parseNodeClaudeResultPayload(nodeResult)
+    ? parseNodeClaudeResultPayload(
+        nodePayload === undefined ? parseNodeClaudePayload(nodeResult) : nodePayload,
+      )
     : {
         exitCode: 1,
         stderrTail: nodeResult.error?.message ?? "paired-node Claude CLI invocation failed",

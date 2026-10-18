@@ -46,7 +46,12 @@ import { resolveCronAuthenticatedChannelRequester } from "../tools-allow-provena
 import type { CronAgentExecutionPhaseUpdate } from "../types.js";
 import { isCommandStyleCronMessage } from "./command-style-prompt.js";
 import { resolveIsolatedCronPromptCacheKey } from "./prompt-cache-key.js";
-import { assertCronRuntimeAuthorityCandidate } from "./run-admission.js";
+import {
+  assertCronCandidateSandboxPlacement,
+  assertCronRuntimeAuthorityCandidate,
+  resolveCronSandboxPlacement,
+  type CronSandboxPlacement,
+} from "./run-admission.js";
 import {
   createCronCandidateExecutionResolver,
   prepareCronCandidateAuthSelection,
@@ -164,6 +169,9 @@ export function createCronPromptExecutor(
     hasNewGeneratedMediaTaskForSessionKey(params.runSessionKey, attemptMediaTaskIds);
 
   const resolveCandidateExecution = createCronCandidateExecutionResolver(params);
+  // Resolved once per isolated run from the prepared session entry; every
+  // candidate (initial, fallback, override) reuses the same placement facts.
+  let sandboxPlacement: CronSandboxPlacement | undefined;
 
   return async (promptText: string, runStartedAt: number): Promise<CronCompletedPromptRun> => {
     using inferenceLease = new DisposableStack();
@@ -382,6 +390,22 @@ export function createCronPromptExecutor(
           candidateRuntime,
           cliExecution,
         });
+        // CLI backends execute on the gateway host; a session whose configured
+        // sandbox claims containment must fail closed instead of dispatching
+        // there. Covers every candidate: initial selection, fallbacks, and
+        // harness/runtime overrides. Unowned preflight errors are terminal for
+        // the whole fallback chain, so this cannot silently switch models.
+        sandboxPlacement ??= resolveCronSandboxPlacement({
+          cfg: params.cfgWithAgentDefaults,
+          agentId: params.agentId,
+          sessionKey: params.runSessionKey,
+          preparedSessionEntry: params.cronSession.sessionEntry,
+        });
+        assertCronCandidateSandboxPlacement({
+          ...sandboxPlacement,
+          cliExecution,
+          executionProvider,
+        });
         // The validated candidate that admits detached work owns its continuation
         // even if the provider throws before returning result metadata.
         const modelChanged = setCronSessionRuntimeModel({
@@ -446,6 +470,7 @@ export function createCronPromptExecutor(
             extraSystemPrompt: params.deliverySystemPrompt,
             sourceReplyDeliveryMode: sourceDelivery.sourceReplyDeliveryMode,
             requireExplicitMessageTarget: sourceDelivery.messageTool.requireExplicitTarget,
+            messageToolFinalByDefault: sourceDelivery.messageTool.finalByDefault,
             scheduledToolPolicy,
             onExecutionStarted: notifyExecutionStarted,
             onExecutionPhase: notifyExecutionPhase,

@@ -19,7 +19,6 @@ import {
   activateMcpLoopbackClientGrantCapture,
   bindMcpLoopbackClientGrantAdmission,
   deactivateMcpLoopbackClientGrantCapture,
-  mintMcpLoopbackClientGrant,
   revokeMcpLoopbackClientGrant,
   transferMcpLoopbackClientGrant,
 } from "../../gateway/mcp-grant-store.js";
@@ -87,7 +86,6 @@ import {
 import { resolveContextWindowInfo } from "../context-window-guard.js";
 import { resolveContextTokensForModel } from "../context.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../defaults.js";
-import { waitForDeferredTurnMaintenanceForSession } from "../embedded-agent-runner/context-engine-maintenance.js";
 import {
   resolvePromptBuildHookResult,
   type ResolvedPromptBuildHookResult,
@@ -105,6 +103,7 @@ import { recordModelFallbackStop } from "../model-fallback-stop.js";
 import { recordAdmittedModelRoutingDecision } from "../model-routing-decision.js";
 import { applyPluginTextReplacements } from "../plugin-text-transforms.js";
 import { resolveRuntimeChannelPromptContext } from "../runtime-capabilities.js";
+import { waitForSessionMaintenance } from "../session-maintenance/coordinator.js";
 import { buildSystemPromptReport } from "../system-prompt-report.js";
 import { appendModelIdentitySystemPrompt, buildModelIdentityPromptLine } from "../system-prompt.js";
 import { normalizeToolPolicyName } from "../tool-policy.js";
@@ -135,6 +134,7 @@ import {
 import { isClaudeCliBackendId, normalizeCliModel } from "./helpers.js";
 import { prepareCliHistoryBoundary } from "./history-boundary.js";
 import { cliBackendLog } from "./log.js";
+import { mintCliMcpClientGrant } from "./mcp-client-grant.js";
 import { buildCliMcpGrantContext } from "./mcp-grant-context.js";
 import { resolveCliCatalogCapabilities } from "./model-capabilities.js";
 import { detectNodeClaudePlacement, resolveClaudeCliContextModelId } from "./prepare-claude.js";
@@ -233,16 +233,15 @@ async function prepareCliRunContextWithinReadFence(
     agentId: sessionOwner,
     config: workspaceConfig,
   });
-  const resolvedWorkspace = workspaceResolution.workspaceDir;
+  const workspaceDir = workspaceResolution.workspaceDir;
   const redactedSessionId = redactRunIdentifier(params.sessionId);
   const redactedSessionKey = redactRunIdentifier(params.sessionKey);
-  const redactedWorkspace = redactRunIdentifier(resolvedWorkspace);
+  const redactedWorkspace = redactRunIdentifier(workspaceDir);
   if (workspaceResolution.usedFallback) {
     cliBackendLog.warn(
       `[workspace-fallback] caller=runCliAgent reason=${workspaceResolution.fallbackReason} run=${params.runId} session=${redactedSessionId} sessionKey=${redactedSessionKey} agent=${workspaceResolution.agentId} workspace=${redactedWorkspace}`,
     );
   }
-  const workspaceDir = resolvedWorkspace;
   const suppliedSessionKey = params.sessionKey?.trim();
   if (suppliedSessionKey) {
     // Native questions and MCP tools share explicit aliases; absent native keys stay sessionless.
@@ -258,7 +257,7 @@ async function prepareCliRunContextWithinReadFence(
   // Every prompt/history read must observe prior deferred rewrites. Caller-owned
   // memory remains independent of durable work sharing its correlation key.
   if (!params.isolatedCompletion && !isControlOperation && !params.sessionManager) {
-    await waitForDeferredTurnMaintenanceForSession(params.sessionKey ?? params.sessionId);
+    await waitForSessionMaintenance(params.sessionKey ?? params.sessionId);
   }
   const policySessionKey = params.runtimePolicySessionKey ?? params.sessionKey;
   // Capture the requester before admission replaces agentId with the execution owner.
@@ -309,6 +308,8 @@ async function prepareCliRunContextWithinReadFence(
     backendId: backendResolved.id,
     bundleMcp: backendResolved.bundleMcp,
     canEnforceExactToolAvailability,
+    projectNativeToolAuthority: backendResolved.projectNativeToolAuthority,
+    sideQuestionToolMode: backendResolved.sideQuestionToolMode,
     isSideQuestion,
     skipsTurnPreparation,
   });
@@ -708,9 +709,9 @@ async function prepareCliRunContextWithinReadFence(
           trigger: params.trigger,
           sessionKey: params.sessionKey,
           isPrimaryRun: isPrimaryBootstrapRun(params.sessionKey),
-          isCanonicalWorkspace: canonicalWorkspace === resolvedWorkspace,
+          isCanonicalWorkspace: canonicalWorkspace === workspaceDir,
           effectiveWorkspace: workspaceDir,
-          resolvedWorkspace,
+          resolvedWorkspace: workspaceDir,
           hasBootstrapFileAccess,
         });
   const bootstrapMode = bootstrapRouting?.bootstrapMode ?? "none";
@@ -941,9 +942,9 @@ async function prepareCliRunContextWithinReadFence(
   let cleanupPreparedResources: (() => Promise<void>) | undefined;
   let preparedExecution: PreparedCliBackendExecution | undefined;
   try {
-    const mcpClientGrant =
+    const mcpClient =
       mcpLoopbackRuntime && mcpGrant
-        ? mintMcpLoopbackClientGrant({
+        ? await mintCliMcpClientGrant({ ...params, config: runConfig }, sessionAgentId, {
             ...mcpGrant,
             sessionEventSourcePolicy,
             runtimeOwnerToken: mcpLoopbackRuntime.ownerToken,
@@ -953,6 +954,10 @@ async function prepareCliRunContextWithinReadFence(
             ...(mcpToolAuth ? { toolAuth: mcpToolAuth } : {}),
           })
         : undefined;
+    const mcpClientGrant = mcpClient?.grant;
+    // The grant's cleanup also releases the memory audience leased for this turn.
+    const cleanupMcpClientGrant = mcpClient?.cleanup;
+    cleanupPreparedResources = cleanupMcpClientGrant;
     const bindMcpClientGrantAdmission = (
       admittedRunContext: NonNullable<RunCliAgentParams["admittedRunContext"]>,
     ) => {
@@ -1049,17 +1054,6 @@ async function prepareCliRunContextWithinReadFence(
             };
           })()
         : undefined;
-    let mcpClientGrantRevoked = false;
-    const cleanupMcpClientGrant = mcpClientGrant
-      ? async () => {
-          if (mcpClientGrantRevoked) {
-            return;
-          }
-          mcpClientGrantRevoked = true;
-          revokeMcpLoopbackClientGrant(mcpClientGrant.token);
-        }
-      : undefined;
-    cleanupPreparedResources = cleanupMcpClientGrant;
     const rawLoopbackServerConfig = mcpLoopbackRuntime
       ? createMcpLoopbackServerConfig(mcpLoopbackRuntime.port)
       : undefined;
@@ -1420,6 +1414,7 @@ async function prepareCliRunContextWithinReadFence(
         ? extraSystemPrompt
         : await prepareCliSystemPrompt({
             preparedTtsPreferences: params.preparedTtsPreferences,
+            preparedSessionEntry: params.sessionEntry,
             requesterProfileId,
             workspaceDir,
             cwd,
@@ -1472,11 +1467,13 @@ async function prepareCliRunContextWithinReadFence(
     // Explicit caller-owned memory remains input; it cannot authorize borrowed durable history.
     const historyAllowed = params.sessionManager !== undefined || cliHistoryWriter !== undefined;
     // Native compatibility and transcript account ownership are independent gates.
+    // A session-less backend starts every turn fresh, so the account-owned transcript is
+    // its only continuity; the backend's raw-reseed opt-in still decides delivery.
     const rawTranscriptReseedReason = !historyAllowed
       ? "auth-unknown"
       : reusableCliSessionId
         ? "session-expired"
-        : (invalidatedReason ?? (ignoreCliSessionCandidate ? undefined : "missing-transcript"));
+        : (invalidatedReason ?? (ignoreCliSessionCandidate ? "stateless" : "missing-transcript"));
     const sessionPromptContext =
       skipsTurnPreparation || params.isolatedCompletion
         ? undefined

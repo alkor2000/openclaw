@@ -43,6 +43,7 @@ import {
 } from "../../plugins/runtime.js";
 import { withPluginRuntimeGenerationScope } from "../../plugins/runtime/generation-scope.js";
 import { createPluginRecord } from "../../plugins/status.test-fixtures.js";
+import { withSessionTurn } from "../../sessions/session-controller.admission.js";
 import { resolveGlobalMap } from "../../shared/global-singleton.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { createAgentLifecycleTerminalBackstop } from "./agent-lifecycle-terminal.js";
@@ -324,152 +325,165 @@ it.each([
           });
         }
         if (kind === "chat") {
-          preparedRunAdmission = prepareSystemAgentRunAdmission(
-            cfg,
-            runId,
-            "main",
-            "chat-cli-account-process",
-          );
-          deferredLifecycle = createDeferredEmbeddedRunLifecycleManager({
-            runId,
-            agentId: "main",
-            sessionId: target.sessionId,
-            sessionKey,
-          });
-          const followupRun: FollowupRun = {
-            prompt: "Synthetic account-bound reply",
-            summaryLine: "Synthetic account-bound reply",
-            enqueuedAt: Date.now(),
-            run: {
+          run = withSessionTurn(target, async (operation, signal) => {
+            preparedRunAdmission = prepareSystemAgentRunAdmission(
+              cfg,
+              runId,
+              "main",
+              "chat-cli-account-process",
+            );
+            const manager = createDeferredEmbeddedRunLifecycleManager({
+              replyOperation: operation,
+              abortSignal: signal,
+              runId,
               agentId: "main",
-              agentDir,
               sessionId: target.sessionId,
               sessionKey,
-              sessionFile: path.join(state.root, "logical-session.jsonl"),
-              workspaceDir: state.workspaceDir,
-              config: cfg,
-              provider: "anthropic",
-              model: "primary-fixture",
-              authProfileId: CONFIGURED_PROFILE,
-              authProfileIdSource: "user",
-              blockReplyBreak: "message_end",
-              timeoutMs: 10_000,
-              skillsSnapshot: { prompt: "", skills: [] },
-              thinkingCatalog: [{ provider: "google", id: model, input: ["text"] }],
-            },
-          };
-          // Actual provenance producer; this supplies configured candidate facts, not
-          // an auth-selector or fallback result. Outer selection is outside this boundary.
-          const selection = await resolveSessionAuthSelection({
-            cfg,
-            provider: "anthropic",
-            modelId: "primary-fixture",
-            agentId: "main",
-            agentDir,
-            sessionEntry: entry,
-            sessionKey,
-            storePath: target.storePath,
-            isNewSession: false,
-          });
-          expect(selection?.profileId).toBe(CONFIGURED_PROFILE);
-          expect(selection?.configuredPrimaryProvider).toBe("anthropic");
-          followupRun.run.authProfileId = selection?.profileId;
-          followupRun.run.authProfileIdSource = selection?.source;
-          bindConfiguredModelAuthProfileScope(
-            followupRun.run,
-            selection?.configuredPrimaryProvider,
-          );
-          const turn: AgentTurnParams = {
-            commandBody: followupRun.prompt,
-            followupRun,
-            sessionCtx: { Provider: "webchat" },
-            opts: { disableTools: true },
-            typingSignals: {
-              mode: "never",
-              shouldStartImmediately: false,
-              shouldStartOnMessageStart: false,
-              shouldStartOnText: false,
-              shouldStartOnReasoning: false,
-              signalRunStart: noActivity,
-              signalMessageStart: noActivity,
-              signalTextDelta: noActivity,
-              signalReasoningDelta: noActivity,
-              signalToolStart: noActivity,
-            },
-            blockReplyPipeline: null,
-            blockStreamingEnabled: false,
-            resolvedBlockStreamingBreak: "message_end",
-            applyReplyToMode: (payload) => payload,
-            shouldEmitToolResult: () => false,
-            shouldEmitToolOutput: () => false,
-            pendingToolTasks: new Set(),
-            isHeartbeat: false,
-            sessionKey,
-            storePath: target.storePath,
-            activeSessionStore: { [sessionKey]: entry },
-            getActiveSessionEntry: () => entry,
-            resolvedVerboseLevel: "off",
-          };
-          contextEngineLogicalTurnLease = await createContextEngineLogicalTurnLease({
-            identity: { runId, sessionId: target.sessionId },
-            config: cfg,
-            agentDir,
-            workspaceDir: state.workspaceDir,
-          });
-          const common: AgentFallbackCandidateCommonParams = {
-            agentHarnessRuntimeOverride: undefined,
-            assistantErrorTranscript: createAssistantErrorTranscript(),
-            modelRoutingProvenance: {
-              requestedProvider: "anthropic",
-              requestedModel: "primary-fixture",
-              stage: "fallback",
-              fallbackReason: "timeout",
-            },
-            contextEngineLogicalTurnLease,
-            onContextEngineTurnCandidate: () => {},
-            preparedRunAdmission,
-            turn,
-            candidateRun: followupRun.run,
-            runtimeConfig: cfg,
-            provider: "google",
-            model,
-            runId,
-            runLane: "test:chat-cli-account",
-            candidateFastMode: {},
-            suppressQueuedUserPersistenceForCandidate: false,
-            userTurnTranscriptRecorder: undefined,
-            notifyUserMessagePersisted: () => {},
-            fastModeStartedAtMs: Date.now(),
-            fastModeAutoProgressState: { offAnnounced: false, resetAnnounced: false },
-            bootstrapContextRunKind: "default",
-            bootstrapPromptWarningSignaturesSeen: [],
-            currentTurnImages: { images: [] },
-            signalExecutionPhaseForTyping: () => {},
-            prepareAgentRunStart: () => {},
-            notifyAgentRunStart: () => {},
-            preserveProgressCallbackStartOrder: false,
-            presentation: createAgentTurnPresentation({
-              turn,
-              replyMediaContext: { normalizePayload: async (p) => p },
-              directBlockDeliveries: [],
-              heartbeatState: { didLogStrip: false },
-            }),
-            timing: createAgentTurnTimingTracker(),
-            onLifecycleBackstop: () => {},
-            deferredLifecycle,
-            isFallbackRetry: true,
-            isFinalFallbackAttempt: true,
-            classifyResult: (result) =>
-              classifyEmbeddedAgentRunResultForModelFallback({ provider: "google", model, result }),
-          };
-          run = runCliFallbackCandidate({
-            ...common,
-            cliExecutionProvider: runtime,
-            lifecycleGeneration: getAgentEventLifecycleGeneration(),
-            onSessionWriter: () => {},
-            providerScopedAuthProfile: resolveRunAuthProfile(followupRun.run, "google", {
-              config: cfg,
-            }),
+            });
+            deferredLifecycle = manager;
+            try {
+              const followupRun: FollowupRun = {
+                prompt: "Synthetic account-bound reply",
+                summaryLine: "Synthetic account-bound reply",
+                enqueuedAt: Date.now(),
+                run: {
+                  agentId: "main",
+                  agentDir,
+                  sessionId: target.sessionId,
+                  sessionKey,
+                  sessionFile: path.join(state.root, "logical-session.jsonl"),
+                  workspaceDir: state.workspaceDir,
+                  config: cfg,
+                  provider: "anthropic",
+                  model: "primary-fixture",
+                  authProfileId: CONFIGURED_PROFILE,
+                  authProfileIdSource: "user",
+                  blockReplyBreak: "message_end",
+                  timeoutMs: 10_000,
+                  skillsSnapshot: { prompt: "", skills: [] },
+                  thinkingCatalog: [{ provider: "google", id: model, input: ["text"] }],
+                },
+              };
+              // Actual provenance producer; this supplies configured candidate facts, not
+              // an auth-selector or fallback result. Outer selection is outside this boundary.
+              const selection = await resolveSessionAuthSelection({
+                cfg,
+                provider: "anthropic",
+                modelId: "primary-fixture",
+                agentId: "main",
+                agentDir,
+                sessionEntry: entry,
+                sessionKey,
+                storePath: target.storePath,
+                isNewSession: false,
+              });
+              expect(selection?.profileId).toBe(CONFIGURED_PROFILE);
+              followupRun.run.authProfileId = selection?.profileId;
+              followupRun.run.authProfileIdSource = selection?.source;
+              bindConfiguredModelAuthProfileScope(
+                followupRun.run,
+                selection?.configuredPrimaryProvider,
+              );
+              const turn: AgentTurnParams = {
+                commandBody: followupRun.prompt,
+                followupRun,
+                sessionCtx: { Provider: "webchat" },
+                opts: { disableTools: true },
+                typingSignals: {
+                  mode: "never",
+                  shouldStartImmediately: false,
+                  shouldStartOnMessageStart: false,
+                  shouldStartOnText: false,
+                  shouldStartOnReasoning: false,
+                  signalRunStart: noActivity,
+                  signalMessageStart: noActivity,
+                  signalTextDelta: noActivity,
+                  signalReasoningDelta: noActivity,
+                  signalToolStart: noActivity,
+                },
+                blockReplyPipeline: null,
+                blockStreamingEnabled: false,
+                resolvedBlockStreamingBreak: "message_end",
+                applyReplyToMode: (payload) => payload,
+                shouldEmitToolResult: () => false,
+                shouldEmitToolOutput: () => false,
+                pendingToolTasks: new Set(),
+                isHeartbeat: false,
+                sessionKey,
+                storePath: target.storePath,
+                activeSessionStore: { [sessionKey]: entry },
+                getActiveSessionEntry: () => entry,
+                resolvedVerboseLevel: "off",
+              };
+              contextEngineLogicalTurnLease = await createContextEngineLogicalTurnLease({
+                identity: { runId, sessionId: target.sessionId },
+                config: cfg,
+                agentDir,
+                workspaceDir: state.workspaceDir,
+              });
+              const common: AgentFallbackCandidateCommonParams = {
+                agentHarnessRuntimeOverride: undefined,
+                assistantErrorTranscript: createAssistantErrorTranscript(),
+                modelRoutingProvenance: {
+                  requestedProvider: "anthropic",
+                  requestedModel: "primary-fixture",
+                  stage: "fallback",
+                  fallbackReason: "timeout",
+                },
+                contextEngineLogicalTurnLease,
+                onContextEngineTurnCandidate: () => {},
+                preparedRunAdmission,
+                turn,
+                candidateRun: followupRun.run,
+                runtimeConfig: cfg,
+                provider: "google",
+                model,
+                runId,
+                runLane: "test:chat-cli-account",
+                candidateFastMode: {},
+                suppressQueuedUserPersistenceForCandidate: false,
+                userTurnTranscriptRecorder: undefined,
+                notifyUserMessagePersisted: () => {},
+                fastModeStartedAtMs: Date.now(),
+                fastModeAutoProgressState: { offAnnounced: false, resetAnnounced: false },
+                bootstrapContextRunKind: "default",
+                bootstrapPromptWarningSignaturesSeen: [],
+                currentTurnImages: { images: [] },
+                signalExecutionPhaseForTyping: () => {},
+                prepareAgentRunStart: () => {},
+                notifyAgentRunStart: () => {},
+                preserveProgressCallbackStartOrder: false,
+                presentation: createAgentTurnPresentation({
+                  turn,
+                  replyMediaContext: { normalizePayload: async (p) => p },
+                  directBlockDeliveries: [],
+                }),
+                timing: createAgentTurnTimingTracker(),
+                onLifecycleBackstop: () => {},
+                deferredLifecycle,
+                isFallbackRetry: true,
+                isFinalFallbackAttempt: true,
+                classifyResult: (result) =>
+                  classifyEmbeddedAgentRunResultForModelFallback({
+                    provider: "google",
+                    model,
+                    result,
+                  }),
+              };
+              return await runCliFallbackCandidate({
+                ...common,
+                deferredLifecycle: manager,
+                runAbortSignal: signal,
+                cliExecutionProvider: runtime,
+                lifecycleGeneration: getAgentEventLifecycleGeneration(),
+                onSessionWriter: () => {},
+                providerScopedAuthProfile: resolveRunAuthProfile(followupRun.run, "google", {
+                  config: cfg,
+                }),
+              });
+            } finally {
+              await manager.complete();
+            }
           });
         } else {
           const now = Date.now();
@@ -512,89 +526,98 @@ it.each([
             admissionSource: kind === "scheduled-cron" ? ("operator-schedule" as const) : undefined,
             skillsSnapshot: { prompt: "", skills: [] },
           };
-          const prepared = await prepareCronRunContext({
+          let cronRunResult: Awaited<ReturnType<typeof runCliFallbackCandidate>> | undefined;
+          run = prepareCronRunContext({
             input,
             isFastTestEnv: true,
             onLifecycleInterrupt: () => cancel.abort(new Error("Fixture interrupted")),
-          });
-          if (!prepared.ok) {
-            throw new Error(JSON.stringify(prepared.result));
-          }
-          const ctx = prepared.context;
-          const lease = ctx.preparedModelRuntimeLease;
-          const contextOwner: { token?: string } = {};
-          let active = true;
-          closeCron = async () => {
-            active = false;
-            try {
-              releaseAgentRunContext(runId, contextOwner.token);
-              ctx.sessionWorkAdmission.release();
-            } finally {
+            runPrepared: async (ctx) => {
+              await using _ = {
+                [Symbol.asyncDispose]: async () => {
+                  await ctx.workspaceLease?.release();
+                },
+              };
+              await using lease = ctx.preparedModelRuntimeLease;
               try {
-                await lease[Symbol.asyncDispose]();
+                const contextOwner: { token?: string } = {};
+                let active = true;
+                closeCron = async () => {
+                  active = false;
+                  releaseAgentRunContext(runId, contextOwner.token);
+                };
+                expect(ctx.runSessionKey).toBe(sessionKey);
+                expect(ctx.usesDetachedRunSession).toBe(false);
+                expect(ctx.cronSession.storePath).toBe(target.storePath);
+                expect(ctx.liveSelection.authProfileId).toBe(CONFIGURED_PROFILE);
+                const generation = getAgentEventLifecycleGeneration();
+                const lifecycle = createAgentLifecycleTerminalBackstop({
+                  runId,
+                  sessionKey,
+                  getLifecycleGeneration: () => generation,
+                  resolveTerminationFields: () => (cancel.signal.aborted ? { aborted: true } : {}),
+                });
+                contextOwner.token = claimAgentRunContext(
+                  runId,
+                  {
+                    sessionKey: ctx.runSessionKey,
+                    sessionId: ctx.cronSession.sessionEntry.sessionId,
+                    agentId: ctx.agentId,
+                    lifecycleGeneration: generation,
+                    cronRunsByJobId: new Map([[job.id, { pacingEnabled: false }]]),
+                  },
+                  { trackOwner: true, ownsContext: true },
+                );
+                const result = await withPreparedModelRuntimePluginGenerationScope(
+                  lease.pluginGeneration,
+                  () =>
+                    withPluginRuntimeGenerationScope(lease.snapshot, () =>
+                      withAgentRunLifecycleGeneration(generation, () =>
+                        executeCronRun({
+                          ...ctx,
+                          cfg,
+                          job,
+                          trigger: input.trigger,
+                          runId,
+                          lane: input.lane,
+                          deliveryAttemptFence: null,
+                          admissionSource: input.admissionSource,
+                          agentVerboseDefault: ctx.agentCfg?.verboseDefault,
+                          abortSignal: cancel.signal,
+                          abortReason: () => "Fixture cancelled",
+                          isAborted: () => cancel.signal.aborted,
+                          lifecycle,
+                          onPromptAdmission: (admission) => {
+                            cronPromptAdmission?.close();
+                            cronPromptAdmission = admission;
+                          },
+                          immutableThinkLevel: ctx.thinkingSelection.immutableThinkLevel,
+                          thinkingCatalog: ctx.thinkingSelection.catalog,
+                          loadThinkingCatalog: ctx.thinkingSelection.loadThinkingCatalog,
+                          persistRunContinuationSession: ctx.runContinuationSession?.sync,
+                        }),
+                      ),
+                    ),
+                  () => (active ? lease.snapshot : undefined),
+                );
+                cronWinner = result.fallbackProvider;
+                cronRunResult = result.runResult;
+                return { status: "ok" };
               } finally {
-                await ctx.workspaceLease?.release();
+                try {
+                  await closeCron?.();
+                } finally {
+                  ctx.sessionPreparationEffect.release();
+                }
               }
-            }
-          };
-          expect(ctx.runSessionKey).toBe(sessionKey);
-          expect(ctx.usesDetachedRunSession).toBe(false);
-          expect(ctx.cronSession.storePath).toBe(target.storePath);
-          expect(ctx.liveSelection.authProfileId).toBe(CONFIGURED_PROFILE);
-          const generation = getAgentEventLifecycleGeneration();
-          const lifecycle = createAgentLifecycleTerminalBackstop({
-            runId,
-            sessionKey,
-            getLifecycleGeneration: () => generation,
-            resolveTerminationFields: () => (cancel.signal.aborted ? { aborted: true } : {}),
-          });
-          contextOwner.token = claimAgentRunContext(
-            runId,
-            {
-              sessionKey: ctx.runSessionKey,
-              sessionId: ctx.cronSession.sessionEntry.sessionId,
-              agentId: ctx.agentId,
-              lifecycleGeneration: generation,
-              cronRunsByJobId: new Map([[job.id, { pacingEnabled: false }]]),
             },
-            { trackOwner: true, ownsContext: true },
-          );
-          run = withPreparedModelRuntimePluginGenerationScope(
-            lease.pluginGeneration,
-            () =>
-              withPluginRuntimeGenerationScope(lease.snapshot, () =>
-                ctx.sessionWorkAdmission.run(() =>
-                  withAgentRunLifecycleGeneration(generation, () =>
-                    executeCronRun({
-                      ...ctx,
-                      cfg,
-                      job,
-                      trigger: input.trigger,
-                      runId,
-                      lane: input.lane,
-                      deliveryAttemptFence: null,
-                      admissionSource: input.admissionSource,
-                      agentVerboseDefault: ctx.agentCfg?.verboseDefault,
-                      abortSignal: cancel.signal,
-                      abortReason: () => "Fixture cancelled",
-                      isAborted: () => cancel.signal.aborted,
-                      lifecycle,
-                      onPromptAdmission: (admission) => {
-                        cronPromptAdmission?.close();
-                        cronPromptAdmission = admission;
-                      },
-                      immutableThinkLevel: ctx.thinkingSelection.immutableThinkLevel,
-                      thinkingCatalog: ctx.thinkingSelection.catalog,
-                      loadThinkingCatalog: ctx.thinkingSelection.loadThinkingCatalog,
-                      persistRunContinuationSession: ctx.runContinuationSession?.sync,
-                    }),
-                  ),
-                ),
-              ),
-            () => (active ? lease.snapshot : undefined),
-          ).then((result) => {
-            cronWinner = result.fallbackProvider;
-            return result.runResult;
+          }).then((prepared) => {
+            if (!prepared.ok) {
+              throw new Error(JSON.stringify(prepared.result));
+            }
+            if (!cronRunResult) {
+              throw new Error("Cron fixture completed without a CLI result");
+            }
+            return cronRunResult;
           });
         }
         void run.catch(() => {});

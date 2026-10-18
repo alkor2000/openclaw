@@ -506,6 +506,7 @@ export async function executePluginOwnedProcess(params: {
       controller.abort(createCliAbortError());
     },
     {
+      supportsTranscriptCommitWait: true,
       messageInjectionV2: createSteeredCliMessageInjection({
         getInjection: () => messageInjection,
         signal,

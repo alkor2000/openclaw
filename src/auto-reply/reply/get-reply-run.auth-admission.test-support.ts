@@ -2,11 +2,11 @@ import { expect, it, vi } from "vitest";
 import { awaitGateBeforeSettlement, createDeferred } from "../../../test/helpers/promise.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import { readConfiguredModelAuthProfileProvider } from "../../config/sessions/auth-profile-override-provenance.js";
+import { listActiveReplyRunSessionKeys } from "../../sessions/session-controller.js";
 import { runReplyAgent } from "./agent-runner-run.js";
 import { shouldUseReplyFastTestRuntime } from "./get-reply-fast-path.js";
 import { runPreparedReply } from "./get-reply-run.js";
 import { baseParams } from "./get-reply-run.test-support.js";
-import { getActiveReplyRunCount } from "./reply-run-registry.registry.js";
 
 export function registerReplyAuthAdmissionCases({
   requireRunReplyAgentCall,
@@ -91,7 +91,7 @@ export function registerReplyAuthAdmissionCases({
         await releaseAuth.promise;
         throw new Error("Auth profile is not configured for openai.");
       });
-      const activeBefore = getActiveReplyRunCount();
+      const activeBefore = listActiveReplyRunSessionKeys().length;
       const params = {
         ...baseParams({ provider: "openai", model: "gpt-5.5", opts: { isHeartbeat: true } }),
         configuredProfileId: "anthropic:other",
@@ -106,14 +106,14 @@ export function registerReplyAuthAdmissionCases({
           running,
           "auth validation was bypassed",
         );
-        expect(getActiveReplyRunCount()).toBe(activeBefore);
+        expect(listActiveReplyRunSessionKeys().length).toBe(activeBefore);
         expect(runReplyAgent).not.toHaveBeenCalled();
       } finally {
         releaseAuth.resolve();
         await rejected;
       }
       expect(runReplyAgent).not.toHaveBeenCalled();
-      expect(getActiveReplyRunCount()).toBe(activeBefore);
+      expect(listActiveReplyRunSessionKeys().length).toBe(activeBefore);
     },
   );
 }

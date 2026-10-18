@@ -98,7 +98,8 @@ describe.skipIf(!connection)("offline CLI on PostgreSQL", () => {
             plugins: { enabled: false },
             meta: { migrations: { webhookListeners: true } },
           });
-          vi.spyOn(defaultRuntime, "log").mockImplementation(() => undefined);
+          const log = vi.spyOn(defaultRuntime, "log").mockImplementation(() => undefined);
+          const json = vi.spyOn(defaultRuntime, "writeJson").mockImplementation(() => undefined);
           const error = vi.spyOn(defaultRuntime, "error").mockImplementation(() => undefined);
           vi.spyOn(defaultRuntime, "exit").mockImplementation((code) => {
             throw new ExitError(code);
@@ -140,6 +141,16 @@ describe.skipIf(!connection)("offline CLI on PostgreSQL", () => {
               }
             };
             await readCold(() => run(["list", "--agent", "main", "--json"]));
+            expect(json).toHaveBeenLastCalledWith(
+              expect.objectContaining({
+                agentId: "main",
+                profiles: [expect.objectContaining({ id: "openai:offline", provider: "openai" })],
+              }),
+              2,
+            );
+            log.mockClear();
+            await readCold(() => run(["list", "--agent", "main"]));
+            expect(log).toHaveBeenCalledWith(expect.stringContaining("openai:offline"));
             await run([
               "order",
               "set",
@@ -149,6 +160,16 @@ describe.skipIf(!connection)("offline CLI on PostgreSQL", () => {
               "main",
               "openai:offline",
             ]);
+            await readCold(() =>
+              run(["order", "get", "--provider", "openai", "--agent", "main", "--json"]),
+            );
+            expect(json).toHaveBeenLastCalledWith(
+              expect.objectContaining({ agentId: "main", order: ["openai:offline"] }),
+              2,
+            );
+            log.mockClear();
+            await readCold(() => run(["order", "get", "--provider", "openai", "--agent", "main"]));
+            expect(log).toHaveBeenCalledWith("Auth profile order override: openai:offline");
             await mkdir(state.agentDir("reader"), { recursive: true });
             await saveModelProviderApiKey({
               provider: "openai",

@@ -3,7 +3,7 @@ import {
   ensureAuthProfileStoreAsync,
   externalCliDiscoveryForProviderAuth,
   resolveAuthProfileDisplayLabel,
-  resolveAuthStatePathForDisplay,
+  resolveAuthStatePathForDisplayAsync,
   type AuthProfileCredential,
   type AuthProfileStore,
   type ProfileUsageStats,
@@ -140,11 +140,13 @@ export async function modelsAuthListCommand(
     .filter((profile) => !provider || profile.provider === provider)
     .toSorted((a, b) => a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id));
 
+  const authStatePath = shortenHomePath(await resolveAuthStatePathForDisplayAsync(agentDir));
+
   if (opts.json) {
     writeRuntimeJson(runtime, {
       agentId,
       agentDir: shortenHomePath(agentDir),
-      authStatePath: shortenHomePath(resolveAuthStatePathForDisplay(agentDir)),
+      authStatePath,
       provider: provider || null,
       profiles,
     });
@@ -152,7 +154,7 @@ export async function modelsAuthListCommand(
   }
 
   runtime.log(`Agent: ${agentId}`);
-  runtime.log(`Auth state store: ${shortenHomePath(resolveAuthStatePathForDisplay(agentDir))}`);
+  runtime.log(`Auth state store: ${authStatePath}`);
   if (provider) {
     runtime.log(`Provider: ${provider}`);
   }

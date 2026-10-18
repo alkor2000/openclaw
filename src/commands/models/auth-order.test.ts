@@ -20,7 +20,7 @@ vi.mock("../../agents/auth-profiles.js", () => ({
   ensureAuthProfileStoreAsync: async (...args: unknown[]) => mocks.ensureAuthProfileStore(...args),
   setAuthProfileOrder: mocks.setAuthProfileOrder,
   externalCliDiscoveryForProviderAuth: () => undefined,
-  resolveAuthStatePathForDisplay: (agentDir: string) => `${agentDir}/auth-profiles.json`,
+  resolveAuthStatePathForDisplayAsync: async (agentDir: string) => `${agentDir}/auth-profiles.json`,
 }));
 
 vi.mock("./load-config.js", () => ({

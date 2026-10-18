@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { collectAuthProfileEnvSecretRefIds } from "../../agents/auth-profiles/env-secret-refs.js";
 import { resolveSharedAuthStoreOwnership } from "../../agents/auth-profiles/path-resolve.js";
 import { prepareFreshSharedAuthStoreWriteAsync } from "../../agents/auth-profiles/shared-store-bootstrap-async.js";
@@ -12,7 +12,10 @@ import {
 } from "../../agents/auth-profiles/sqlite.js";
 import { updateAuthProfileStoreWithLock } from "../../agents/auth-profiles/store-runtime.js";
 import type { AuthProfileStore } from "../../agents/auth-profiles/types.js";
-import { selectGatewayRunEnvironment } from "../../cli/gateway-cli/pre-bootstrap.js";
+import {
+  clearGatewayRunConfigEnvironment,
+  selectGatewayRunEnvironment,
+} from "../../cli/gateway-cli/pre-bootstrap.js";
 import { createConfigIO } from "../../config/io.factory.js";
 import { captureRuntimeConfigAsyncReader } from "../../config/io.runtime.js";
 import { upsertSessionEntryCore } from "../../config/sessions/session-accessor.sqlite-entry.js";
@@ -36,6 +39,7 @@ import {
   closeOpenClawStateDatabaseByPathAsync,
   openOpenClawStateDatabase,
 } from "../../state/openclaw-state-db.js";
+import { withEnvAsync } from "../../test-utils/env.js";
 import { isPostgresSqlConnection } from "../sql-connection.js";
 import { retireSqliteDatabaseAdmissionForPath } from "../sqlite-database-admission.js";
 import { withEngineStoreAdmission } from "./admission-scope.js";
@@ -150,23 +154,37 @@ describe.skipIf(!mixedAgentConnection).each(mixedAgentPairs)(
             entries: { main: { agentDir: path.dirname(database.path) } },
           },
         };
-        fs.writeFileSync(process.env.OPENCLAW_CONFIG_PATH!, JSON.stringify(config));
-        vi.stubEnv("OPENCLAW_HOME", fixture.root);
-        vi.stubEnv("INVOCATION_ID", "mixed-auth-fixture");
-        vi.stubEnv("MIXED_AUTH_KEY", "synthetic-inherited");
-        vi.stubEnv("STALE_AUTH_KEY", "stale");
-        vi.stubEnv("OPENCLAW_SERVICE_MANAGED_ENV_KEYS", "MIXED_AUTH_KEY,STALE_AUTH_KEY");
-        const anchorBefore = fs.readFileSync(database.path);
-        // Early selection precedes runtime engine installation and must ignore ambient selection.
-        expect(
-          await withDatabaseEngineSelection(
-            { effectiveEngines: resolveDatabaseFamilyEngines({}) },
-            () => selectGatewayRunEnvironment({ opts: {}, runtime: createNonExitingRuntime() }),
-          ),
-        ).toBe(true);
-        expect(process.env.MIXED_AUTH_KEY).toBe("synthetic-inherited");
-        expect(process.env.STALE_AUTH_KEY).toBeUndefined();
-        expect(fs.readFileSync(database.path)).toEqual(anchorBefore);
+        const configPath = process.env.OPENCLAW_CONFIG_PATH!;
+        const configBefore = fs.readFileSync(configPath);
+        await withEnvAsync(
+          {
+            OPENCLAW_HOME: fixture.root,
+            INVOCATION_ID: "mixed-auth-fixture",
+            MIXED_AUTH_KEY: "synthetic-inherited",
+            STALE_AUTH_KEY: "stale",
+            OPENCLAW_SERVICE_MANAGED_ENV_KEYS: "MIXED_AUTH_KEY,STALE_AUTH_KEY",
+          },
+          async () => {
+            try {
+              fs.writeFileSync(configPath, JSON.stringify(config));
+              const anchorBefore = fs.readFileSync(database.path);
+              // Early selection precedes runtime engine installation and must ignore ambient selection.
+              expect(
+                await withDatabaseEngineSelection(
+                  { effectiveEngines: resolveDatabaseFamilyEngines({}) },
+                  () =>
+                    selectGatewayRunEnvironment({ opts: {}, runtime: createNonExitingRuntime() }),
+                ),
+              ).toBe(true);
+              expect(process.env.MIXED_AUTH_KEY).toBe("synthetic-inherited");
+              expect(process.env.STALE_AUTH_KEY).toBeUndefined();
+              expect(fs.readFileSync(database.path)).toEqual(anchorBefore);
+            } finally {
+              clearGatewayRunConfigEnvironment();
+              fs.writeFileSync(configPath, configBefore);
+            }
+          },
+        );
         withEngineStoreAdmission(() => closeOpenClawAgentDatabaseByPath(database.path));
         await closeOpenClawAgentDatabaseByPathAsync(database.path);
         retireSqliteDatabaseAdmissionForPath(database.path);

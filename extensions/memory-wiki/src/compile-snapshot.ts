@@ -31,7 +31,7 @@ export function buildCompiledCacheSnapshot(scan: {
           const summary = Object.assign(
             claim.id ? { id: claim.id } : {},
             { text: claim.text, status: normalizeClaimStatus(claim.status) },
-            typeof claim.confidence === "number" ? { confidence: claim.confidence } : {},
+            claim.confidence !== undefined ? { confidence: claim.confidence } : {},
             { freshnessLevel: freshness.level },
           );
           return { claim, freshness, summary };

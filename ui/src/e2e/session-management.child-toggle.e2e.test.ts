@@ -18,7 +18,7 @@ const rosterMatch = { includeGlobal: true };
 
 suite.define(() => {
   it("keeps the child-toggle point safe after remote child deletion", async () => {
-    const context = await suite.browser.newContext(createControlUiE2eContextOptions());
+    const context = await suite.newBrowserContext(createControlUiE2eContextOptions());
     const page = await context.newPage();
     const main = sessionRow("agent:main:main", "Main", 1);
     const childKey = "agent:main:pointer-child";
@@ -141,7 +141,7 @@ suite.define(() => {
       expect(clickedTarget).toEqual({ trusted: true, archive: false });
       expect(archiveRequests).toEqual([]);
     } finally {
-      await context.close();
+      await suite.closeBrowserContext(context);
     }
   });
 });

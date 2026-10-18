@@ -292,12 +292,6 @@ function parseSnapshot(
   }
 }
 
-export function resolveMemoryWikiCompiledCacheGeneration(
-  snapshot: MemoryWikiCompiledCacheSnapshot,
-): string {
-  return createHash("sha256").update(JSON.stringify(snapshot)).digest("hex");
-}
-
 export function createMemoryWikiCompiledCacheStore(
   openBlobStore: <TMetadata>(options: OpenBlobStoreOptions) => PluginBlobStore<TMetadata>,
   options: { onReadError?: (error: unknown) => void } = {},
@@ -358,7 +352,6 @@ export function createMemoryWikiCompiledCacheStore(
       this: void,
       config: ResolvedMemoryWikiConfig,
       snapshot: MemoryWikiCompiledCacheSnapshot,
-      generation: string,
       publicationId: string,
     ) {
       const ownerId = resolveMemoryWikiCompiledCacheOwnerId(config);
@@ -368,16 +361,13 @@ export function createMemoryWikiCompiledCacheStore(
         throw new Error(`Memory Wiki vault is not active: ${vaultPath}`);
       }
       const serialized = JSON.stringify(snapshot);
-      if (createHash("sha256").update(serialized).digest("hex") !== generation) {
-        throw new Error("Memory Wiki compiled cache generation does not match its snapshot.");
-      }
       const metadata: CompiledCacheMetadata = {
         version: COMPILED_CACHE_VERSION,
         ownerId,
         vaultPath,
         vaultGeneration: activeVault.vaultGeneration,
         publicationId,
-        generation,
+        generation: createHash("sha256").update(serialized).digest("hex"),
         encoding: "gzip-json",
       };
       // Freeze prior candidates before registering this one; later writers keep their rows.
@@ -522,7 +512,6 @@ export async function reconcileMemoryWikiCompiledCacheOwner(
 export async function writeMemoryWikiCompiledCache(
   config: ResolvedMemoryWikiConfig,
   snapshot: MemoryWikiCompiledCacheSnapshot,
-  generation: string,
   publicationId: string,
   parentPublicationId: string | null,
   validatePublication: () => Promise<void>,
@@ -533,7 +522,6 @@ export async function writeMemoryWikiCompiledCache(
   const { activeVault, serializedSnapshot, priorPublicationIds } = await store.write(
     config,
     snapshot,
-    generation,
     publicationId,
   );
   try {
@@ -591,7 +579,7 @@ export async function writeMemoryWikiCompiledCache(
     // Own the persisted payload, not compiler strings whose slices can retain entire
     // source pages. Reuse the serialized snapshot to detach every nested string
     // without changing its JSON representation (including lone surrogates).
-    // SAFETY: The store serialized this typed snapshot and verified its generation before writing.
+    // SAFETY: The store serialized this typed snapshot and derived its generation before writing.
     snapshot: JSON.parse(serializedSnapshot) as MemoryWikiCompiledCacheSnapshot,
   });
   dashboardStates.delete(dashboardStateKey(config));

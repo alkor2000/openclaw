@@ -17,7 +17,6 @@ import {
   configureMemoryWikiCompiledCacheStore,
   createMemoryWikiCompiledCacheStore,
   loadMemoryWikiCompiledCache,
-  resolveMemoryWikiCompiledCacheGeneration,
 } from "./compiled-cache.js";
 import { loadMemoryWikiVaultIdentity } from "./log.js";
 import { renderWikiMarkdown } from "./markdown.js";
@@ -86,12 +85,7 @@ it("reclaims an abandoned persisted candidate after a successful cold compile", 
 
     // Seed the durable state left by an interrupted writer through its real store.
     // This does not execute SIGKILL or claim process-crash coverage.
-    await cacheStore.write(
-      config,
-      snapshot,
-      resolveMemoryWikiCompiledCacheGeneration(snapshot),
-      "orphan-B",
-    );
+    await cacheStore.write(config, snapshot, "orphan-B");
     const withOrphan = await entries();
     expect(withOrphan).toHaveLength(2);
     const orphan = withOrphan.find(

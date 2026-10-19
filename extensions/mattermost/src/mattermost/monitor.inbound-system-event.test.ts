@@ -1,4 +1,4 @@
-import { EventEmitter, once } from "node:events";
+import { once } from "node:events";
 import fs from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
@@ -22,6 +22,7 @@ import { WebSocketServer } from "openclaw/plugin-sdk/websocket-runtime";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { MattermostPost } from "./client.js";
 import type { MattermostEventPayload } from "./monitor-websocket.js";
+import { FakeWebSocket, mattermostPostEvent } from "./monitor-websocket.test-support.js";
 import { registerMattermostBlockProgressTests } from "./monitor.block-progress.test-support.js";
 import { registerMattermostIngressDebounceTests } from "./monitor.ingress-debounce.test-support.js";
 import { monitorMattermostProvider } from "./monitor.js";
@@ -29,31 +30,11 @@ import { registerMattermostPreviewDeliveryTests } from "./monitor.preview-delive
 import { registerMattermostPreviewPolicyTests } from "./monitor.preview-policy.test-support.js";
 import type { OpenClawConfig, ReplyPayload } from "./runtime-api.js";
 
-class FakeWebSocket extends EventEmitter<{
-  open: [];
-  message: [Buffer];
-  pong: [Buffer];
-  close: [number, Buffer];
-  error: [unknown];
-}> {
-  send(_data: string): void {}
-  ping(): void {}
-  close(): void {}
-  terminate(): void {
-    this.emit("close", 1000, Buffer.alloc(0));
-  }
-  async emitMessage(payload: unknown): Promise<void> {
-    const buffer = Buffer.from(JSON.stringify(payload), "utf8");
-    await Promise.all(
-      this.listeners("message").map((listener) => Promise.resolve(listener(buffer))),
-    );
-  }
-}
-
 const mockState = vi.hoisted(() => ({
   abortController: undefined as AbortController | undefined,
   createReplyDispatcherWithTyping: vi.fn(),
   createMattermostClient: vi.fn(),
+  createWebSocket: vi.fn(),
   createMattermostDraftStream: vi.fn(),
   deliveryPlanObserver: vi.fn(),
   dispatchInboundMessage: vi.fn(),
@@ -64,6 +45,7 @@ const mockState = vi.hoisted(() => ({
   progressDrafts: [] as Array<{ getSnapshot: () => { lines: readonly unknown[] } }>,
   registerMattermostMonitorSlashCommands: vi.fn(),
   registerPluginHttpRoute: vi.fn(),
+  receiveMattermostEvent: vi.fn<(rawEvent: string) => Promise<void>>(),
   recordMattermostThreadParticipation: vi.fn(),
   resolveChannelInfo: vi.fn(),
   resolveMattermostMedia: vi.fn(),
@@ -72,6 +54,19 @@ const mockState = vi.hoisted(() => ({
   sendMessageMattermost: vi.fn(),
   updateMattermostPost: vi.fn(),
 }));
+
+vi.mock("openclaw/plugin-sdk/websocket-runtime", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("openclaw/plugin-sdk/websocket-runtime")>();
+  return {
+    ...actual,
+    WebSocket: Object.assign(
+      vi.fn(function (...args: ConstructorParameters<typeof actual.WebSocket>) {
+        return mockState.createWebSocket(...args) ?? new actual.WebSocket(...args);
+      }),
+      actual.WebSocket,
+    ),
+  };
+});
 
 vi.mock("openclaw/plugin-sdk/plugin-runtime", async (importOriginal) => ({
   ...(await importOriginal<typeof import("openclaw/plugin-sdk/plugin-runtime")>()),
@@ -123,37 +118,40 @@ vi.mock("./monitor-ingress.js", async (importOriginal) => {
     createMattermostIngressMonitor: (
       options: Parameters<typeof actual.createMattermostIngressMonitor>[0],
     ) => {
-      if (mockState.ingressQueue) {
-        return actual.createMattermostIngressMonitor({
-          ...options,
-          queue: mockState.ingressQueue as NonNullable<typeof options.queue>,
-          pollIntervalMs: 60_000,
-        });
-      }
+      const monitor = mockState.ingressQueue
+        ? actual.createMattermostIngressMonitor({
+            ...options,
+            queue: mockState.ingressQueue as NonNullable<typeof options.queue>,
+            pollIntervalMs: 60_000,
+          })
+        : {
+            receive: async (rawEvent: string) => {
+              const payload = JSON.parse(rawEvent) as MattermostEventPayload;
+              const post =
+                typeof payload.data?.post === "string"
+                  ? (JSON.parse(payload.data.post) as MattermostPost)
+                  : (payload.data?.post as MattermostPost | undefined);
+              if (payload.event !== "posted" || !post) {
+                return;
+              }
+              const senderId = post.user_id?.trim();
+              if (!senderId) {
+                throw new Error("Mattermost posted event is missing post.user_id");
+              }
+              await options.dispatch({ ...post, user_id: senderId }, payload, {
+                abortSignal: new AbortController().signal,
+                onAdopted: async () => {},
+                onDeferred: () => {},
+                onAdoptionFinalizing: () => {},
+                onAbandoned: async () => {},
+              });
+            },
+            stop: async () => {},
+            waitForIdle: async () => {},
+          };
       return {
-        receive: async (rawEvent: string) => {
-          const payload = JSON.parse(rawEvent) as MattermostEventPayload;
-          const post =
-            typeof payload.data?.post === "string"
-              ? (JSON.parse(payload.data.post) as MattermostPost)
-              : (payload.data?.post as MattermostPost | undefined);
-          if (payload.event !== "posted" || !post) {
-            return;
-          }
-          const senderId = post.user_id?.trim();
-          if (!senderId) {
-            throw new Error("Mattermost posted event is missing post.user_id");
-          }
-          await options.dispatch({ ...post, user_id: senderId }, payload, {
-            abortSignal: new AbortController().signal,
-            onAdopted: async () => {},
-            onDeferred: () => {},
-            onAdoptionFinalizing: () => {},
-            onAbandoned: async () => {},
-          });
-        },
-        stop: async () => {},
-        waitForIdle: async () => {},
+        ...monitor,
+        receive: mockState.receiveMattermostEvent.mockImplementation(monitor.receive),
       };
     },
   };
@@ -393,12 +391,11 @@ vi.mock("../runtime.js", () => ({
 function startTestMonitor(config: OpenClawConfig = testConfig) {
   const socket = new FakeWebSocket();
   const abortController = new AbortController();
-  const socketFactory = vi.fn(() => socket);
+  const socketFactory = mockState.createWebSocket.mockReturnValue(socket);
   const monitor = monitorMattermostProvider({
     config,
     runtime: testRuntime(),
     abortSignal: abortController.signal,
-    webSocketFactory: socketFactory,
   });
   let stopped = false;
   return {
@@ -425,47 +422,13 @@ async function openMonitor(config: OpenClawConfig = testConfig) {
   return provider;
 }
 
-function mattermostPostEvent(params: {
-  id: string;
-  message: string;
-  channelId?: string;
-  rootId?: string;
-  senderId?: string;
-  senderName?: string;
-  createAt?: number;
-  type?: string;
-  fileIds?: string[];
-  channelType?: string;
-  includeChannelLabels?: boolean;
-}) {
-  const senderId = params.senderId ?? "user-1";
-  const channelId = params.channelId ?? "chan-1";
-  return {
-    event: "posted",
-    data: {
-      ...(params.includeChannelLabels === false
-        ? {}
-        : { channel_name: "town-square", channel_display_name: "Town Square" }),
-      channel_type: params.channelType,
-      sender_name: params.senderName ?? "alice",
-      post: JSON.stringify({
-        id: params.id,
-        channel_id: channelId,
-        user_id: senderId,
-        message: params.message,
-        root_id: params.rootId,
-        create_at: params.createAt ?? 1_714_000_000_000,
-        type: params.type,
-        file_ids: params.fileIds,
-      }),
-    },
-  };
-}
 async function emitMattermostChannelPost(
   socket: FakeWebSocket,
   post: Parameters<typeof mattermostPostEvent>[0],
 ) {
   await socket.emitMessage(mattermostPostEvent(post));
+  // EventEmitter listeners return void; join the ingress owner, not the socket callback.
+  await mockState.receiveMattermostEvent.mock.results.at(-1)?.value;
 }
 
 async function receivePost(
@@ -485,6 +448,7 @@ async function receivePost(
 describe("mattermost inbound user posts", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockState.createWebSocket.mockReset();
     mockState.abortController = undefined;
     mockState.ingressQueue = undefined;
     mockState.progressDrafts.length = 0;
@@ -525,11 +489,11 @@ describe("mattermost inbound user posts", () => {
         ready();
         return socket;
       });
+      mockState.createWebSocket.mockImplementation(socketFactory);
       const monitor = monitorMattermostProvider({
         config,
         runtime: testRuntime(),
         abortSignal: abort.signal,
-        webSocketFactory: socketFactory,
       });
       return {
         monitor,
@@ -657,7 +621,9 @@ describe("mattermost inbound user posts", () => {
   it("does not open a websocket after slash startup fails", async () => {
     const unregisterInteractions = vi.fn();
     const statusSink = vi.fn();
-    const webSocketFactory = vi.fn(() => new FakeWebSocket());
+    const webSocketFactory = mockState.createWebSocket.mockImplementation(
+      () => new FakeWebSocket(),
+    );
     const failure = new Error("Mattermost slash setup failed");
     mockState.registerPluginHttpRoute.mockReturnValueOnce(unregisterInteractions);
     mockState.registerMattermostMonitorSlashCommands.mockRejectedValueOnce(failure);
@@ -667,7 +633,6 @@ describe("mattermost inbound user posts", () => {
         runtime: testRuntime(),
         abortSignal: new AbortController().signal,
         statusSink,
-        webSocketFactory,
       }),
     ).rejects.toThrow(failure.message);
     expect(unregisterInteractions).toHaveBeenCalledOnce();
@@ -1055,4 +1020,3 @@ describe("mattermost inbound user posts", () => {
   registerMattermostBlockProgressTests(harness);
   registerMattermostPreviewDeliveryTests(harness);
 });
-/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

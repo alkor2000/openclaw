@@ -30,6 +30,7 @@ export type {
   CliBackendToolAvailabilityEnforcement,
   CliBackendToolPermissionRequest,
   CliBackendToolPermissionResult,
+  CliBackendTurnInterrupt,
   CliBackendThinkingLevel,
   CliBackendUserInputOption,
   CliBackendUserInputQuestion,

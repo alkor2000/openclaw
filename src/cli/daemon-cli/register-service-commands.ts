@@ -49,25 +49,22 @@ function resolveInstallOptions(
 }
 
 function resolveRestartOptions(cmdOpts: DaemonLifecycleOptions, command?: Command) {
-  const parentForce = inheritOptionFromParent<boolean>(command, "force");
-  const force = Boolean(cmdOpts.force || parentForce);
+  const options = resolveLifecycleOptions(cmdOpts, command);
   const safeFromGateway =
     process.platform === "win32" &&
     isGatewayServiceEnv(process.env) &&
     !isGatewayExternallySupervised() &&
-    !force &&
+    !options.force &&
     cmdOpts.wait === undefined &&
     !cmdOpts.preserveDefinition &&
     !cmdOpts.skipDeferral;
   return {
-    ...cmdOpts,
-    force,
+    ...options,
     safe: cmdOpts.safe || safeFromGateway,
-    json: resolveJsonOption(cmdOpts, command),
   };
 }
 
-function resolveStopOptions(cmdOpts: DaemonLifecycleOptions, command?: Command) {
+function resolveLifecycleOptions(cmdOpts: DaemonLifecycleOptions, command?: Command) {
   const parentForce = inheritOptionFromParent<boolean>(command, "force");
   return {
     ...cmdOpts,
@@ -76,21 +73,25 @@ function resolveStopOptions(cmdOpts: DaemonLifecycleOptions, command?: Command) 
   };
 }
 
-/** Attach Gateway service status/install/lifecycle subcommands to a parent command. */
 export function addGatewayServiceCommands(parent: Command, opts?: { statusDescription?: string }) {
   parent
     .command("status")
     .description(
-      opts?.statusDescription ?? "Show gateway service status + probe connectivity/capability",
+      opts?.statusDescription ?? "Show gateway service status + check connectivity/capability",
     )
     .option("--url <url>", "Gateway WebSocket URL (defaults to config/remote/local)")
     .option("--port <port>", "Local Gateway port")
     .option("--token <token>", "Gateway token (if required)")
     .option("--password <password>", "Gateway password (password auth)")
     .option("--timeout <ms>", "Timeout in ms", "10000")
-    .option("--no-probe", "Skip RPC probe")
-    .option("--require-rpc", "Exit non-zero when the RPC probe fails", false)
+    .option("--no-probe", "Skip RPC check")
+    .option("--require-rpc", "Exit non-zero when the RPC check fails", false)
     .option("--deep", "Scan system-level services", false)
+    .option(
+      "--runtime-intent-only",
+      "Output local service runtime intent as JSON without shared-state or RPC reads",
+      false,
+    )
     .option("--json", "Output JSON", false)
     .action(async (cmdOpts, command) => {
       const { runDaemonStatus } = await import("./status.runtime.js");
@@ -106,6 +107,7 @@ export function addGatewayServiceCommands(parent: Command, opts?: { statusDescri
         probe: Boolean(cmdOpts.probe),
         requireRpc: Boolean(cmdOpts.requireRpc),
         deep: Boolean(cmdOpts.deep),
+        ...(cmdOpts.runtimeIntentOnly ? { runtimeIntentOnly: true } : {}),
         json: resolveJsonOption(cmdOpts, command),
       });
     });
@@ -118,6 +120,12 @@ export function addGatewayServiceCommands(parent: Command, opts?: { statusDescri
     .option("--runtime-path <path>", "Pin an absolute Node/Bun executable path")
     .addOption(
       new Option("--expected-runtime-pin <json>", "Require the observed runtime intent").hideHelp(),
+    )
+    .addOption(
+      new Option(
+        "--restore-service-cli <json>",
+        "Restore the service onto a retained OpenClaw CLI",
+      ).hideHelp(),
     )
     .option("--token <token>", "Gateway token (token auth)")
     .option("--wrapper <path>", "Executable wrapper for generated service ProgramArguments")
@@ -160,7 +168,7 @@ export function addGatewayServiceCommands(parent: Command, opts?: { statusDescri
     .action(async (cmdOpts, command) => {
       await runUpdateCommand(cmdOpts.updateExecutor, "stop", async () => {
         const { runDaemonStop } = await import("./lifecycle.runtime.js");
-        await runDaemonStop(resolveStopOptions(cmdOpts, command));
+        await runDaemonStop(resolveLifecycleOptions(cmdOpts, command));
       });
     });
 

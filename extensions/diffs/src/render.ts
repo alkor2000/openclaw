@@ -2,7 +2,6 @@ import type { FileContents, FileDiffMetadata } from "@pierre/diffs";
 import { parsePatchFiles } from "@pierre/diffs";
 import { preloadDiffHTML, type PreloadDiffOptions } from "@pierre/diffs/ssr";
 import { escapeHtml } from "openclaw/plugin-sdk/text-utility-runtime";
-import { normalizeDiffFontSize, normalizeDiffLineSpacing } from "./config.js";
 import {
   collectDiffPayloadLanguageHints,
   isBaseDiffViewerLanguage,
@@ -24,10 +23,10 @@ const MAX_PATCH_TOTAL_LINES = 120_000;
 const VIEWER_LOADER_DOCUMENT_PATH = "../../assets/viewer.js";
 const LANGUAGE_PACK_VIEWER_LOADER_DOCUMENT_PATH = "../../../diffs-language-pack/assets/viewer.js";
 
-export class DiffRenderInputError extends Error {
+export class DiffInputError extends Error {
   constructor(message: string) {
     super(message);
-    this.name = "DiffRenderInputError";
+    this.name = "ToolInputError";
   }
 }
 
@@ -49,12 +48,8 @@ function buildDiffTitle(input: DiffInput): string {
   return "Patch diff";
 }
 
-function resolveDiffTypography(presentation: DiffRenderOptions["presentation"]): {
-  fontSize: number;
-  lineHeight: number;
-} {
-  const fontSize = normalizeDiffFontSize(presentation.fontSize);
-  const lineSpacing = normalizeDiffLineSpacing(presentation.lineSpacing);
+function resolveDiffTypography(presentation: DiffRenderOptions["presentation"]) {
+  const { fontSize, lineSpacing } = presentation;
   const lineHeight = Math.max(20, Math.round(fontSize * lineSpacing));
   return { fontSize, lineHeight };
 }
@@ -152,7 +147,7 @@ function buildImageRenderOptions(options: DiffRenderOptions): DiffRenderOptions 
     ...options,
     presentation: {
       ...options.presentation,
-      fontSize: Math.max(16, normalizeDiffFontSize(options.presentation.fontSize)),
+      fontSize: Math.max(16, options.presentation.fontSize),
     },
   };
 }
@@ -180,10 +175,7 @@ function renderDiffCard(payload: DiffViewerPayload, anchorId?: string): string {
   </section>`;
 }
 
-type FileDiffStats = {
-  additions: number;
-  deletions: number;
-};
+type FileDiffStats = ReturnType<typeof computeFileDiffStats>;
 
 type FileNavEntry = {
   anchorId: string;
@@ -193,7 +185,7 @@ type FileNavEntry = {
 
 // Hunk.additionLines/deletionLines count only +/- lines (not context), so the
 // sums match the built-in per-file header counts rendered by @pierre/diffs.
-function computeFileDiffStats(fileDiff: FileDiffMetadata): FileDiffStats {
+function computeFileDiffStats(fileDiff: FileDiffMetadata) {
   let additions = 0;
   let deletions = 0;
   for (const hunk of fileDiff.hunks) {
@@ -255,10 +247,7 @@ function buildHtmlDocument(params: {
   bodyHtml: string;
   theme: DiffRenderOptions["presentation"]["theme"];
   imageMaxWidth: number;
-  imageTypography: {
-    fontSize: number;
-    lineHeight: number;
-  };
+  imageTypography: ReturnType<typeof resolveDiffTypography>;
   runtimeMode: "viewer" | "image";
   viewerRuntime: "base" | "language-pack";
 }): string {
@@ -529,12 +518,10 @@ async function renderPatchDiff(
   const languagePackAvailable = options.languagePackAvailable === true;
   const files = parsePatchFiles(input.patch).flatMap((entry) => entry.files ?? []);
   if (files.length === 0) {
-    throw new DiffRenderInputError("Patch input did not contain any file diffs.");
+    throw new DiffInputError("Patch input did not contain any file diffs.");
   }
   if (files.length > MAX_PATCH_FILE_COUNT) {
-    throw new DiffRenderInputError(
-      `Patch input contains too many files (max ${MAX_PATCH_FILE_COUNT}).`,
-    );
+    throw new DiffInputError(`Patch input contains too many files (max ${MAX_PATCH_FILE_COUNT}).`);
   }
   const totalLines = files.reduce((sum, fileDiff) => {
     const splitLines = Number.isFinite(fileDiff.splitLineCount) ? fileDiff.splitLineCount : 0;
@@ -542,7 +529,7 @@ async function renderPatchDiff(
     return sum + Math.max(splitLines, unifiedLines, 0);
   }, 0);
   if (totalLines > MAX_PATCH_TOTAL_LINES) {
-    throw new DiffRenderInputError(
+    throw new DiffInputError(
       `Patch input is too large to render (max ${MAX_PATCH_TOTAL_LINES} lines).`,
     );
   }
@@ -585,34 +572,20 @@ export async function renderDiffDocument(
     ? "language-pack"
     : "base";
   const imageTypography = resolveDiffTypography(buildImageRenderOptions(options).presentation);
+  const document = (bodyHtml: string, runtimeMode: "viewer" | "image") =>
+    buildHtmlDocument({
+      title,
+      bodyHtml,
+      theme: options.presentation.theme,
+      imageMaxWidth: options.image.maxWidth,
+      imageTypography,
+      runtimeMode,
+      viewerRuntime,
+    });
 
   return {
-    ...(viewerBodyHtml
-      ? {
-          html: buildHtmlDocument({
-            title,
-            bodyHtml: viewerBodyHtml,
-            theme: options.presentation.theme,
-            imageMaxWidth: options.image.maxWidth,
-            imageTypography,
-            runtimeMode: "viewer",
-            viewerRuntime,
-          }),
-        }
-      : {}),
-    ...(imageBodyHtml
-      ? {
-          imageHtml: buildHtmlDocument({
-            title,
-            bodyHtml: imageBodyHtml,
-            theme: options.presentation.theme,
-            imageMaxWidth: options.image.maxWidth,
-            imageTypography,
-            runtimeMode: "image",
-            viewerRuntime,
-          }),
-        }
-      : {}),
+    ...(viewerBodyHtml ? { html: document(viewerBodyHtml, "viewer") } : {}),
+    ...(imageBodyHtml ? { imageHtml: document(imageBodyHtml, "image") } : {}),
     title,
     fileCount: sections.length,
     inputKind: input.kind,

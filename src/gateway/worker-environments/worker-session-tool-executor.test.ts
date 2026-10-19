@@ -6,6 +6,9 @@ import type { DecisionReceiptV1 } from "../../../packages/gateway-protocol/src/i
 import { SkillLibraryWorkshopSchema } from "../../../packages/gateway-protocol/src/schema/worker-skill-workshop.js";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { createOperationalRunInstanceRef } from "../../agents/admitted-run-context.js";
+import { createOpenClawCodingToolsInternal } from "../../agents/agent-tools.js";
+import { resolveConversationCapabilityProfile } from "../../agents/conversation-capability-profile.js";
+import { prepareCoreToolPolicy } from "../../agents/prepared-tool-surface.js";
 import type { AnyAgentTool } from "../../agents/tools/common.js";
 import { getGatewayToolCallerIdentity } from "../../agents/tools/gateway-caller-context.js";
 import type { ExecutionIdentityAdmissionToken } from "../../audit/execution-identity-admission.js";
@@ -23,6 +26,7 @@ import { readAgentRuntimeExecutionLineage } from "../agent-runtime-execution-lin
 import type { WorkerConnectionIdentity } from "./connection-identity.js";
 import { bindWorkerTurnOwner } from "./placement-turn-claim-events.js";
 import * as environmentServiceModule from "./service.js";
+import { registerWorkerDelegationPolicyTests } from "./worker-session-tool-executor.delegation.suite.js";
 import { registerWorkerGatewayToolExecutionTests } from "./worker-session-tool-executor.gateway-tools.suite.js";
 const {
   workerSessionToolTestMocks,
@@ -77,6 +81,95 @@ describe("worker session tool topology", () => {
 
   afterEach(() => resetGlobalHookRunner());
 
+  it.each([
+    {
+      name: "permitted",
+      allow: ["sessions_spawn", "github_publish"],
+      deny: [],
+      promptAllow: undefined,
+      expected: true,
+    },
+    { name: "unrestricted", allow: undefined, deny: [], promptAllow: undefined, expected: true },
+    {
+      name: "explicitly denied",
+      allow: ["sessions_spawn", "github_publish"],
+      deny: ["github_publish"],
+      promptAllow: undefined,
+      expected: false,
+    },
+    {
+      name: "prompt restricted",
+      allow: ["sessions_spawn", "github_publish"],
+      deny: [],
+      promptAllow: ["sessions_spawn"],
+      expected: false,
+    },
+  ])(
+    "captures $name publication for a new worker child",
+    async ({ allow, deny, promptAllow, expected }) => {
+      setEntry(SOURCE.sessionKey, SOURCE.sessionId);
+      const config = { tools: { allow, deny } };
+      const inheritedPublicationToolRef: { current?: AnyAgentTool } = {};
+      const runtime = getFixture().createToolRuntime({
+        inheritedPublicationToolRef,
+        prepareTools: (adapters) =>
+          createOpenClawCodingToolsInternal(
+            {
+              config,
+              sessionKey: SOURCE.sessionKey,
+              githubPublicationAvailable: false,
+              inheritedPublicationToolRef,
+              wrapBeforeToolCallHook: false,
+              toolConstructionPlan: {
+                includeBaseCodingTools: false,
+                includeShellTools: false,
+                includeChannelTools: false,
+                includeOpenClawTools: true,
+                includePluginTools: false,
+              },
+              conversationCapabilityProfile: resolveConversationCapabilityProfile({
+                config,
+                sessionKey: SOURCE.sessionKey,
+                preparedSessionCapabilityStore: {},
+              }),
+            },
+            undefined,
+            undefined,
+            { tools: adapters, policy: prepareCoreToolPolicy({}) },
+          ),
+      });
+      const surface = await runtime.getSurface(identity);
+      expect(surface.tools.map((tool) => tool.definition.name)).not.toContain("github_publish");
+      runtime.applyPromptToolsAllow(promptAllow);
+      runtime.applyPromptToolsAllow(["sessions_spawn", "github_publish"]);
+      await spawn("publication-child");
+      const policy = gatewayCreate.mock.calls[0]?.[0]?.creation?.inheritedToolPolicy;
+      expect(policy.allow.includes("github_publish")).toBe(expected);
+      expect(
+        gatewayRuntimeIdentity.mock.calls[0]?.[1]?.sessionSpawnContext.inheritedToolPolicy.allow,
+      ).toEqual(policy.allow);
+      expect(placements.isWorkerTurnToolAuthorized(sourceClaim, "github_publish")).toBe(false);
+      await runtime.close();
+      expect(() => runtime.getInheritedPublicationToolName()).toThrow("Worker tool surface closed");
+    },
+  );
+
+  it("rejects tool publication when the source run closes during preparation", async () => {
+    const started = createDeferred();
+    const prepared = createDeferred<AnyAgentTool[]>();
+    const runtime = getFixture().createToolRuntime({
+      prepareTools: () => {
+        started.resolve();
+        return prepared.promise;
+      },
+    });
+    const pending = runtime.getSurface(identity);
+    await started.promise;
+    getFixture().closeSourceRun();
+    prepared.resolve([]);
+    await expect(pending).rejects.toThrow(/source worker run ended|worker turn authority changed/);
+  });
+
   it.each(["active", "run-ended", "operator-revoked"] as const)(
     "reads presence as the original operator only while its authority is live (%s)",
     async (authorityState) => {
@@ -99,9 +192,9 @@ describe("worker session tool topology", () => {
         await release.promise;
         return snapshot;
       });
-      const tool = getFixture()
-        .createTools()
-        .find((candidate) => candidate.name === "presence")!;
+      const tool = (await getFixture().createTools()).find(
+        (candidate) => candidate.name === "presence",
+      )!;
       const pending = tool.execute("presence-read", {
         action: "person",
         person: "me",
@@ -143,9 +236,9 @@ describe("worker session tool topology", () => {
         },
       ]),
     );
-    const tool = getFixture()
-      .createTools()
-      .find((candidate) => candidate.name === "presence")!;
+    const tool = (await getFixture().createTools()).find(
+      (candidate) => candidate.name === "presence",
+    )!;
     const result = await tool.execute("blocked-presence", {});
     expect(result.details).toMatchObject({ reason: "presence is disabled here" });
     expect(gatewayRequest).not.toHaveBeenCalled();
@@ -231,7 +324,7 @@ describe("worker session tool topology", () => {
         return result;
       },
     );
-    const tools = getFixture().createTools({
+    const tools = await getFixture().createTools({
       name: "skill_workshop",
       label: "Workshop",
       description: "Library",
@@ -281,15 +374,15 @@ describe("worker session tool topology", () => {
         await placements.authorizeWorkerTurnTools(sourceClaim, []);
         return { content: [], details: {} };
       });
-      const tool = getFixture()
-        .createTools({
+      const tool = (
+        await getFixture().createTools({
           name: "skill_workshop",
           label: "Workshop",
           description: "Library",
           parameters: SkillLibraryWorkshopSchema,
           execute: executeWorkshop,
         })
-        .find((candidate) => candidate.name === "skill_workshop")!;
+      ).find((candidate) => candidate.name === "skill_workshop")!;
       await expect(tool.execute("revoked-call", { action: "list" })).rejects.toThrow(
         "tool authority changed",
       );
@@ -726,7 +819,7 @@ describe.each([
     const snapshot = { status: "ok", people: [{ name: "Ada" }] };
     gatewayRequest.mockResolvedValueOnce(snapshot);
 
-    const tool = createTools().find((candidate) => candidate.name === "presence")!;
+    const tool = (await createTools()).find((candidate) => candidate.name === "presence")!;
     const pending = tool.execute("source-presence", { include: ["network", "location"] });
 
     if (source.deniedReason) {
@@ -767,7 +860,7 @@ describe("worker spawn startup composition", () => {
             getPluginRegistry: () => registry,
             getPortalRuntime: () => undefined,
             resolveGatewayContext,
-            desktopSessionRegistry: createDesktopSessionRegistry({ lingerMs: 1 }),
+            desktopSessionRegistry: createDesktopSessionRegistry(),
             startup: { ...startup, placementStore: placements },
             log: { child: () => ({ info: () => {}, warn: () => {} }) },
           });
@@ -845,6 +938,8 @@ describe("worker spawn startup composition", () => {
     },
   );
 });
+
+registerWorkerDelegationPolicyTests(fixtureMocks);
 
 describe.each([false, true])(
   "worker spawn parent authority (audit=%s)",

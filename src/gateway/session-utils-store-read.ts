@@ -1,12 +1,10 @@
-import { expectDefined } from "@openclaw/normalization-core";
 import { ok, type Result } from "@openclaw/normalization-core/result";
 import {
   listSessionEntriesCore as listAccessorSessionEntries,
   listSessionEntriesReadOnly as listAccessorSessionEntriesReadOnly,
   loadExactSessionEntryCandidates,
-  loadExactSessionEntryCandidatesReadOnlyBatch,
 } from "../config/sessions/session-accessor.js";
-import type { SessionEntryListScope } from "../config/sessions/session-accessor.types.js";
+import type { SessionEntryReadScope } from "../config/sessions/session-accessor.types.js";
 import type {
   CapturedSessionEntryReadSource,
   SessionEntryReadSource,
@@ -31,14 +29,33 @@ export type GatewaySessionStoreRead = {
     readOnly?: boolean;
     cache?: GatewaySessionStoreCache;
     exactKeys?: readonly string[];
-    projection?: SessionEntryListScope["projection"];
-    readConsistency?: SessionEntryListScope["readConsistency"];
+    projection?: SessionEntryReadScope["projection"];
+    readConsistency?: SessionEntryReadScope["readConsistency"];
     readSource?: SessionEntryReadSource;
   };
   result?: Result<Record<string, SessionEntry>, unknown>;
   readSource?: SessionEntryReadSource;
   capturedReadSource?: CapturedSessionEntryReadSource;
 };
+
+export function gatewaySessionStoreReadOptions(
+  params: Pick<GatewaySessionStoreRead["options"], "env" | "projection" | "readConsistency"> & {
+    exactRead?: boolean;
+    preserveQualifiedAddress?: boolean;
+    storeCache?: GatewaySessionStoreCache;
+  },
+  keys: string[],
+  readOnly: boolean | undefined,
+): GatewaySessionStoreRead["options"] {
+  return {
+    env: params.env,
+    readOnly,
+    ...(params.exactRead || params.preserveQualifiedAddress ? { exactKeys: keys } : {}),
+    ...(params.projection ? { projection: params.projection } : {}),
+    ...(params.readConsistency ? { readConsistency: params.readConsistency } : {}),
+    ...(params.storeCache ? { cache: params.storeCache } : {}),
+  };
+}
 
 /** Single-target resolution keeps its original lazy read and failure order. */
 export function readGatewaySessionStore(
@@ -48,7 +65,7 @@ export function readGatewaySessionStore(
     const { storePath, clone, agentId, options } = read;
     const cache = options.cache;
     const cacheKey = cache
-      ? `${storePath}\u0000${agentId ?? ""}\u0000${clone === false ? "0" : "1"}\u0000${options.readOnly}\u0000${options.projection ?? "full"}\u0000${options.readConsistency ?? ""}\u0000${options.exactKeys?.join("\u0001") ?? ""}`
+      ? `${storePath}\u0000${agentId ?? ""}\u0000${clone === false ? "0" : "1"}\u0000${options.readOnly}\u0000${JSON.stringify(options.projection ?? "full")}\u0000${options.readConsistency ?? ""}\u0000${options.exactKeys?.join("\u0001") ?? ""}`
       : "";
     let loaded = cache?.get(cacheKey);
     if (!loaded) {
@@ -63,34 +80,6 @@ export function readGatewaySessionStore(
     throw read.result.error;
   }
   return read.result.value;
-}
-
-/** Populate exact logical lookups without materializing unrelated store entries. */
-export function loadGatewaySessionStoreReads(reads: readonly GatewaySessionStoreRead[]): void {
-  const pending = reads.filter((read) => read.result === undefined);
-  const results = loadExactSessionEntryCandidatesReadOnlyBatch(
-    pending.map((read) => ({
-      agentId: read.agentId,
-      env: read.options.env,
-      storePath: read.storePath,
-      projection: read.options.projection,
-      clone: false,
-      sessionKeys: expectDefined(read.options.exactKeys, "exact batch lookup keys"),
-      onReadSource: (source) => {
-        read.readSource = source;
-      },
-    })),
-  );
-  for (const [index, read] of pending.entries()) {
-    const result = expectDefined(results[index], "exact batch lookup result");
-    // Consume failures per logical target so prepared callers retain independent results.
-    read.result = result.ok
-      ? ok(Object.fromEntries(result.value.map(({ sessionKey, entry }) => [sessionKey, entry])))
-      : result;
-    if (!result.ok) {
-      read.readSource = undefined;
-    }
-  }
 }
 
 function loadGatewaySessionLookupStore({
@@ -135,7 +124,9 @@ function loadGatewaySessionLookupStore({
         env: options.env,
         ...(agentId ? { agentId } : {}),
         ...(clone === false ? { clone: false } : {}),
-        ...(options.projection ? { projection: options.projection } : {}),
+        ...(options.projection
+          ? { projection: typeof options.projection === "object" ? "full" : options.projection }
+          : {}),
         ...(options.readConsistency ? { readConsistency: options.readConsistency } : {}),
         storePath,
       }).map(({ sessionKey, entry }) => [sessionKey, entry]),

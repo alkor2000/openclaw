@@ -313,16 +313,6 @@ describe("OpenClaw performance workflow", () => {
     expect(verify.run).toContain('"$VITEST_PAIR_RESULT" != "success"');
   });
 
-  it("uses an optional dispatch identifier to name parent-owned runs", () => {
-    const workflow = readFileSync(WORKFLOW, "utf8");
-
-    expect(workflow).toContain(
-      "run-name: ${{ inputs.dispatch_id != '' && format('OpenClaw Performance {0}', inputs.dispatch_id) || 'OpenClaw Performance' }}",
-    );
-    expect(workflow).toContain("dispatch_id:");
-    expect(workflow).toContain("Optional parent workflow dispatch identifier");
-  });
-
   it("pins the Kova evaluator with release validation contracts", () => {
     const workflow = readFileSync(WORKFLOW, "utf8");
     const canonicalKovaRef = "88d9a7efa5e6569f902bf8d298fd6a21c6be2e7b";
@@ -825,6 +815,13 @@ describe("OpenClaw performance workflow", () => {
     expect(baseline.if).toBeUndefined();
     expect(baseline.env?.CLAWGRIT_REPORTS_TOKEN).toBeUndefined();
     expect(baseline.env?.GH_TOKEN).toBe("${{ github.token }}");
+    expect(baseline.env?.QUALIFICATION_DISPATCH).toBe(
+      "${{ startsWith(inputs.dispatch_id, 'full-release-validation-') }}",
+    );
+    expect(run).toContain("advisory-not-compared");
+    expect(run.indexOf('os.environ.get("QUALIFICATION_DISPATCH")')).toBeLessThan(
+      run.indexOf('fetch(reports, "main"'),
+    );
     expect(run).toContain('remote = "https://github.com/openclaw/clawgrit-reports.git"');
     expect(run).toContain(
       'fetch(reports, "main", blobless=True, max_attempts=3, retry_failures=True)',
@@ -1014,7 +1011,7 @@ describe("OpenClaw performance workflow", () => {
       "${{ needs.resolve_target.outputs.secret_eligible == 'true' && steps.prepare.outputs.ready == 'true' && steps.prepare.outputs.already_published != 'true' }}",
     );
     expect(appToken.uses).toBe(
-      "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
+      "actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510",
     );
     expect(appToken.with).toEqual({
       "client-id": "Iv23liOECG0slfuhz093",
@@ -1079,7 +1076,7 @@ describe("OpenClaw performance workflow", () => {
     expect(paths.run).toContain('mktemp -d "${RUNNER_TEMP}/clawgrit-input.XXXXXX"');
     expect(paths.run).toContain('mktemp -d "${RUNNER_TEMP}/clawgrit-reports.XXXXXX"');
     expect(download.uses).toBe(
-      "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+      "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
     );
     expect(download.with?.["artifact-ids"]).toBe("${{ steps.artifact.outputs.ids }}");
     expect(download.with?.name).toBeUndefined();

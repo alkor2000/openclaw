@@ -1,5 +1,6 @@
 import { theme } from "../../packages/terminal-core/src/theme.js";
 import type { HostDesktopStatus } from "../gateway/desktop/host-source.js";
+import type { PluginCompatibilityNotice } from "../plugins/status-compatibility.js";
 import { formatTokenCount } from "../utils/token-format.js";
 
 export function formatHostDesktopStatus(status?: HostDesktopStatus): string {
@@ -27,11 +28,6 @@ type AgentStatusLike = {
   }>;
 };
 
-type PluginCompatibilityNoticeLike = {
-  pluginId?: string | null;
-  plugin?: string | null;
-};
-
 type SummarySessionsLike = {
   count: number;
   paths: string[];
@@ -52,12 +48,9 @@ export function countActiveStatusAgents(params: {
   ).length;
 }
 
-export function buildStatusAllAgentsValue(params: {
-  agentStatus: AgentStatusLike;
-  activeThresholdMs?: number;
-}) {
-  const activeAgents = countActiveStatusAgents(params);
-  return `${params.agentStatus.agents.length} total · ${params.agentStatus.bootstrapPendingCount} bootstrapping · ${activeAgents} active · ${params.agentStatus.totalSessions} sessions`;
+export function buildStatusAllAgentsValue(agentStatus: AgentStatusLike) {
+  const activeAgents = countActiveStatusAgents({ agentStatus });
+  return `${agentStatus.agents.length} total · ${agentStatus.bootstrapPendingCount} bootstrapping · ${activeAgents} active · ${agentStatus.totalSessions} sessions`;
 }
 
 export function buildStatusSecretsValue(count: number) {
@@ -75,14 +68,12 @@ export function buildStatusProbesValue(params: { health?: unknown }) {
 }
 
 export function buildStatusPluginCompatibilityValue(params: {
-  notices: PluginCompatibilityNoticeLike[];
+  notices: Pick<PluginCompatibilityNotice, "pluginId">[];
 }) {
   if (params.notices.length === 0) {
     return theme.success("none");
   }
-  const pluginCount = new Set(
-    params.notices.map((notice) => notice.pluginId ?? notice.plugin ?? ""),
-  ).size;
+  const pluginCount = new Set(params.notices.map((notice) => notice.pluginId)).size;
   return theme.warn(
     `${params.notices.length} notice${params.notices.length === 1 ? "" : "s"} · ${pluginCount} plugin${pluginCount === 1 ? "" : "s"}`,
   );

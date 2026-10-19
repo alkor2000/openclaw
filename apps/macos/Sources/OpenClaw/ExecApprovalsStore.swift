@@ -2,6 +2,7 @@ import CryptoKit
 import Darwin
 import Foundation
 import OpenClawKit
+import OpenClawNativeState
 import OSLog
 import Security
 
@@ -165,18 +166,6 @@ enum ExecApprovalsStore {
         return "/tmp/openclaw-\(geteuid())/exec-approvals-\(digest).sock"
     }
 
-    static func resolvedPersistedSocketPath(
-        existing: String?,
-        stateDirectoryURL: URL,
-        computed: String) -> String
-    {
-        let existing = existing?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let oldCanonical = stateDirectoryURL.appendingPathComponent("exec-approvals.sock").path
-        return existing.isEmpty || (existing == oldCanonical && computed != oldCanonical)
-            ? computed
-            : existing
-    }
-
     private static func homeURL() -> URL {
         guard let configured = OpenClawEnv.path("OPENCLAW_HOME") else {
             return FileManager().homeDirectoryForCurrentUser
@@ -193,17 +182,7 @@ enum ExecApprovalsStore {
         guard let configured = OpenClawEnv.path("OPENCLAW_STATE_DIR") else {
             return AppProfile.current.stateDirectoryURL(homeDirectory: self.homeURL())
         }
-        let home = self.homeURL().path
-        let expanded: String = if configured == "~" {
-            home
-        } else if configured.hasPrefix("~/") {
-            URL(fileURLWithPath: home, isDirectory: true)
-                .appendingPathComponent(String(configured.dropFirst(2)), isDirectory: true)
-                .path
-        } else {
-            configured
-        }
-        return URL(fileURLWithPath: expanded, isDirectory: true).standardizedFileURL
+        return URL(fileURLWithPath: self.expandPath(configured), isDirectory: true).standardizedFileURL
     }
 
     private static func failClosedFallbackFile() -> ExecApprovalsFile {
@@ -222,13 +201,9 @@ enum ExecApprovalsStore {
         let socketPath = file.socket?.path?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let token = file.socket?.token?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         var agents = file.agents ?? [:]
-        if let legacyDefault = agents["default"] {
-            if let main = agents[defaultAgentId] {
-                agents[self.defaultAgentId] = self.mergeAgents(current: main, legacy: legacyDefault)
-            } else {
-                agents[self.defaultAgentId] = legacyDefault
-            }
-            agents.removeValue(forKey: "default")
+        if let legacyDefault = agents.removeValue(forKey: "default") {
+            agents[self.defaultAgentId] = agents[self.defaultAgentId]
+                .map { self.mergeAgents(current: $0, legacy: legacyDefault) } ?? legacyDefault
         }
         agents = agents.mapValues { entry in
             var agent = entry
@@ -252,16 +227,7 @@ enum ExecApprovalsStore {
     {
         var file = self.normalizeIncoming(
             record?.document ?? ExecApprovalsFile(version: 1, socket: nil, defaults: nil, agents: [:]))
-        let existingSocketPath = file.socket?.path
-        let resolvedSocketPath = self.resolvedPersistedSocketPath(
-            existing: existingSocketPath,
-            stateDirectoryURL: self.stateDirURL(),
-            computed: self.socketPath())
-        file.socket?.path = resolvedSocketPath
-        let token = file.socket?.token?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if token.isEmpty {
-            file.socket?.token = self.generateToken()
-        }
+        file.socket = nil
         if file.agents == nil {
             file.agents = [:]
         }
@@ -286,6 +252,19 @@ enum ExecApprovalsStore {
             }
         }
         return false
+    }
+
+    static func localSocketCredentials() throws -> (socketPath: String, token: String) {
+        var operation = ClientCredentialOperation(kind: .socketEnsure)
+        operation.fallback = .init(
+            path: self.socketPath(),
+            token: self.generateToken(),
+            updatedAtMs: Int64(Date().timeIntervalSince1970 * 1000))
+        let result = try DeviceCredentialAccess.execute(root: self.stateDirURL(), operation: operation)
+        guard let socket = result.socket, let path = socket.path, let token = socket.token else {
+            throw OpenClawNativeStateError("Could not acquire local execution socket credentials")
+        }
+        return (self.expandPath(path), token)
     }
 
     static func resolve(agentId: String?) -> ExecApprovalsResolved {
@@ -314,7 +293,13 @@ enum ExecApprovalsStore {
                     documentToWrite: ensured.needsWrite ? ensured.file : nil)
             }
             self.migrationRequiredCache.markResolved(stateDirectoryURL: stateDirectoryURL)
-            return .success(self.resolveFromFile(file, agentId: agentId))
+            guard FileManager.default.fileExists(atPath: OpenClawClientCredentialStore.databaseURL(
+                rootURL: stateDirectoryURL).path)
+            else {
+                throw OpenClawNativeStateError("Local execution credentials require migration")
+            }
+            let socket = try self.localSocketCredentials()
+            return .success(self.resolveFromFile(file, agentId: agentId, socket: (socket.socketPath, socket.token)))
         } catch let error as ExecApprovalsLegacyMigrationRequiredError {
             self.migrationRequiredCache.record(error)
             return .failure(.migrationRequired(error))
@@ -333,7 +318,11 @@ enum ExecApprovalsStore {
             autoAllowSkills: defaults.autoAllowSkills ?? self.defaultAutoAllowSkills)
     }
 
-    private static func resolveFromFile(_ file: ExecApprovalsFile, agentId: String?) -> ExecApprovalsResolved {
+    private static func resolveFromFile(
+        _ file: ExecApprovalsFile,
+        agentId: String?,
+        socket: (path: String, token: String)? = nil) -> ExecApprovalsResolved
+    {
         let resolvedDefaults = self.resolveDefaults(from: file)
         let key = self.agentKey(agentId)
         let agentEntry = file.agents?[key] ?? ExecApprovalsAgent()
@@ -347,13 +336,11 @@ enum ExecApprovalsStore {
                 ?? resolvedDefaults.autoAllowSkills)
         let allowlist = self.normalizeAllowlistEntries(
             (wildcardEntry.allowlist ?? []) + (agentEntry.allowlist ?? []))
-        let socketPath = self.expandPath(file.socket?.path ?? self.socketPath())
-        let token = file.socket?.token ?? ""
+        let socketPath = self.expandPath(socket?.path ?? self.socketPath())
+        let token = socket?.token ?? ""
         return ExecApprovalsResolved(
-            url: self.databaseURL(),
             socketPath: socketPath,
             token: token,
-            defaults: resolvedDefaults,
             agent: resolvedAgent,
             allowlist: allowlist,
             file: file)
@@ -422,18 +409,16 @@ extension ExecApprovalsStore {
         var normalized: [ExecAllowlistUse] = []
         normalized.reserveCapacity(grants.count)
         for grant in grants {
-            switch ExecApprovalHelpers.validateAllowlistPattern(grant.match.pattern) {
-            case let .valid(pattern):
-                normalized.append(ExecAllowlistUse(
-                    match: ExecAllowlistEntry(
-                        id: grant.match.id,
-                        pattern: pattern,
-                        source: "allow-always",
-                        argPattern: grant.match.argPattern.flatMap { $0.isEmpty ? nil : $0 }),
-                    resolvedPath: grant.resolvedPath))
-            case let .invalid(reason):
-                return .failure(.invalidPattern(reason))
+            guard let pattern = grant.match.pattern.nonEmpty else {
+                return .failure(.invalidPattern(.empty))
             }
+            normalized.append(ExecAllowlistUse(
+                match: ExecAllowlistEntry(
+                    id: grant.match.id,
+                    pattern: pattern,
+                    source: "allow-always",
+                    argPattern: grant.match.argPattern.flatMap { $0.isEmpty ? nil : $0 }),
+                resolvedPath: grant.resolvedPath))
         }
         return .success(normalized)
     }
@@ -574,14 +559,12 @@ extension ExecApprovalsStore {
             let allowlist = currentAllowlist.map { item -> ExecAllowlistEntry in
                 guard let use = usesByKey[self.allowlistEntryMatchKey(item)] else { return item }
                 entryChanged = true
-                return ExecAllowlistEntry(
-                    id: item.id,
-                    pattern: item.pattern,
-                    source: item.source,
-                    argPattern: item.argPattern,
-                    lastUsedAt: now,
-                    lastUsedCommand: self.shouldRecordLastUsedCommand(for: item) ? command : nil,
-                    lastResolvedPath: use.resolvedPath)
+                var updated = item
+                updated.commandText = nil
+                updated.lastUsedAt = now
+                updated.lastUsedCommand = item.argPattern?.hasPrefix("sha256:") == true ? nil : command
+                updated.lastResolvedPath = use.resolvedPath
+                return updated
             }
             if entryChanged {
                 changed = true
@@ -593,10 +576,6 @@ extension ExecApprovalsStore {
             file.agents = agents
         }
         return changed
-    }
-
-    private static func shouldRecordLastUsedCommand(for entry: ExecAllowlistEntry) -> Bool {
-        !(entry.argPattern?.hasPrefix("sha256:") ?? false)
     }
 
     static func allowlistEntryMatchKey(_ entry: ExecAllowlistEntry) -> ExecAllowlistEntryMatchKey {
@@ -620,10 +599,7 @@ extension ExecApprovalsStore {
 
     static func expandPath(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        let configuredHome = OpenClawEnv.path("OPENCLAW_HOME")
-            .map { ($0 as NSString).expandingTildeInPath }
-        let home = configuredHome.map { URL(fileURLWithPath: $0, isDirectory: true) }
-            ?? FileManager().homeDirectoryForCurrentUser
+        let home = self.homeURL()
         if trimmed == "~" {
             return home.path
         }

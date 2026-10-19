@@ -2,7 +2,6 @@ import { resolveTimerTimeoutMs } from "@openclaw/normalization-core/number-coerc
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import type { ChannelApprovalKind } from "./approval-types.js";
-import type { DeviceIdentity } from "./device-identity.js";
 import { toErrorObject } from "./errors.js";
 import { getApnsBearerToken, type ApnsAuthConfig } from "./push-apns-auth.js";
 import {
@@ -12,13 +11,6 @@ import {
   createApnsResponseBodyCapture,
   getApnsResponseBodyCaptureText,
 } from "./push-apns-http2.js";
-import {
-  createApnsAlertPayload,
-  createApnsApprovalAlertPayload,
-  createApnsApprovalResolvedPayload,
-  createApnsBackgroundPayload,
-  resolvePluginApprovalAlertBody,
-} from "./push-apns-payloads.js";
 import { apnsSendInvalidatedError, requireCurrentApnsSend } from "./push-apns-send-current.js";
 import {
   isLikelyApnsToken,
@@ -33,7 +25,6 @@ import {
 import {
   type ApnsRelayConfig,
   type ApnsRelayPushResponse,
-  type ApnsRelayRequestSender,
   resolveApnsRelayConfigFromEnv,
   sendApnsRelayPush,
 } from "./push-apns.relay.js";
@@ -86,6 +77,42 @@ type ApnsRequestResponse = { status: number; apnsId?: string; body: string };
 type ApnsRequestSender = (params: ApnsRequestParams) => Promise<ApnsRequestResponse>;
 
 const DEFAULT_APNS_TIMEOUT_MS = 10_000;
+const PLUGIN_APPROVAL_ALERT_BODY_MAX_LENGTH = 256;
+
+function createApnsApprovalAlertPayload(params: {
+  kind: ChannelApprovalKind;
+  approvalId: string;
+  gatewayDeviceId: string;
+  title: string;
+  body: string;
+  category: string;
+}): object {
+  return {
+    aps: {
+      alert: {
+        title: params.title,
+        body: params.body,
+      },
+      sound: "default",
+      category: params.category,
+      "content-available": 1,
+    },
+    openclaw: {
+      kind: `${params.kind}.approval.requested`,
+      approvalId: params.approvalId,
+      gatewayDeviceId: params.gatewayDeviceId,
+      ts: Date.now(),
+    },
+  };
+}
+
+function resolvePluginApprovalAlertBody(description: string): string {
+  const body = normalizeOptionalString(description) ?? "";
+  if (body.length <= PLUGIN_APPROVAL_ALERT_BODY_MAX_LENGTH) {
+    return body;
+  }
+  return `${truncateUtf16Safe(body, PLUGIN_APPROVAL_ALERT_BODY_MAX_LENGTH - 1).trimEnd()}…`;
+}
 
 function parseReason(body: string): string | undefined {
   const trimmed = body.trim();
@@ -284,14 +311,11 @@ type DirectApnsTransportParams = ApnsTransportCommonParams & {
   auth: ApnsAuthConfig;
   requestSender?: ApnsRequestSender;
   relayConfig?: never;
-  relayRequestSender?: never;
 };
 
 type RelayApnsTransportParams = ApnsTransportCommonParams & {
   registration: RelayApnsRegistration;
   relayConfig: ApnsRelayConfig;
-  relayRequestSender?: ApnsRelayRequestSender;
-  relayGatewayIdentity?: Pick<DeviceIdentity, "deviceId" | "privateKeyPem">;
   auth?: never;
   requestSender?: never;
 };
@@ -321,11 +345,13 @@ type ApnsPluginApprovalAlertParams = ApnsApprovalParams & {
 };
 
 export async function sendApnsAlert(params: ApnsAlertParams): Promise<ApnsPushResult> {
-  const payload = createApnsAlertPayload({
-    nodeId: params.nodeId,
-    title: params.title,
-    body: params.body,
-  });
+  const payload = {
+    aps: {
+      alert: { title: params.title, body: params.body },
+      sound: "default",
+    },
+    openclaw: { kind: "push.test", nodeId: params.nodeId, ts: Date.now() },
+  };
 
   return await sendApnsPush({ transport: params, payload, pushType: "alert" }, params);
 }
@@ -333,10 +359,16 @@ export async function sendApnsAlert(params: ApnsAlertParams): Promise<ApnsPushRe
 export async function sendApnsBackgroundWake(
   params: ApnsBackgroundWakeParams,
 ): Promise<ApnsPushResult> {
-  const payload = createApnsBackgroundPayload({
-    nodeId: params.nodeId,
-    wakeReason: params.wakeReason,
-  });
+  const reason = params.wakeReason ?? "node.invoke";
+  const payload = {
+    aps: { "content-available": 1 },
+    openclaw: {
+      kind: "node.wake",
+      nodeId: params.nodeId,
+      ts: Date.now(),
+      ...(reason ? { reason } : {}),
+    },
+  };
 
   return await sendApnsPush({ transport: params, payload, pushType: "background" }, params);
 }
@@ -366,8 +398,6 @@ async function sendApnsPush(
       payload: params.payload,
       pushType: params.pushType,
       priority,
-      gatewayIdentity: relayParams.relayGatewayIdentity,
-      requestSender: relayParams.relayRequestSender,
       ...lifecycleControls,
     });
     return toPushResult({ registration, response });
@@ -443,11 +473,15 @@ async function sendApnsApprovalResolvedWake(params: {
 }): Promise<ApnsPushResult> {
   return await sendApnsPush({
     transport: params.transport,
-    payload: createApnsApprovalResolvedPayload({
-      kind: params.kind,
-      approvalId: params.transport.approvalId,
-      gatewayDeviceId: params.transport.gatewayDeviceId,
-    }),
+    payload: {
+      aps: { "content-available": 1 },
+      openclaw: {
+        kind: `${params.kind}.approval.resolved`,
+        approvalId: params.transport.approvalId,
+        gatewayDeviceId: params.transport.gatewayDeviceId,
+        ts: Date.now(),
+      },
+    },
     pushType: "background",
   });
 }

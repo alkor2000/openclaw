@@ -133,7 +133,6 @@ describe("broadcast serialization failures", () => {
         broadcastToConnIds: connection.broadcastToConnIds,
         sessionEventSubscribers: { getAll: () => recipients },
         sessionMessageSubscribers: { get: () => recipients },
-        chatAbortControllers: new Map(),
         getSessionRowProjection: () => projection,
       });
       for (const order of [peers, peers.toReversed()]) {
@@ -240,7 +239,6 @@ describe("broadcast serialization failures", () => {
         broadcastToConnIds: connection.broadcastToConnIds,
         sessionEventSubscribers: { getAll: () => recipients },
         sessionMessageSubscribers: { get: () => recipients },
-        chatAbortControllers: new Map(),
         getSessionRowProjection: () => projection,
       });
       const update = { target: scope, messageId: "steer", messageSeq: 1, message };
@@ -346,6 +344,7 @@ describe("broadcast serialization failures", () => {
     });
     broadcast("sessions.changed", { reason: "delete" });
     broadcast("users.prefs.changed", { profileId: "other", keys: ["ui.theme"] });
+    broadcast("mentions.changed", { gatewayInstanceId: "gateway", revision: 1 });
     broadcast("chat.metadata.changed", { content: "Hidden content" });
     broadcastToConnIds("sessions.changed", dynamic, recipients);
     expect(scoped.socket.send).not.toHaveBeenCalled();
@@ -357,10 +356,16 @@ describe("broadcast serialization failures", () => {
       { profileId: "owner", keys: ["ui.theme"] },
       recipients,
     );
+    broadcastToConnIds(
+      "mentions.changed",
+      { gatewayInstanceId: "gateway", revision: 1 },
+      recipients,
+    );
     expect(scoped.socket.frames).toEqual([
       { event: "chat.metadata.changed", seq: 1 },
       { event: "sessions.changed", seq: 2 },
       { event: "users.prefs.changed", seq: 3 },
+      { event: "mentions.changed", seq: 4 },
     ]);
   });
 

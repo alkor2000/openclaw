@@ -1,3 +1,5 @@
+import { createChangeListeners } from "../../../../src/shared/listeners.js";
+
 const RUN_FIELDS = [
   "chatMessages",
   "chatPendingInputs",
@@ -23,7 +25,7 @@ const RUN_FIELDS = [
 
 type RunField = (typeof RUN_FIELDS)[number];
 type ChatRunFields<T> = Partial<Pick<T, Extract<RunField, keyof T>>>;
-export type ChatRunPublication = "immediate" | "animation-frame";
+type ChatRunPublication = "immediate" | "animation-frame";
 
 const presentations = new WeakMap<object, ChatRunPresentation<object>>();
 
@@ -32,11 +34,10 @@ class ChatRunPresentation<T extends object> {
   readonly values: ChatRunFields<T> = {};
   readonly fields = RUN_FIELDS;
   frame: number | null = null;
-  private listeners = new Set<() => void>();
+  private readonly listeners = createChangeListeners();
   private depth = 0;
   private changed = false;
   private cadence: ChatRunPublication | false = false;
-  private viewUpdate: (() => void) | undefined;
 
   constructor(host: T) {
     const pendingFrame: unknown = Reflect.get(host, "chatStreamRenderFrame");
@@ -72,10 +73,7 @@ class ChatRunPresentation<T extends object> {
     });
   }
 
-  subscribe(listener: () => void): () => void {
-    this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
-  }
+  readonly subscribe = this.listeners.subscribe;
 
   batch<TResult>(operation: () => TResult, mode?: ChatRunPublication | false): TResult {
     if (this.depth === 0) {
@@ -122,35 +120,18 @@ class ChatRunPresentation<T extends object> {
       }
       return;
     }
-    this.clearFrame();
+    this.cancelFrame();
     this.notify();
   }
 
-  requestViewUpdate(update: () => void, mode: ChatRunPublication): void {
-    this.viewUpdate = update;
-    this.publish(mode);
-  }
-
   cancelFrame(): void {
-    this.clearFrame();
-    this.viewUpdate = undefined;
-  }
-
-  private clearFrame(): void {
     if (this.frame !== null) {
       globalThis.cancelAnimationFrame?.(this.frame);
       this.frame = null;
     }
   }
 
-  private notify(): void {
-    const update = this.viewUpdate;
-    this.viewUpdate = undefined;
-    for (const listener of this.listeners) {
-      listener();
-    }
-    update?.();
-  }
+  private readonly notify = this.listeners.publish;
 }
 
 export function chatRunPresentation<T extends object>(host: T): ChatRunPresentation<T> {

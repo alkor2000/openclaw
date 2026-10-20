@@ -23,6 +23,7 @@ import {
   cloneChatAttachmentsForIndependentOwner,
   replaceChatAttachmentsFromEditor,
 } from "./attachment-payload-store.ts";
+import { mergeStoredChatSessionSnapshot } from "./chat-board-snapshot.ts";
 import { rewindChatHistory, switchChatHistoryBranch } from "./chat-history-actions.ts";
 import {
   fetchStagedOlderHistoryPage,
@@ -70,10 +71,9 @@ import {
 import {
   applyChatCacheSnapshot,
   cacheChatSessionSnapshot,
-  readChatSessionSnapshot,
   resolveChatSnapshotKey,
 } from "./session-message-cache.ts";
-import { maybeResetToolStream } from "./stream-reconciliation.ts";
+import { resetToolStream } from "./tool-stream-state.ts";
 
 export abstract class ChatPaneHistory extends ChatPaneReplyNavigation {
   private activeCatalogContinuation: symbol | null = null;
@@ -109,7 +109,6 @@ export abstract class ChatPaneHistory extends ChatPaneReplyNavigation {
         .then((storedSnapshot) => {
           if (
             requests.initialSnapshotHydration !== hydration ||
-            requests.acceptedHistory ||
             this.state !== state ||
             !this.ownsChatSnapshot({ sessionKey }) ||
             !areUiSessionKeysEquivalent(state.sessionKey, sessionKey) ||
@@ -117,10 +116,24 @@ export abstract class ChatPaneHistory extends ChatPaneReplyNavigation {
           ) {
             return hydration.complete?.();
           }
+          const snapshot = mergeStoredChatSessionSnapshot(
+            state.chatMessagesBySession,
+            state,
+            { sessionKey },
+            storedSnapshot,
+          );
+          if (snapshot?.board) {
+            this.boardProviderLease?.restoreSnapshot(
+              snapshot.board.snapshot,
+              snapshot.board.receivedAtMs,
+            );
+          }
+          if (requests.acceptedHistory) {
+            return hydration.complete?.();
+          }
           // A sibling can fill the shared cache while this pane still needs its
           // own transcript. Adopt those messages before revalidating their cursor.
           const cache = state.chatMessagesBySession;
-          const snapshot = readChatSessionSnapshot(cache, state, { sessionKey }) ?? storedSnapshot;
           if (!snapshot) {
             return hydration.complete?.();
           }
@@ -156,7 +169,7 @@ export abstract class ChatPaneHistory extends ChatPaneReplyNavigation {
       void this.loadCatalogSession(catalogKey, false);
       return;
     }
-    maybeResetToolStream(state, { preserveStreamSegments: state.chatRunId !== null });
+    resetToolStream(state, { preserveStreamSegments: state.chatRunId !== null });
     this.reconcileWaitingApprovalSnapshot();
     if (chatHistoryRequests(state).subscriptionError) {
       void syncSelectedSessionMessageSubscription(state);
@@ -237,9 +250,8 @@ export abstract class ChatPaneHistory extends ChatPaneReplyNavigation {
       return;
     }
     const root = this.transcript.scrollElement;
-    // The transcript renderer owns the sentinel observed by this history owner.
-    const sentinel = root?.querySelector<HTMLElement>(".chat-history-sentinel") ?? null;
-    if (!root || !sentinel) {
+    const sentinel = this.historySentinel;
+    if (!root || !sentinel || !root.contains(sentinel)) {
       this.clearHistoryObserver();
       return;
     }
@@ -733,7 +745,6 @@ export abstract class ChatPaneHistory extends ChatPaneReplyNavigation {
       return;
     }
     state.handleChatDraftChange(command.endsWith(" ") ? command : `${command} `);
-    state.requestUpdate?.();
   };
 
   protected announceCommandPaletteTarget(

@@ -31,13 +31,17 @@ function interceptAdmission(
   }
 }
 
-function postedEvent(postId = "post-1", event: "posted" | "post_edited" = "posted"): string {
+function postedEvent(
+  postId = "post-1",
+  event: "posted" | "post_edited" = "posted",
+  channelId = "channel-1",
+): string {
   return JSON.stringify({
     event,
     data: {
       post: JSON.stringify({
         id: postId,
-        channel_id: "channel-1",
+        channel_id: channelId,
         user_id: "user-1",
         message: "hello",
       }),
@@ -138,6 +142,56 @@ it("visibly rejects an authorless event without disconnecting subsequent ingress
 
   await monitor.receive(postedEvent("post-after-invalid"));
   await vi.waitFor(() => expect(defaultDispatch).toHaveBeenCalledTimes(1));
+});
+
+it("dispatches same-channel steering while preserving a deferred follow-up claim", async () => {
+  const active = createDeferred<void>();
+  const finish = createDeferred<void>();
+  const deferred = createDeferred<() => void | Promise<void>>();
+  const otherChannel = createDeferred<void>();
+  const dispatched: string[] = [];
+  const monitor = startMonitor(queue, async (post, _payload, lifecycle) => {
+    dispatched.push(post.id);
+    if (post.id === "01-active") {
+      await lifecycle.onAdopted();
+      active.resolve();
+      await finish.promise;
+    } else if (post.id === "02-follow-up") {
+      lifecycle.onDeferred();
+      deferred.resolve(lifecycle.onAdopted);
+      return { kind: "deferred" };
+    } else {
+      await lifecycle.onAdopted();
+      if (post.id === "04-other-channel") {
+        otherChannel.resolve();
+      }
+    }
+    return undefined;
+  });
+  let adoptFollowup: (() => void | Promise<void>) | undefined;
+  try {
+    await monitor.receive(postedEvent("01-active"));
+    await active.promise;
+    await monitor.receive(postedEvent("02-follow-up"));
+    adoptFollowup = await deferred.promise;
+    const claims = await queue.listClaims();
+    expect(claims).toEqual([expect.objectContaining({ id: "02-follow-up" })]);
+
+    await monitor.receive(postedEvent("03-steer"));
+    await monitor.receive(postedEvent("04-other-channel", "posted", "channel-2"));
+    // The later independent lane is a drain barrier even if the deferred lane blocks steering.
+    await otherChannel.promise;
+    expect(dispatched).toEqual(["01-active", "02-follow-up", "03-steer", "04-other-channel"]);
+    expect(await queue.listClaims()).toEqual(claims);
+
+    await adoptFollowup();
+    adoptFollowup = undefined;
+    expect(await queue.listClaims()).toEqual([]);
+  } finally {
+    finish.resolve();
+    await adoptFollowup?.();
+    await monitor.stop();
+  }
 });
 
 it("settles only the restarted account and recovers its durable row exactly once", async () => {

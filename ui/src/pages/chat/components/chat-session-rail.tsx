@@ -1,18 +1,19 @@
 import "../../../styles/chat/session-rail.css";
 import "../../../styles/chat/working-indicator.css";
-import "./chat-comment-controller.ts";
 import { createMemo, For, onSettled, Show } from "solid-js";
 import type { SessionObserverDigest } from "../../../../../packages/gateway-protocol/src/schema/sessions.js";
 import type { ControlUiSessionPullRequest } from "../../../../../src/gateway/control-ui-contract.js";
+import type { GatewayBrowserClient } from "../../../api/gateway.ts";
 import type { ChatSendShortcut } from "../../../app/settings.ts";
 import { handleMarkdownCodeBlockClick } from "../../../components/markdown-code-blocks.ts";
 import { markdownBlocksRef } from "../../../components/markdown-element-refs-solid.ts";
 import { Icon } from "../../../components/solid/icon.tsx";
 import { PanelEmptyState } from "../../../components/solid/panel-empty-state.tsx";
 import { PanelLoadingSkeleton } from "../../../components/solid/panel-loading-skeleton.tsx";
+import { registerChatSessionEnglish } from "../../../i18n/locales/en-chat-session.ts";
 import { formatTimeMs } from "../../../lib/format.ts";
 import { cancelLayout, scheduleLayout } from "../../../lib/layout-frame.ts";
-import { t } from "../../../lib/reactive/i18n.ts";
+import { registerEnglishCatalog, t } from "../../../lib/reactive/i18n.ts";
 import { projectOwner } from "../../../lib/reactive/projection.ts";
 import { defineSolidBridge, type SolidBridgeElement } from "../../../lib/solid-bridge.ts";
 import type {
@@ -21,9 +22,13 @@ import type {
 } from "../chat-session-companion.ts";
 import type { ChatAttachmentControlsProps } from "./chat-attachment-controls.types.ts";
 import { createChatAttachmentDropHandlers } from "./chat-attachments.ts";
+import { ChatCommentController } from "./chat-comment-controller.ts";
 import { MessageMarkdown } from "./chat-message-text-view.tsx";
+import type { ChatModelControlsProps } from "./chat-model-controls.tsx";
 import { SessionRailComposer, sessionRailQuestion } from "./chat-session-rail-composer.tsx";
 import { ChatWorkingIndicator } from "./chat-working-indicator.tsx";
+
+registerEnglishCatalog(registerChatSessionEnglish);
 
 function checksSummary(pullRequest: ControlUiSessionPullRequest): string | null {
   const checks = pullRequest.checks;
@@ -38,7 +43,6 @@ function checksSummary(pullRequest: ControlUiSessionPullRequest): string | null 
   }
   return t("chat.rail.checksPending", { count: String(checks.running) });
 }
-const SESSION_RAIL_STARTER_KEYS = ["changed", "stopped", "remaining"] as const;
 const COMPANION_HINT_KEYS = {
   busy: "chat.rail.askBusy",
   "history-unavailable": "chat.rail.askHistoryUnavailable",
@@ -53,19 +57,24 @@ const COMPANION_HINT_KEYS = {
 >;
 
 type ChatSessionRailProps = {
+  presentation?: "desktop" | "mobile";
   sessionKey: string;
   digest: SessionObserverDigest | null;
   running: boolean;
   activeRunId: string | null;
   pullRequests: ControlUiSessionPullRequest[];
   companion: ChatSessionCompanionThread;
+  modelControls?: ChatModelControlsProps;
+  client: GatewayBrowserClient | null;
   connected: boolean;
   sendShortcut: ChatSendShortcut;
+  inputDeviceId?: string;
   onSubmit?: (question: string | ChatSessionCompanionTurn) => void;
   onDraftChange?: (draft: string) => void;
   onAttachmentsChange?: ChatAttachmentControlsProps["onAttachmentsChange"];
   attachmentLimits?: ChatAttachmentControlsProps["attachmentLimits"];
   uploadConfig?: ChatAttachmentControlsProps["uploadConfig"];
+  onOpenImage?: ChatAttachmentControlsProps["onOpenImage"];
   presented: boolean;
   focusRequest?: () => boolean;
 };
@@ -104,6 +113,7 @@ function ChatSessionRailContent(props: ChatSessionRailProps, host: ChatSessionRa
       imagesOnly: true,
       disabled: !props.connected,
       onAttachmentsChange: props.onAttachmentsChange,
+      onOpenImage: props.onOpenImage,
       onPendingReadsChange: (delta) => {
         if (readSignal) {
           reads?.updatePending(readSignal, delta);
@@ -212,6 +222,8 @@ function ChatSessionRailContent(props: ChatSessionRailProps, host: ChatSessionRa
         )}
         {!props.companion.loading && !props.companion.turns.length && (
           <PanelEmptyState
+            // Side chat keeps its native desktop empty; only mobile adopts the shared variant.
+            presentation={props.presentation === "mobile" ? "mobile" : undefined}
             icon={<Icon name="bot" />}
             heading={t("chat.sidePanel.companion")}
             description={t("chat.rail.empty")}
@@ -324,37 +336,25 @@ function ChatSessionRailContent(props: ChatSessionRailProps, host: ChatSessionRa
           }}
         </For>
       </div>
-      {!props.companion.turns.some((turn) => turn.status !== "failed") && (
-        <div class="chat-session-rail__starters">
-          <For each={SESSION_RAIL_STARTER_KEYS}>
-            {(key) => (
-              <button
-                class="chip chat-session-rail__starter"
-                type="button"
-                disabled={!props.connected}
-                onClick={() => props.onSubmit?.(t(`chat.rail.starters.${key}`))}
-              >
-                <Icon name="spark" />
-                <span>{t(`chat.rail.starters.${key}`)}</span>
-              </button>
-            )}
-          </For>
-        </div>
-      )}
-      <openclaw-chat-comment-controller
-        prop:onFocusComposer={focusComposer}
-        prop:paneId={`side-chat:${props.sessionKey}`}
-        prop:props={attachmentProps()}
-        prop:disabled={attachmentProps().disabled}
-        prop:sessionKey={props.sessionKey}
-        prop:presented={props.presented}
+      <ChatCommentController
+        onFocusComposer={focusComposer}
+        paneId={`side-chat:${props.sessionKey}`}
+        props={attachmentProps()}
+        disabled={Boolean(attachmentProps().disabled)}
+        sessionKey={props.sessionKey}
+        presented={props.presented}
       />
       <SessionRailComposer
         textareaRef={(element) => (textarea = element)}
+        sessionKey={props.sessionKey}
         companion={props.companion}
+        modelControls={props.modelControls}
+        client={props.client}
         connected={props.connected}
+        presented={props.presented}
         pending={pending()}
         sendShortcut={props.sendShortcut}
+        inputDeviceId={props.inputDeviceId}
         attachmentProps={attachmentProps()}
         submit={submit}
         onDraftChange={props.onDraftChange}
@@ -370,35 +370,25 @@ defineSolidBridge<ChatSessionRailProps>("openclaw-chat-session-rail", ChatSessio
     }
   },
   properties: {
+    presentation: { default: undefined, attribute: false },
     sessionKey: { default: "", attribute: false },
     digest: { default: null, attribute: false },
     running: { default: false, attribute: false },
     activeRunId: { default: null, attribute: false },
     pullRequests: { default: [], attribute: false },
     companion: { default: { turns: [], loading: false, draft: "" }, attribute: false },
+    modelControls: { default: undefined, attribute: false },
+    client: { default: null, attribute: false },
     connected: { default: false, attribute: false },
     sendShortcut: { default: "enter", attribute: false },
+    inputDeviceId: { default: undefined, attribute: false },
     onSubmit: { default: undefined, attribute: false },
     onDraftChange: { default: undefined, attribute: false },
     onAttachmentsChange: { default: undefined, attribute: false },
+    onOpenImage: { default: undefined, attribute: false },
     attachmentLimits: { default: undefined, attribute: false },
     uploadConfig: { default: undefined, attribute: false },
     presented: { default: false, type: Boolean },
     focusRequest: { default: undefined, attribute: false },
   },
 });
-
-declare module "@solidjs/web" {
-  namespace JSX {
-    interface IntrinsicElements {
-      "openclaw-chat-comment-controller": HTMLAttributes<HTMLElement> & {
-        "prop:paneId": string;
-        "prop:props": ChatAttachmentControlsProps;
-        "prop:disabled"?: boolean;
-        "prop:sessionKey": string;
-        "prop:presented": boolean;
-        "prop:onFocusComposer": () => void;
-      };
-    }
-  }
-}

@@ -8,6 +8,7 @@ import {
   observeChannelIngressQueueWrite,
 } from "openclaw/plugin-sdk/channel-ingress-test-runtime";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
+import type { dispatchInboundMessage } from "openclaw/plugin-sdk/reply-runtime";
 import {
   clearRuntimeConfigSnapshot,
   setRuntimeConfigSnapshot,
@@ -31,6 +32,7 @@ type Transport = {
   connectionCount: () => number;
   post: (post: Post) => Promise<void>;
 };
+type InboundDispatchParams = Parameters<typeof dispatchInboundMessage>[0];
 
 export function registerMattermostIngressDebounceTests(harness: {
   testConfig: OpenClawConfig;
@@ -51,12 +53,13 @@ export function registerMattermostIngressDebounceTests(harness: {
     dispatchInboundMessage: Mock;
     sendMessageMattermost: Mock;
     resolveMattermostMedia: Mock;
+    resolveChannelInfo: Mock;
   };
   startTransport: (config: OpenClawConfig, abort: AbortController, ready: () => void) => Transport;
 }) {
   const { testConfig, mockState } = harness;
   const dirs = useAutoCleanupTempDirTracker(afterEach);
-  function fixture(signal: AbortSignal) {
+  function fixture(signal: AbortSignal, debounceMs = 1_000) {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
     const queue = createChannelIngressQueueForTests<{
       version: 1;
@@ -72,7 +75,11 @@ export function registerMattermostIngressDebounceTests(harness: {
       ...testConfig,
       channels: {
         ...testConfig.channels,
-        mattermost: { ...testConfig.channels?.mattermost, groupAllowFrom: ["user-1", "user-2"] },
+        mattermost: {
+          ...testConfig.channels?.mattermost,
+          allowFrom: ["user-1"],
+          groupAllowFrom: ["user-1", "user-2"],
+        },
       },
     };
     const collectors: Array<{
@@ -82,7 +89,7 @@ export function registerMattermostIngressDebounceTests(harness: {
     let enqueued = 0;
     const arrivals = new Map<number, ReturnType<typeof createDeferred<void>>>();
     mockState.runtimeCore = harness.createRuntimeCore(config, undefined, {
-      inboundDebounceMs: 1_000,
+      inboundDebounceMs: debounceMs,
       isControlCommandMessage: (text) => text?.trim().startsWith("/") ?? false,
       shouldHandleTextCommands: () => true,
       createInboundDebouncer: (params) => {
@@ -371,6 +378,83 @@ export function registerMattermostIngressDebounceTests(harness: {
     } finally {
       admit.resolve();
       finish.resolve();
+      await f.close();
+    }
+  });
+
+  it("dispatches later DM input while an older followup remains deferred", async ({ signal }) => {
+    const f = fixture(signal, 0);
+    mockState.resolveChannelInfo.mockResolvedValue({
+      id: "chan-1",
+      type: "D",
+      name: "",
+      display_name: "",
+    });
+    const activeAdopted = createDeferred<void>();
+    const normalAdopted = createDeferred<void>();
+    const steerAdopted = createDeferred<void>();
+    const followupAdoption = createDeferred<() => void | Promise<void>>();
+    const finishActive = createDeferred<void>();
+    const chatTypes: InboundDispatchParams["ctx"]["ChatType"][] = [];
+    let activeFinished = false;
+    mockState.dispatchInboundMessage.mockImplementation(async (params: InboundDispatchParams) => {
+      const lifecycle = params.replyOptions?.turnAdoptionLifecycle;
+      if (!lifecycle?.onDeferred) {
+        throw new Error("Missing Mattermost turn adoption lifecycle");
+      }
+      chatTypes.push(params.ctx.ChatType);
+      if (params.ctx.BodyForAgent === "followup") {
+        lifecycle.onDeferred();
+        followupAdoption.resolve(lifecycle.onAdopted);
+        return;
+      }
+      await lifecycle.onAdopted();
+      switch (params.ctx.BodyForAgent) {
+        case "active":
+          activeAdopted.resolve();
+          await finishActive.promise;
+          activeFinished = true;
+          break;
+        case "normal":
+          normalAdopted.resolve();
+          break;
+        case "steer":
+          steerAdopted.resolve();
+          break;
+        default:
+          throw new Error("Unexpected Mattermost regression input");
+      }
+    });
+    let adoptFollowup: (() => void | Promise<void>) | undefined;
+    try {
+      const provider = await f.start();
+      await f.post(provider, { id: "dm-active", message: "active" });
+      await f.join(activeAdopted.promise);
+      await f.post(provider, { id: "dm-normal", message: "normal" });
+      await f.join(normalAdopted.promise);
+      expect(activeFinished).toBe(false);
+
+      await f.post(provider, { id: "dm-followup", message: "followup" });
+      adoptFollowup = await f.join(followupAdoption.promise);
+      expect(await f.queue.listClaims()).toEqual([expect.objectContaining({ id: "dm-followup" })]);
+      // Queue ownership must not block a newer input from reaching steering.
+      await f.post(provider, { id: "dm-steer", message: "steer" });
+      await f.join(steerAdopted.promise);
+      expect(activeFinished).toBe(false);
+      expect(chatTypes).toEqual(["direct", "direct", "direct", "direct"]);
+      expect(await f.queue.listClaims()).toEqual([expect.objectContaining({ id: "dm-followup" })]);
+      expect(await f.queue.listPending({ limit: "all" })).toEqual([]);
+
+      await adoptFollowup();
+      finishActive.resolve();
+      await f.drain();
+      expect(activeFinished).toBe(true);
+      expect(f.bodies()).toEqual(["active", "normal", "followup", "steer"]);
+      expect(await f.queue.listClaims()).toEqual([]);
+      expect(await f.queue.listPending({ limit: "all" })).toEqual([]);
+    } finally {
+      await adoptFollowup?.();
+      finishActive.resolve();
       await f.close();
     }
   });

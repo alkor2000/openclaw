@@ -668,7 +668,6 @@ async function runGuidedOnboardingFlow(
   if (quickstart && !gatewayExternallyManaged) {
     await prompter.outro(t("wizard.guided.setupDone"));
     return {
-      workspace: hatchWorkspace,
       next: "foreground-gateway",
       ...(handoffAgentId ? { agentId: handoffAgentId } : {}),
     };
@@ -687,7 +686,7 @@ async function runGuidedOnboardingFlow(
     });
     if (handoff) {
       await prompter.outro(t("wizard.guided.browserHandoffReady"));
-      return { workspace: hatchWorkspace, next: "browser" };
+      return { next: "browser" };
     }
   }
   if (setupOnly) {

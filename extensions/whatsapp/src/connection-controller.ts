@@ -245,7 +245,6 @@ export async function waitForWhatsAppLoginResult(params: {
   verbose: boolean;
   runtime: RuntimeEnv;
   waitForConnection?: typeof waitForWaConnection;
-  createSocket?: typeof createWaSocket;
   socketTiming?: WhatsAppSocketTimingOptions;
   onQr?: (qr: string) => void;
   onSocketReplaced?: (sock: WaSocket) => void;
@@ -257,18 +256,12 @@ export async function waitForWhatsAppLoginResult(params: {
   getCredentialPersistenceFailure?: () => CredentialPersistenceFailure | null;
 }): Promise<WhatsAppLoginWaitResult> {
   const wait = params.waitForConnection ?? waitForWaConnection;
-  const createSocket = params.createSocket ?? createWaSocket;
   let currentSock = params.sock;
   const restartedStatuses = new Set<number>();
 
-  const replaceLoginSocket = async (
-    opts: { closeCurrent?: boolean } = {},
-  ): Promise<WhatsAppLoginWaitResult | null> => {
-    if (opts.closeCurrent ?? true) {
-      closeWaSocket(currentSock);
-    }
+  const replaceLoginSocket = async (): Promise<WhatsAppLoginWaitResult | null> => {
     try {
-      currentSock = await createSocket(false, params.verbose, {
+      currentSock = await createWaSocket(false, params.verbose, {
         authDir: params.authDir,
         ...params.socketTiming,
         onQr: params.onQr,
@@ -332,14 +325,8 @@ export async function waitForWhatsAppLoginResult(params: {
               : WHATSAPP_LOGIN_RESTART_MESSAGE,
           ),
         );
-        const replacementFailure = await replaceLoginSocket();
-        if (replacementFailure) {
-          return replacementFailure;
-        }
-        continue;
-      }
-
-      if (statusCode === LOGGED_OUT_STATUS) {
+        closeWaSocket(currentSock);
+      } else if (statusCode === LOGGED_OUT_STATUS) {
         if (restartedStatuses.has(LOGGED_OUT_STATUS)) {
           return {
             outcome: "logged-out",
@@ -373,19 +360,19 @@ export async function waitForWhatsAppLoginResult(params: {
           }
         }
         restartedStatuses.add(LOGGED_OUT_STATUS);
-        const replacementFailure = await replaceLoginSocket({ closeCurrent: false });
-        if (replacementFailure) {
-          return replacementFailure;
-        }
-        continue;
+      } else {
+        return {
+          outcome: "failed",
+          message: formatError(err),
+          statusCode,
+          error: err,
+        };
       }
 
-      return {
-        outcome: "failed",
-        message: formatError(err),
-        statusCode,
-        error: err,
-      };
+      const replacementFailure = await replaceLoginSocket();
+      if (replacementFailure) {
+        return replacementFailure;
+      }
     }
   }
 }
@@ -433,7 +420,6 @@ export class WhatsAppConnectionController {
       socketTiming?: WhatsAppSocketTimingOptions;
     },
   ) {
-    this.params = { ...params };
     this.accountId = params.accountId;
     this.authDir = params.authDir;
     this.appSilenceTimeoutMs = params.messageTimeoutMs * 4;
@@ -564,9 +550,7 @@ export class WhatsAppConnectionController {
     try {
       return await setupPromise;
     } finally {
-      if (this.connectionSetupPromise === setupPromise) {
-        this.connectionSetupPromise = null;
-      }
+      this.connectionSetupPromise = null;
     }
   }
 

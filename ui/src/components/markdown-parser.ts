@@ -5,6 +5,7 @@ import { fileKindForPath, shortestFileLabels } from "./file-kind.ts";
 import { isGitHubHost } from "./github-link-eligibility.ts";
 import {
   decodeGitHubPathSegment,
+  formatGitHubItemReference,
   parseGitHubItemPath,
   parseGitHubLinkTarget,
 } from "./github-link-target.ts";
@@ -18,12 +19,16 @@ import {
   splitMarkdownFileLineSuffix,
 } from "./markdown-file-links.ts";
 import { installMarkdownGitHubRefs } from "./markdown-github-refs.ts";
+import { installMarkdownHexColors } from "./markdown-hex-colors.ts";
 import { installMarkdownHumanMentions } from "./markdown-human-mentions.ts";
 import { hasMarkdownLinkBoundaries } from "./markdown-link-boundary.ts";
 import type { MarkdownRenderEnv } from "./markdown-render-options.ts";
 import { installMarkdownSessionLinks } from "./markdown-session-links.ts";
 import { installMarkdownTables } from "./markdown-tables.ts";
-import { replaceMarkdownTextMatches } from "./markdown-text-replacements.ts";
+import {
+  markdownInlineChildren,
+  replaceMarkdownTextMatches,
+} from "./markdown-text-replacements.ts";
 
 const DISALLOWED_LINK_SCHEME_RE = /^(?!(?:https?|mailto):)[a-z][a-z0-9+.-]*:/i;
 // Raw CJK suffixes delimit autolinks; percent-encoded URL content stays intact.
@@ -225,11 +230,7 @@ export function createMarkdownParser(): MarkdownItParser {
   markdownParser.validateLink = () => true;
 
   markdownParser.core.ruler.after("linkify", "disallowed-link-schemes", (state) => {
-    for (const blockToken of state.tokens) {
-      const children = blockToken.children;
-      if (blockToken.type !== "inline" || !children) {
-        continue;
-      }
+    for (const children of markdownInlineChildren(state.tokens)) {
       let hideClose = false;
       for (const token of children) {
         if (
@@ -248,11 +249,7 @@ export function createMarkdownParser(): MarkdownItParser {
 
   // Linkify can swallow adjacent CJK prose; return only its suffix to plain text.
   markdownParser.core.ruler.after("linkify", "linkify-cjk-trim", (state) => {
-    for (const blockToken of state.tokens) {
-      if (blockToken.type !== "inline" || !blockToken.children) {
-        continue;
-      }
-      const children = blockToken.children;
+    for (const children of markdownInlineChildren(state.tokens)) {
       for (let index = children.length - 1; index >= 0; index--) {
         const token = children[index];
         if (!token || token.type !== "link_open") {
@@ -325,11 +322,7 @@ export function createMarkdownParser(): MarkdownItParser {
       });
       return [open, label, close];
     };
-    for (const blockToken of state.tokens) {
-      if (blockToken.type !== "inline" || !blockToken.children) {
-        continue;
-      }
-      const children = blockToken.children;
+    for (const children of markdownInlineChildren(state.tokens)) {
       let linkDepth = 0;
       for (let index = 0; index < children.length; index++) {
         const token = children[index];
@@ -420,11 +413,7 @@ export function createMarkdownParser(): MarkdownItParser {
 
   // Give bare and code-span GitHub URLs the same label; image-only links get no mark.
   markdownParser.core.ruler.after("linkify", "web-link-classes", (state) => {
-    for (const blockToken of state.tokens) {
-      if (blockToken.type !== "inline" || !blockToken.children) {
-        continue;
-      }
-      const children = blockToken.children;
+    for (const children of markdownInlineChildren(state.tokens)) {
       let linkDepth = 0;
       for (let index = 0; index < children.length; index++) {
         let open = children[index];
@@ -497,9 +486,9 @@ export function createMarkdownParser(): MarkdownItParser {
           if (itemChip) {
             open.attrJoin("class", "markdown-github-item");
             open.attrSet("data-github-kind", item.kind);
-          }
-          if (generatedUrlLabel) {
-            labelToken.content = item ? `#${item.number}` : formatGitHubLinkLabel(url);
+            labelToken.content = formatGitHubItemReference(item);
+          } else if (generatedUrlLabel) {
+            labelToken.content = formatGitHubLinkLabel(url);
           }
           if (!githubPreview && (generatedUrlLabel || itemChip)) {
             open.attrSet("title", href);
@@ -599,5 +588,6 @@ export function createMarkdownParser(): MarkdownItParser {
       : code;
   };
   installMarkdownHumanMentions(markdownParser);
+  installMarkdownHexColors(markdownParser);
   return markdownParser;
 }

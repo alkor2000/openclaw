@@ -27,7 +27,7 @@ import {
   tryResolveSoleAgentId,
 } from "../agents/agent-scope.js";
 import {
-  resolveSharedAuthStoreOwnership,
+  prepareSharedAuthStoreOwnership,
   resolveSharedAuthStorePath,
 } from "../agents/auth-profiles/path-resolve.js";
 import { resolveAuthProfileDatabasePath } from "../agents/auth-profiles/sqlite.js";
@@ -48,7 +48,6 @@ import {
   purgeAgentSessionStoreEntries,
   resolveSessionTranscriptsDirForAgent,
 } from "../config/sessions.js";
-import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { withLocalAgentCronJobsRemoved } from "../cron/local-service.js";
 import { resolveGatewayMutationFallback } from "../gateway/call-mutation-fallback.js";
 import {
@@ -60,7 +59,7 @@ import { formatErrorMessage } from "../infra/errors.js";
 import { withAgentExecApprovalsRemoved } from "../infra/exec-approvals.js";
 import { isPathInside } from "../infra/path-guards.js";
 import { normalizeAgentIdStrict } from "../routing/session-key.js";
-import { defaultRuntime, type RuntimeEnv, writeRuntimeJson } from "../runtime.js";
+import { defaultRuntime as runtime, writeRuntimeJson } from "../runtime.js";
 import { readAgentDeletionJournalAsync } from "../state/agent-deletion-journal.js";
 import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../utils/message-channel.js";
 import { createClackPrompter } from "../wizard/clack-prompter.js";
@@ -76,63 +75,17 @@ type AgentsDeleteOptions = {
 
 type AgentDeleteRemovedPath = NonNullable<AgentsDeleteResult["removed"]>[number];
 type AgentDeleteFailedPath = NonNullable<AgentsDeleteResult["failed"]>[number];
-type AgentDeleteGatewayAttempt =
-  | { kind: "deleted"; result: AgentsDeleteResult }
-  | { kind: "fallback-unreachable" }
-  | { kind: "fallback-credentials-required" };
-
-function failAgentsDelete(opts: AgentsDeleteOptions, runtime: RuntimeEnv, message: string): void {
-  if (opts.json) {
-    writeRuntimeJson(runtime, formatCliJsonFailure(message));
-    runtime.exit(1, { resetStream: process.stderr });
-  } else {
-    runtime.error(message);
-    runtime.exit(1);
-  }
-}
-
-async function maybeDeleteAgentThroughGateway(params: {
-  config: OpenClawConfig;
-  agentId: string;
-}): Promise<AgentDeleteGatewayAttempt> {
-  const { url } = buildGatewayConnectionDetails({ config: params.config });
-  const localTarget = await isImplicitLocalGatewayTarget({ config: params.config });
-  try {
-    const result = await callGateway<AgentsDeleteResult>({
-      config: params.config,
-      expectUrl: url,
-      method: "agents.delete",
-      params: {
-        agentId: params.agentId,
-        deleteFiles: true,
-      },
-      mode: GATEWAY_CLIENT_MODES.CLI,
-      clientName: GATEWAY_CLIENT_NAMES.CLI,
-      requiredMethods: ["agents.delete"],
-    });
-    return { kind: "deleted", result };
-  } catch (error) {
-    const fallback = resolveGatewayMutationFallback({ error, localTarget });
-    if (fallback === "unreachable") {
-      return { kind: "fallback-unreachable" };
+export async function agentsDeleteCommand(opts: AgentsDeleteOptions) {
+  const failAgentsDelete = (message: string): void => {
+    if (opts.json) {
+      writeRuntimeJson(runtime, formatCliJsonFailure(message));
+      runtime.exit(1, { resetStream: process.stderr });
+    } else {
+      runtime.error(message);
+      runtime.exit(1);
     }
-    if (fallback === "credentials-required") {
-      return { kind: "fallback-credentials-required" };
-    }
-    if (fallback === "non-local") {
-      throw new Error(
-        `${formatErrorMessage(error)}\nLocal agent state was left unchanged. Restore the Gateway connection and credentials, or run this command on the Gateway host (the far end of any SSH tunnel).`,
-        { cause: error },
-      );
-    }
-    throw error;
-  }
-}
+  };
 
-export async function agentsDeleteCommand(
-  opts: AgentsDeleteOptions,
-  runtime: RuntimeEnv = defaultRuntime,
-) {
   const writeSnapshot = await requireValidConfigForWrite(runtime);
   if (!writeSnapshot) {
     return;
@@ -142,8 +95,6 @@ export async function agentsDeleteCommand(
   const input = opts.id?.trim();
   if (!input) {
     failAgentsDelete(
-      opts,
-      runtime,
       `Agent id is required. Run ${formatCliCommand("openclaw agents list")} to choose one.`,
     );
     return;
@@ -152,8 +103,6 @@ export async function agentsDeleteCommand(
   const normalized = normalizeAgentIdStrict(input);
   if (!normalized.ok) {
     failAgentsDelete(
-      opts,
-      runtime,
       `Agent "${input}" not found. Run ${formatCliCommand("openclaw agents list")} to see configured agents.`,
     );
     return;
@@ -166,8 +115,6 @@ export async function agentsDeleteCommand(
   let existingJournal = configured ? undefined : await readAgentDeletionJournalAsync(agentId);
   if (!configured && (!existingJournal || existingJournal.cleanupCompleted)) {
     failAgentsDelete(
-      opts,
-      runtime,
       `Agent "${agentId}" not found. Run ${formatCliCommand("openclaw agents list")} to see configured agents.`,
     );
     return;
@@ -183,10 +130,10 @@ export async function agentsDeleteCommand(
     if (!(error instanceof AgentSharedStoreOwnerError)) {
       throw error;
     }
-    failAgentsDelete(opts, runtime, error.message);
+    failAgentsDelete(error.message);
     return;
   }
-  const sharedAuthOwnership = resolveSharedAuthStoreOwnership();
+  const sharedAuthOwnership = await prepareSharedAuthStoreOwnership();
   if (
     isSharedAuthStoreOwner({
       ownership: sharedAuthOwnership,
@@ -194,22 +141,16 @@ export async function agentsDeleteCommand(
       sharedAuthDbPath: resolveSharedAuthStorePath(),
     })
   ) {
-    failAgentsDelete(opts, runtime, formatSharedAuthStoreOwnerDeleteError(agentId));
+    failAgentsDelete(formatSharedAuthStoreOwnerDeleteError(agentId));
     return;
   }
 
   if (configured && agentId === tryResolveSoleAgentId(cfg)) {
-    failAgentsDelete(
-      opts,
-      runtime,
-      `Agent "${agentId}" is the only configured agent and cannot be deleted.`,
-    );
+    failAgentsDelete(`Agent "${agentId}" is the only configured agent and cannot be deleted.`);
     return;
   }
   if (isInheritedAuthStoreOwner(cfg, agentId)) {
     failAgentsDelete(
-      opts,
-      runtime,
       `Agent "${agentId}" owns inherited credentials through agents.defaults.authInheritance.agentId and cannot be deleted. Relocate those credentials, then re-point or remove that binding before retrying.`,
     );
     return;
@@ -228,7 +169,7 @@ export async function agentsDeleteCommand(
 
   if (!opts.force) {
     if (!isTerminalInteractive()) {
-      failAgentsDelete(opts, runtime, "Non-interactive session. Re-run with --force.");
+      failAgentsDelete("Non-interactive session. Re-run with --force.");
       return;
     }
     const prompter = createClackPrompter();
@@ -288,15 +229,37 @@ export async function agentsDeleteCommand(
     }
   };
 
-  const gatewayAttempt = await maybeDeleteAgentThroughGateway({
-    config: cfg,
-    agentId,
-  });
-  if (gatewayAttempt.kind === "deleted") {
+  let gatewayAttempt: AgentsDeleteResult | "unreachable" | "credentials-required";
+  const { url } = buildGatewayConnectionDetails({ config: cfg });
+  const localTarget = await isImplicitLocalGatewayTarget({ config: cfg });
+  try {
+    gatewayAttempt = await callGateway<AgentsDeleteResult>({
+      config: cfg,
+      expectUrl: url,
+      method: "agents.delete",
+      params: { agentId, deleteFiles: true },
+      mode: GATEWAY_CLIENT_MODES.CLI,
+      clientName: GATEWAY_CLIENT_NAMES.CLI,
+      requiredMethods: ["agents.delete"],
+    });
+  } catch (error) {
+    const fallback = resolveGatewayMutationFallback({ error, localTarget });
+    if (fallback === "unreachable" || fallback === "credentials-required") {
+      gatewayAttempt = fallback;
+    } else if (fallback === "non-local") {
+      throw new Error(
+        `${formatErrorMessage(error)}\nLocal agent state was left unchanged. Restore the Gateway connection and credentials, or run this command on the Gateway host (the far end of any SSH tunnel).`,
+        { cause: error },
+      );
+    } else {
+      throw error;
+    }
+  }
+  if (typeof gatewayAttempt !== "string") {
     const workspaceSharedWith = opts.json
       ? findOverlappingWorkspaceAgentIds(cfg, agentId, workspaceDir)
       : [];
-    reportDeletion(gatewayAttempt.result, workspaceSharedWith.length > 0, workspaceSharedWith, {
+    reportDeletion(gatewayAttempt, workspaceSharedWith.length > 0, workspaceSharedWith, {
       transport: "gateway",
     });
     return;
@@ -322,6 +285,13 @@ export async function agentsDeleteCommand(
     );
     let rosterCommitted = !configured;
     try {
+      if (deletion.entry.phase === "draining") {
+        // Offline recovery cannot cancel a serving process; its leases must already be gone.
+        await deletion.runWithWorker((scope, guard) =>
+          scope.execute({ type: "agentDeletion.assertNoDatabaseLeases", input: { guard } }),
+        );
+        await deletion.retire();
+      }
       await prepareAgentDeleteDatabases(cfg, agentId, agentDir, {}, deletion);
       await deletion.assertCurrentAsync();
       const commitRoster = async () =>
@@ -355,7 +325,7 @@ export async function agentsDeleteCommand(
           },
           deletion,
         );
-      if (gatewayAttempt.kind === "fallback-unreachable") {
+      if (gatewayAttempt === "unreachable") {
         await withLocalAgentCronJobsRemoved(agentId, () => cfg, commitRoster);
       } else {
         // Credential resolution fails before transport, so a live scheduler may still own the store.
@@ -461,11 +431,9 @@ export async function agentsDeleteCommand(
       },
       workspaceRetained,
       workspaceSharedWith,
-      gatewayAttempt.kind === "fallback-credentials-required"
-        ? { cronCleanupSkipped: true }
-        : undefined,
+      gatewayAttempt === "credentials-required" ? { cronCleanupSkipped: true } : undefined,
     );
-    if (gatewayAttempt.kind === "fallback-credentials-required") {
+    if (gatewayAttempt === "credentials-required") {
       runtime.error(
         `Warning: cron cleanup was skipped for deleted agent "${agentId}" because the Gateway could not be authenticated; scheduled jobs may remain.`,
       );

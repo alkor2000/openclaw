@@ -187,6 +187,12 @@ export function createSlackStreamingDeliveryRuntime(setup: SlackDispatchSetup) {
       state.usedBlockReplyThreadTs = deliveredThreadTs;
     }
   };
+  const stopStream = (session: SlackStreamSession, chunks?: AnyChunk[]) =>
+    stopSlackStream({
+      session,
+      ...(chunks?.length ? { chunks } : {}),
+      ...(slackMessageMetadata ? { metadata: slackMessageMetadata } : {}),
+    });
   const deliverPendingStreamFallback = async (
     session: SlackStreamSession,
     err: SlackStreamNotDeliveredError,
@@ -197,10 +203,7 @@ export function createSlackStreamingDeliveryRuntime(setup: SlackDispatchSetup) {
     let fallbackError = err;
     if (!session.stopped) {
       try {
-        const stopResult = await stopSlackStream({
-          session,
-          ...(slackMessageMetadata ? { metadata: slackMessageMetadata } : {}),
-        });
+        const stopResult = await stopStream(session);
         if (session.stoppedBySlack) {
           return undefined;
         }
@@ -236,10 +239,7 @@ export function createSlackStreamingDeliveryRuntime(setup: SlackDispatchSetup) {
     markSlackStreamFallbackDelivered(session);
     if (!session.stopped) {
       try {
-        await stopSlackStream({
-          session,
-          ...(slackMessageMetadata ? { metadata: slackMessageMetadata } : {}),
-        });
+        await stopStream(session);
       } catch (finalizeErr) {
         runtime.error?.(
           danger(
@@ -268,11 +268,7 @@ export function createSlackStreamingDeliveryRuntime(setup: SlackDispatchSetup) {
     if (session && !session.stopped) {
       try {
         try {
-          await stopSlackStream({
-            session,
-            ...(chunks?.length ? { chunks } : {}),
-            ...(slackMessageMetadata ? { metadata: slackMessageMetadata } : {}),
-          });
+          await stopStream(session, chunks);
           state.observedReplyDelivery ||= session.delivered;
         } catch (error) {
           if (!(error instanceof SlackStreamNotDeliveredError)) {
@@ -347,7 +343,6 @@ export function createSlackStreamingDeliveryRuntime(setup: SlackDispatchSetup) {
       preparedReply,
     );
     if (deliveryKey && deliveredKeys.has(deliveryKey)) {
-      logVerbose("slack: suppressed duplicate normal delivery within the same turn");
       return { visibleReplySent: false };
     }
     const sent = await deliverPreparedReply(preparedReply, deliveryReplyThreadTs);
@@ -378,8 +373,19 @@ export function createSlackStreamingDeliveryRuntime(setup: SlackDispatchSetup) {
     const renderPlan = resolveSlackReplyRenderPlan(payload);
     const plannedBlocks =
       renderPlan.mode === "single" ? renderPlan.blocks : renderPlan.blockPart?.blocks;
+    const previewThreadTs =
+      state.streamSession?.threadTs ??
+      state.interruptedThreadTs ??
+      state.nativeProgressStreamThreadTs;
+    const finalThreadTs = resolveSlackReplyThreadTs({
+      replyToMode: replyDeliveryMode,
+      replyToId: payload.replyToId,
+      threadId: previewThreadTs,
+      replyToCurrent: payload.replyToCurrent,
+    });
     return (
       !state.streamFailed &&
+      (!previewThreadTs || finalThreadTs === previewThreadTs) &&
       !reply.hasMedia &&
       renderPlan.mode !== "split" &&
       !renderPlan.textIsSlackPlainText &&
@@ -415,7 +421,12 @@ export function createSlackStreamingDeliveryRuntime(setup: SlackDispatchSetup) {
       return { visibleReplySent: false };
     }
     let session = state.streamSession;
-    const threadTs = session?.threadTs ?? state.interruptedThreadTs ?? replyPlan.nextThreadTs();
+    const threadTs = resolveSlackReplyThreadTs({
+      replyToMode: replyDeliveryMode,
+      replyToId: params.payload.replyToId,
+      threadId: session?.threadTs ?? state.interruptedThreadTs ?? replyPlan.nextThreadTs(),
+      replyToCurrent: params.payload.replyToCurrent,
+    });
     if (state.streamFailed || !threadTs) {
       state.streamFailed = true;
       return await deliverNormally({
@@ -428,7 +439,6 @@ export function createSlackStreamingDeliveryRuntime(setup: SlackDispatchSetup) {
     const text = params.streamText ?? hookContent;
     const deliveryKey = buildSlackEventDeliveryKey({ ...params, threadTs, textOverride: text });
     if (deliveryKey && deliveredKeys.has(deliveryKey)) {
-      logVerbose("slack-stream: suppressed duplicate reply payload");
       return { visibleReplySent: false };
     }
     let messageId: string | undefined;

@@ -1,16 +1,17 @@
 import "./system-agent.mocks.test-support.js";
 import { expectDefined } from "@openclaw/normalization-core";
 import { expect, it, vi } from "vitest";
-import { runEmbeddedAttemptBeforeAgentRun } from "../../agents/embedded-agent-runner/run/attempt-before-agent-run.js";
 import { buildEmbeddedRunBlockedResult } from "../../agents/embedded-agent-runner/run/blocked-run-result.js";
-import type { AgentMessage } from "../../agents/runtime/index.js";
+import * as embeddedAgent from "../../agents/embedded-agent.js";
+import {
+  buildAgentRunBlockedUserMessage,
+  runBeforeAgentRunGate,
+} from "../../agents/harness/before-agent-run.js";
 import { guardSessionManager } from "../../agents/session-tool-result-guard-wrapper.js";
+import { withSessionManagerAppend } from "../../agents/sessions/session-manager-append-admission.js";
 import type { PluginHookBeforeAgentRunEvent } from "../../plugins/hook-types.js";
 import { createHookRunner } from "../../plugins/hooks.js";
-import {
-  runSystemAgentTurnWithDeps,
-  type SystemAgentTurnDeps,
-} from "../../system-agent/agent-turn.test-support.js";
+import { runSystemAgentTurn } from "../../system-agent/agent-turn.js";
 import { SystemAgentChatEngine } from "../../system-agent/chat-engine.js";
 import {
   createSystemAgentPluginMetadataTestSnapshot,
@@ -25,7 +26,12 @@ import {
   verifiedConfig,
 } from "./system-agent.test-support.js";
 
-const { requireVerifiedInferenceDeps, systemAgentTempDirs, seededSession } =
+vi.mock("../../agents/embedded-agent.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../agents/embedded-agent.js")>()),
+  runEmbeddedAgent: vi.fn(),
+}));
+
+const { installVerifiedConfigReader, systemAgentTempDirs, seededSession } =
   useSystemAgentGatewayTestFixture();
 
 it("retains a policy-blocked conversation and safely runs its next allowed turn", async () => {
@@ -38,7 +44,7 @@ it("retains a policy-blocked conversation and safely runs its next allowed turn"
   const privateInput = "synthetic private policy input";
   const internalReason = "synthetic internal policy reason";
   const safeReplacement = "Please send an allowed request.";
-  type EmbeddedParams = Parameters<NonNullable<SystemAgentTurnDeps["runEmbeddedAgent"]>>[0];
+  type EmbeddedParams = Parameters<typeof embeddedAgent.runEmbeddedAgent>[0];
   const admittedTurns: EmbeddedParams[] = [];
   const allowedModel = vi.fn(async () => ({
     meta: { durationMs: 0, finalAssistantVisibleText: "Allowed follow-up complete." },
@@ -58,43 +64,34 @@ it("retains a policy-blocked conversation and safely runs its next allowed turn"
       },
     ],
   });
-  const runEmbeddedAgent: NonNullable<SystemAgentTurnDeps["runEmbeddedAgent"]> = async (params) => {
+  vi.spyOn(embeddedAgent, "runEmbeddedAgent").mockImplementation(async (params) => {
     admittedTurns.push(params);
     await expectDefined(params.preparedRunAdmission, "prepared turn admission").admit("embedded");
     const runId = expectDefined(params.runId, "admitted turn run ID");
     const sessionManager = guardSessionManager(
       expectDefined(params.sessionManager, "turn manager"),
     );
-    const state: { messages: AgentMessage[] } = {
-      messages: sessionManager.buildSessionContext().messages,
-    };
-    const outcome = await runEmbeddedAttemptBeforeAgentRun({
-      attempt: { runId, agentAccountId: undefined, senderId: undefined, senderIsOwner: true },
-      activeSession: {
-        get messages() {
-          return state.messages;
-        },
-        agent: { state },
-      },
-      hookContext: {
-        runId: params.runId,
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-      },
-      hookMessages: state.messages,
+    const block = await runBeforeAgentRunGate(
       hookRunner,
-      modelPrompt: params.prompt,
-      sessionManager,
-      systemPrompt: params.extraSystemPrompt ?? "",
-      withOwnedTranscriptWrite: async (operation) => await operation(),
-    });
-    if (!outcome) {
+      {
+        prompt: params.prompt,
+        systemPrompt: params.extraSystemPrompt ?? "",
+        messages: sessionManager.buildSessionContext().messages,
+        senderIsOwner: true,
+      },
+      { runId: params.runId, sessionId: params.sessionId, sessionKey: params.sessionKey },
+    );
+    if (!block) {
       return allowedModel();
     }
+    await withSessionManagerAppend(sessionManager, async () => {
+      await sessionManager.appendMessageAsync(buildAgentRunBlockedUserMessage(runId, block));
+      sessionManager.flushPendingPersistence();
+    });
     return buildEmbeddedRunBlockedResult({
-      text: outcome.promptError.message,
+      text: block.message,
       errorKind: "hook_block",
-      errorMessage: outcome.promptError.message,
+      errorMessage: block.message,
       durationMs: 0,
       agentMeta: {
         sessionId: params.sessionId,
@@ -103,17 +100,12 @@ it("retains a policy-blocked conversation and safely runs its next allowed turn"
       },
       replayInvalid: false,
     });
-  };
-  const deps = {
-    ...proof.deps,
-    readConfigFileSnapshot: requireVerifiedInferenceDeps().readConfigFileSnapshot,
-  };
+  });
+  installVerifiedConfigReader();
   const engine = new SystemAgentChatEngine({
     verifiedInference: proof.binding,
     surface: "gateway",
-    deps,
-    runAgentTurn: (params) =>
-      metadata.run(() => runSystemAgentTurnWithDeps(params, { ...deps, runEmbeddedAgent })),
+    runAgentTurn: (params) => metadata.run(() => runSystemAgentTurn(params)),
   });
   const dispose = vi.spyOn(engine, "dispose");
   const sessions = new Map<string, SystemAgentChatSession>([

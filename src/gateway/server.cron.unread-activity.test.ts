@@ -145,7 +145,6 @@ beforeAll(async () => {
         skipBootstrap: true,
         model: { primary: "owned-fixture/fixture-model", fallbacks: [] },
         models: { "owned-fixture/fixture-model": { agentRuntime: { id: "openclaw" } } },
-        heartbeat: { every: "0m", target: "none" },
       },
     },
     models: {

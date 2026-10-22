@@ -197,7 +197,7 @@ it("keeps standalone Node lifecycle warnings out of post-install Doctor result I
     }
     vi.spyOn(runtimeGuard, "detectRuntime").mockResolvedValue({
       kind: "node",
-      version: "24.19.0",
+      version: "24.22.1",
       execPath: "/fixture/node",
       pathEnv: "/fixture",
       hasNodeSqlite: true,

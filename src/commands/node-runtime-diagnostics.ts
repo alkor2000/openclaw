@@ -1,5 +1,5 @@
 /** Read-only Node findings shared by Doctor and status commands. */
-import { nodeRuntimeFailure, nodeRuntimeNote } from "../../node-sqlite.mjs";
+import { nodeRuntimeFailure } from "../../node-sqlite.mjs";
 import {
   formatUnsupportedNodeVersionMessage,
   parseNodeReleaseVersion,
@@ -17,11 +17,10 @@ import { detectRuntime } from "../infra/runtime-guard.js";
 
 const CHECK_ID = "core/doctor/node-runtime";
 
-// Upstream lifecycle dates are advisory; SQLite capabilities own admission.
+// Upstream lifecycle dates are advisory; the runtime security and SQLite gates own admission.
 // Compare UTC instants so notes never start before the published effective date.
 const NODE_RELEASE_SCHEDULE = [
   { major: 24, maintenance: "2026-10-20", eol: "2028-04-30", lts: true },
-  { major: 25, maintenance: "2026-04-01", eol: "2026-06-01", lts: false },
   { major: 26, maintenance: "2027-10-20", eol: "2029-04-30", lts: true },
 ] as const;
 
@@ -34,7 +33,6 @@ export async function collectNodeRuntimeFindings(
   const cliRuntime = await detectRuntime();
   if (cliRuntime.kind === "node" && cliRuntime.sqliteProbe) {
     const failure = nodeRuntimeFailure(cliRuntime.version, cliRuntime.sqliteProbe);
-    const message = failure ?? nodeRuntimeNote(cliRuntime.version, cliRuntime.sqliteProbe);
     // Lifecycle advice belongs to standalone Doctor, never status or updater admission.
     const includeLifecycleAdvice =
       mode === "doctor" &&
@@ -55,21 +53,17 @@ export async function collectNodeRuntimeFindings(
             }),
           )
         : null;
-    if (message) {
+    if (failure) {
       findings.push({
         checkId: CHECK_ID,
-        severity: failure ? "error" : "info",
+        severity: "error",
         source: "cli",
-        message,
+        message: failure,
         requirement: SUPPORTED_NODE_VERSIONS,
         target: cliRuntime.execPath ?? undefined,
-        ...(failure
-          ? {
-              fixHint: installOwner
-                ? formatInstallOwnerMessage(installOwner)
-                : formatUnsupportedNodeVersionMessage(cliRuntime.version),
-            }
-          : {}),
+        fixHint: installOwner
+          ? formatInstallOwnerMessage(installOwner)
+          : formatUnsupportedNodeVersionMessage(cliRuntime.version),
       });
     }
     if (release) {
@@ -123,14 +117,6 @@ export async function collectNodeRuntimeFindings(
                 formatUnsupportedNodeVersionMessage(runtime.version),
                 "After switching Node, refresh a managed Gateway with `openclaw gateway install --force`; for an externally managed service, have its deployment owner update the launcher.",
               ].join("\n"),
-        });
-      } else if (runtime.note) {
-        findings.push({
-          checkId: CHECK_ID,
-          severity: "info",
-          source: "gateway-service",
-          message: runtime.note,
-          target: executable,
         });
       }
     }

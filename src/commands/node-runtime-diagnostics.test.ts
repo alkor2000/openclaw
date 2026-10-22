@@ -65,7 +65,7 @@ beforeEach(() => {
     status: "unsupported",
     version: "22.23.2",
   });
-  mockCliRuntime("26.8.1");
+  mockCliRuntime("26.12.1");
 });
 
 afterEach(() => {
@@ -137,9 +137,9 @@ it("registers CLI and service Node repair findings", async () => {
 
 it.each([
   [
-    { status: "supported", version: "24.15.0", note: "Node 24.15.0: unsupported, capability OK." },
-    "[info] Node 24.15.0:",
-    ["[warning]", "undefined"],
+    { status: "unsupported", version: "24.22.0" },
+    "Gateway service Node 24.22.0 is unsupported.",
+    ["[info]", "undefined"],
   ],
   [
     { status: "probe-failed", error: new Error("unavailable") },
@@ -159,14 +159,12 @@ it.each([
 );
 
 it.each([
-  ["24.19.0", "2026-10-19T23:59:59.999Z", null, null],
-  ["24.19.0", "2026-10-20T00:00:00.000Z", "info", "maintenance mode"],
-  ["25.9.0", "2026-03-31T23:59:59.999Z", null, null],
-  ["25.9.0", "2026-04-01T00:00:00.000Z", "info", "maintenance mode"],
-  ["25.9.0", "2026-05-31T23:59:59.999Z", "info", "maintenance mode"],
-  ["25.9.0", "2026-06-01T00:00:00.000Z", "warning", "end-of-life on 2026-06-01"],
-  ["26.8.1", "2027-10-19T23:59:59.999Z", null, null],
-  ["26.8.1", "2027-10-20T00:00:00.000Z", "info", "maintenance mode"],
+  ["24.22.1", "2026-10-19T23:59:59.999Z", null, null],
+  ["24.22.1", "2026-10-20T00:00:00.000Z", "info", "maintenance mode"],
+  ["24.22.1", "2028-04-29T23:59:59.999Z", "info", "maintenance mode"],
+  ["24.22.1", "2028-04-30T00:00:00.000Z", "warning", "end-of-life on 2028-04-30"],
+  ["26.12.1", "2027-10-19T23:59:59.999Z", null, null],
+  ["26.12.1", "2027-10-20T00:00:00.000Z", "info", "maintenance mode"],
 ] as const)("reports admitted Node %s lifecycle at %s", async (version, date, severity, text) => {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(new Date(date));
@@ -176,8 +174,7 @@ it.each([
     (candidate) => candidate.id === "core/doctor/node-runtime",
   );
   const findings = await check?.detect({ mode: "doctor", cfg: {}, runtime, env: {} });
-  const lifecycle = findings?.filter((finding) => finding.message.includes("upstream"));
-  expect(lifecycle).toEqual(
+  expect(findings).toEqual(
     text === null
       ? []
       : [expect.objectContaining({ severity, message: expect.stringContaining(text) })],
@@ -187,7 +184,7 @@ it.each([
 it("keeps lifecycle advice out of healthy upgrade lint checks", async () => {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(new Date("2026-10-20T00:00:00Z"));
-  mockCliRuntime("24.19.0");
+  mockCliRuntime("24.22.1");
   mocks.readCommand.mockResolvedValue(null);
   const check = (await resolveDoctorContributionHealthChecks()).find(
     (candidate) => candidate.id === "core/doctor/node-runtime",
@@ -210,7 +207,7 @@ it.each([
   }
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(new Date("2028-04-30T00:00:00Z"));
-  mockCliRuntime("24.19.0");
+  mockCliRuntime("24.22.1");
   mocks.readCommand.mockResolvedValue(null);
   const contribution = resolveDoctorHealthContributions().find(
     (entry) => entry.id === "doctor:node-runtime",
@@ -226,7 +223,7 @@ it.each([
 it("retains Gateway compatibility warnings during updater Doctor", async () => {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(new Date("2028-04-30T00:00:00Z"));
-  mockCliRuntime("24.19.0");
+  mockCliRuntime("24.22.1");
   const contribution = resolveDoctorHealthContributions().find(
     (entry) => entry.id === "doctor:node-runtime",
   );
@@ -243,7 +240,7 @@ it("retains Gateway compatibility warnings during updater Doctor", async () => {
 it("does not add lifecycle advice to healthy status JSON", async () => {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(new Date("2026-10-20T00:00:00Z"));
-  mockCliRuntime("24.19.0");
+  mockCliRuntime("24.22.1");
   mocks.readCommand.mockResolvedValue(null);
   await statusCommand({ json: true }, runtime);
   expect(runtime.log).not.toHaveBeenCalled();

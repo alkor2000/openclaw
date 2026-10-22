@@ -204,12 +204,12 @@ it("routes upstream EOL advice to the app that owns the runtime", async () => {
   mocks.root.mockResolvedValue(await hostRoot());
   mocks.detectRuntime.mockResolvedValue({
     kind: "node",
-    version: "25.9.0",
+    version: "24.22.1",
     execPath: "/fixture/node",
     sqliteProbe: { available: true, version: "3.53.4", text: true, blob: true, json: true },
   });
   vi.useFakeTimers({ toFake: ["Date"] });
-  vi.setSystemTime(new Date("2026-10-01T00:00:00Z"));
+  vi.setSystemTime(new Date("2028-04-30T00:00:00Z"));
   try {
     const findings = await collectNodeRuntimeFindings({}, "doctor");
     expect(findings.filter((finding) => finding.severity === "warning")).toEqual([

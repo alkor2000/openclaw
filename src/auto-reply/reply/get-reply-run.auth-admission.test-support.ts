@@ -13,12 +13,12 @@ export function registerReplyAuthAdmissionCases({
 }: {
   requireRunReplyAgentCall: () => Parameters<typeof runReplyAgent>[0];
 }): void {
-  it("validates the configured heartbeat profile before fast dispatch", async () => {
+  it("validates the configured profile before fast dispatch", async () => {
     const { resolveSessionAuthSelection } =
       await import("../../agents/auth-profiles/session-override.js");
     vi.mocked(shouldUseReplyFastTestRuntime).mockReturnValueOnce(true);
     const sessionEntry: SessionEntry = {
-      sessionId: "heartbeat-profile-session",
+      sessionId: "configured-profile-session",
       updatedAt: 1,
       authProfileOverride: "openai:subscription",
       authProfileOverrideSource: "auto",
@@ -38,7 +38,6 @@ export function registerReplyAuthAdmissionCases({
       ...baseParams({
         provider: "openai",
         model: "gpt-5.5",
-        opts: { isHeartbeat: true },
         sessionEntry,
         sessionStore: { "session-key": sessionEntry },
       }),
@@ -79,7 +78,7 @@ export function registerReplyAuthAdmissionCases({
   });
 
   it.each([false, true])(
-    "rejects invalid heartbeat profiles before dispatch or reply registration (fast: %s)",
+    "rejects invalid configured profiles before dispatch or reply registration (fast: %s)",
     async (fast) => {
       const { resolveSessionAuthSelection } =
         await import("../../agents/auth-profiles/session-override.js");
@@ -93,7 +92,7 @@ export function registerReplyAuthAdmissionCases({
       });
       const activeBefore = listActiveReplyRunSessionKeys().length;
       const params = {
-        ...baseParams({ provider: "openai", model: "gpt-5.5", opts: { isHeartbeat: true } }),
+        ...baseParams({ provider: "openai", model: "gpt-5.5" }),
         configuredProfileId: "anthropic:other",
       };
       const running = runPreparedReply(params);
@@ -116,4 +115,22 @@ export function registerReplyAuthAdmissionCases({
       expect(listActiveReplyRunSessionKeys().length).toBe(activeBefore);
     },
   );
+
+  it("does not leave an active reply operation after auth preparation fails", async () => {
+    const { resolveSessionAuthSelection } =
+      await import("../../agents/auth-profiles/session-override.js");
+    const sessionId = "reply-operation-auth-failure";
+    const activeBefore = listActiveReplyRunSessionKeys().length;
+    vi.mocked(resolveSessionAuthSelection).mockRejectedValueOnce(new Error("auth failed"));
+
+    await expect(
+      runPreparedReply(
+        baseParams({
+          sessionId,
+        }),
+      ),
+    ).rejects.toThrow("auth failed");
+
+    expect(listActiveReplyRunSessionKeys().length).toBe(activeBefore);
+  });
 }

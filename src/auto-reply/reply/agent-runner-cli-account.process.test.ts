@@ -434,7 +434,6 @@ it.each([
                 shouldEmitToolResult: () => false,
                 shouldEmitToolOutput: () => false,
                 pendingToolTasks: new Set(),
-                isHeartbeat: false,
                 sessionKey,
                 storePath: target.storePath,
                 activeSessionStore: { [sessionKey]: entry },

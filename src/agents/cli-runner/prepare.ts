@@ -66,7 +66,6 @@ import {
   makeBootstrapWarn as makeBootstrapWarnImpl,
   resolveBootstrapContextForRun as resolveBootstrapContextForRunImpl,
 } from "../bootstrap-files.js";
-import { isHeartbeatLifecycleRunKind } from "../bootstrap-mode.js";
 import { isPrimaryBootstrapRun, resolveWorkspaceBootstrapRouting } from "../bootstrap-routing.js";
 import {
   CLI_AUTH_EPOCH_VERSION,
@@ -1734,7 +1733,6 @@ async function prepareCliRunContextWithinReadFence(
         lease: params.contextEngineLogicalTurnLease,
         host: contextEngineHostSupport,
         recorder: params.userTurnTranscriptRecorder,
-        isHeartbeat: isHeartbeatLifecycleRunKind(params.bootstrapContextRunKind),
         sessionTarget: params.sessionTarget,
       });
       resolvedContextEngine = effective.engine;

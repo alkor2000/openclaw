@@ -1,4 +1,5 @@
 import { createEffect, createSignal, onCleanup, onSettled } from "solid-js";
+import type { PluginsUninstallResult } from "../../../../packages/gateway-protocol/src/schema/plugins.js";
 import {
   pathForRoute,
   pluginCatalogIdFromPath,
@@ -7,7 +8,7 @@ import {
 import type { ApplicationContext } from "../../app/context.ts";
 import { hasOperatorAdminAccess, hasOperatorReadAccess } from "../../app/operator-access.ts";
 import { showConfirmDialog } from "../../components/confirm-dialog.ts";
-import { registryFor } from "../../components/overlay-registry.ts";
+import { hasModalSurface, registryFor } from "../../components/overlay-registry.ts";
 import { formatUiError } from "../../lib/format-error.ts";
 import { canCallGatewayMethod } from "../../lib/gateway-methods.ts";
 import { GatewayPageBinding, type GatewayPageChange } from "../../lib/gateway-page-binding.ts";
@@ -15,30 +16,28 @@ import { isComposingKeyboardEvent } from "../../lib/ime.ts";
 import { createPageRequest } from "../../lib/page-request.ts";
 import {
   loadPluginDiscoveryDetail,
-  uninstallPlugin,
   type PluginListResult,
   type PluginMutationResult,
 } from "../../lib/plugins/index.ts";
 import { t } from "../../lib/reactive/i18n.ts";
 import { listen } from "../../lib/reactive/listener.ts";
 import type { PluginCredentialEditorProps } from "./credential-editor.tsx";
-import { installedPluginDetailTabFromHash, type InstalledPluginDetailTab } from "./detail-tabs.ts";
+import { installedPluginDetailTabFromHash } from "./detail-tabs.ts";
 import { createPluginDiscovery } from "./plugin-discovery.ts";
 import { createPluginHelp } from "./plugin-help.ts";
 import { createPluginMcpLogin } from "./plugin-mcp-login.ts";
-import { focusHeadingAfterRemoval } from "./plugin-removal-focus.ts";
+import { createPluginPageTargets } from "./plugin-removal-focus.ts";
 import { pluginRowKey, type PluginRowMessage } from "./plugin-row-message.tsx";
 import { pluginMutationWarnings, createPluginsConsent } from "./plugins-consent.ts";
 import { loadInstalledPluginDetail, loadPluginCatalogDetail } from "./plugins-detail-loader.ts";
 import type { PluginsHubTab } from "./plugins-hub.ts";
 import { createPluginsPageIcons } from "./plugins-page-icons.ts";
 import {
+  createPluginsPageState,
   installRequestForDiscoveryDetail,
   mergePluginCatalogItem,
   pluginMutationBlockedReason,
   type PluginMutationAction,
-  type PluginsPageCatalogDetail,
-  type PluginsPageDetail,
 } from "./plugins-page-model.ts";
 import type { PluginsRouteData } from "./route-data.ts";
 import type { PluginSettingsField } from "./settings-editor.tsx";
@@ -52,35 +51,15 @@ export function createPluginsPage(options: {
   surface: () => "discovery" | "settings";
 }) {
   const context = options.context;
+  const runtime = context.runtimeConfig;
   let active = true;
+  const targets = createPluginPageTargets();
   let routeData: PluginsRouteData | undefined;
   let surface: "discovery" | "settings" = "settings";
   const [revision, setRevision] = createSignal(0, { ownedWrite: true });
   const [settingsTab, setSettingsTab] = createSignal<PluginSettingsTab>("installed");
 
-  const state: {
-    result: PluginListResult | null;
-    error: string | null;
-    busy: Record<string, PluginMutationAction>;
-    messages: Record<string, PluginRowMessage>;
-    detail: PluginsPageDetail | null;
-    iconUrls: Record<string, string>;
-    catalogIconUrls: Record<string, string>;
-    pageNotice: PluginRowMessage | null;
-    catalogDetail: PluginsPageCatalogDetail | null;
-    installedDetailTab: InstalledPluginDetailTab;
-  } = {
-    result: null,
-    error: null,
-    busy: {},
-    messages: {},
-    detail: null,
-    iconUrls: {},
-    catalogIconUrls: {},
-    pageNotice: null,
-    catalogDetail: null,
-    installedDetailTab: "readme",
-  };
+  const state = createPluginsPageState();
 
   function read() {
     revision();
@@ -105,6 +84,7 @@ export function createPluginsPage(options: {
   const help = createPluginHelp(context);
   let pluginConfigEditPending = false;
   let routeDataConsumed = false;
+  const [catalog, setCatalog] = createSignal<Promise<void> | null>(null, { ownedWrite: true });
   let pluginGeneration: number | undefined;
   let adminAccess: boolean | undefined;
   let readAccess: boolean | undefined;
@@ -150,7 +130,6 @@ export function createPluginsPage(options: {
       return false;
     }
     pluginConfigEditPending = true;
-    const runtime = context.runtimeConfig;
     if (value === undefined) {
       runtime.removeFormValue(path);
     } else {
@@ -174,7 +153,6 @@ export function createPluginsPage(options: {
     if (!detail || !descriptor) {
       return undefined;
     }
-    const runtime = context.runtimeConfig;
     return {
       field,
       descriptor,
@@ -183,7 +161,10 @@ export function createPluginsPage(options: {
         baseHash: runtime.state.configSnapshot?.hash ?? null,
         gateway,
         canInspect: hasOperatorAdminAccess(context.gateway.snapshot.hello?.auth ?? null),
-        saveError: runtime.state.lastError,
+        // Awaited writes and discards can settle before the presentation catches up.
+        get saveError() {
+          return runtime.state.lastError;
+        },
         onDiscard: () => runtime.discardFormValue(field.path),
         onCommit: async (path, value) => {
           const previous = write;
@@ -195,7 +176,6 @@ export function createPluginsPage(options: {
       },
     };
   };
-  const settings = { patch, resolveCredential };
 
   const consent = createPluginsConsent({
     gateway,
@@ -206,9 +186,7 @@ export function createPluginsPage(options: {
     setBusy,
     setMessage,
     getMessages: () => state.messages,
-    clearPageNotice: () => {
-      setState({ pageNotice: null });
-    },
+    clearPageNotice: () => setState({ pageNotice: null }),
     closeDetails: skillPreview.close,
     applyMutationResult,
     refreshCatalogAfterMutation: refreshCatalog,
@@ -228,11 +206,10 @@ export function createPluginsPage(options: {
   onCleanup(catalogTask.cancel);
 
   onSettled(() => {
-    const runtimeConfig = context.runtimeConfig;
-    let configAutoSaveStatus = runtimeConfig.state.configAutoSaveStatus;
+    let configAutoSaveStatus = runtime.state.configAutoSaveStatus;
     // Preserve saving-to-saved receipts so plugin edits refresh the catalog even within one render turn.
-    return runtimeConfig.subscribe(() => {
-      const nextStatus = runtimeConfig.state.configAutoSaveStatus;
+    return runtime.subscribe(() => {
+      const nextStatus = runtime.state.configAutoSaveStatus;
       const completedSave = configAutoSaveStatus === "saving" && nextStatus === "saved";
       configAutoSaveStatus = nextStatus;
       publish();
@@ -293,7 +270,7 @@ export function createPluginsPage(options: {
       !(event instanceof KeyboardEvent) ||
       event.key !== "Escape" ||
       isComposingKeyboardEvent(event) ||
-      document.querySelector(".shell-nav[aria-modal='true']") ||
+      hasModalSurface(document) ||
       registryFor(document).stack.at(-1)?.open
     ) {
       return;
@@ -306,11 +283,7 @@ export function createPluginsPage(options: {
     ) {
       return;
     }
-    const progress = options
-      .element()
-      .querySelector<HTMLElementTagNameMap["openclaw-plugin-install-action"]>(
-        "openclaw-plugin-install-action[open]",
-      );
+    const progress = targets.openInstallAction();
     if (progress) {
       progress.dismiss();
       event.stopPropagation();
@@ -322,11 +295,14 @@ export function createPluginsPage(options: {
       return;
     }
     // The file viewer owns Escape inside its shadow-root modal.
-    if (skillPreview.state || document.querySelector("openclaw-modal-dialog")) {
+    if (skillPreview.state) {
       return;
     }
     // Firefox does not emit blur when a focused input is removed from the document.
-    options.element().querySelector<HTMLElement>(":focus")?.blur();
+    const focused = document.activeElement;
+    if (focused instanceof HTMLElement && options.element().contains(focused)) {
+      focused.blur();
+    }
     if (state.catalogDetail) {
       closeCatalogDetail();
       event.stopPropagation();
@@ -445,6 +421,7 @@ export function createPluginsPage(options: {
   function invalidateRequests(invalidateCatalog: boolean, retirePresentation = true) {
     mcpLogin.reset();
     if (invalidateCatalog) {
+      void setCatalog(null);
       catalogTask.reset();
       discovery.invalidate();
     }
@@ -540,7 +517,9 @@ export function createPluginsPage(options: {
       return;
     }
     setState({ error: null });
-    await catalogTask.run([client]);
+    const promise = catalogTask.run([client]);
+    void setCatalog(promise);
+    await promise;
   }
 
   async function refreshDiscovery(): Promise<void> {
@@ -573,8 +552,7 @@ export function createPluginsPage(options: {
   }
 
   function canEditConfig(): boolean {
-    const runtimeConfig = context.runtimeConfig;
-    return accessBlockedReason(runtimeConfig.canSet, runtimeConfig.state.connected) === null;
+    return accessBlockedReason(runtime.canSet, runtime.state.connected) === null;
   }
 
   function setBusy(key: string, value: PluginMutationAction | null) {
@@ -697,7 +675,7 @@ export function createPluginsPage(options: {
       : null;
     await consent.runMutation(
       rowKey,
-      (client) => uninstallPlugin(client, pluginId),
+      (client) => client.request<PluginsUninstallResult>("plugins.uninstall", { pluginId }),
       async (result, refreshError, client, isLatest) => {
         if (state.detail?.pluginId === pluginId) {
           setState({ detail: null });
@@ -714,7 +692,7 @@ export function createPluginsPage(options: {
         }
         await refreshCatalog(client);
         if (isLatest()) {
-          onSettled(() => focusHeadingAfterRemoval(options.element(), trigger));
+          onSettled(() => targets.focusAfterRemoval(trigger));
         }
       },
       {
@@ -741,8 +719,9 @@ export function createPluginsPage(options: {
     skillPreview,
     mcpLogin,
     discovery,
-    settings,
+    settings: { patch, resolveCredential },
     consent,
+    ...targets,
     settingsTab,
     setSettingsTab,
     get routeData() {
@@ -757,6 +736,8 @@ export function createPluginsPage(options: {
       revision();
       return loading();
     },
+    routeLoading: () => gateway.connected && !routeDataConsumed,
+    catalogRead: catalog,
     setState,
     refreshCatalog,
     selectHubTab,

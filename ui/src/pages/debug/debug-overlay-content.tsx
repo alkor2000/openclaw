@@ -1,21 +1,12 @@
-import {
-  createComponent,
-  createEffect,
-  createSignal,
-  createStore,
-  For,
-  onSettled,
-  Show,
-  untrack,
-} from "solid-js";
+import { createSignal, createStore, For, onSettled, Show } from "solid-js";
 import type { ApplicationContext } from "../../app/context.ts";
 import type { ApplicationGateway } from "../../app/gateway.ts";
 import { createGatewayConnectionLifecycle } from "../../lib/gateway-connection-lifecycle.ts";
 import { projectGatewayEventLog } from "../../lib/reactive/application.ts";
-import { useApplication } from "../../lib/reactive/context.ts";
+import { useOptionalApplication } from "../../lib/reactive/context.ts";
 import { t } from "../../lib/reactive/i18n.ts";
 import { listen } from "../../lib/reactive/listener.ts";
-import { defineSolidBridge } from "../../lib/solid-bridge.ts";
+import { defineSolidBridge, type SolidBridgeElement } from "../../lib/solid-bridge.ts";
 import { canReadSystemInfo, SYSTEM_INFO_POLL_INTERVAL_MS } from "../../lib/system-info.ts";
 import "../../styles/debug-data.css";
 import { DebugOverlaySectionLoading } from "./debug-overlay-loading-view.tsx";
@@ -28,13 +19,17 @@ import {
 
 type SectionState = { status: "loading" | "unavailable" } | { status: "ready"; value: unknown };
 
-function Content(props: { gateway: ApplicationGateway; minimized: boolean }) {
-  // The keyed parent gives each Gateway source its own request lifetime.
-  const source = untrack(() => props.gateway);
+const pollingSynchronizers = new WeakMap<HTMLElement, () => void>();
+
+function Content(
+  source: ApplicationGateway,
+  props: { minimized: boolean },
+  host: SolidBridgeElement<Props>,
+) {
   const lifecycle = createGatewayConnectionLifecycle(source.snapshot);
   const [visible, setVisible] = createSignal(document.visibilityState !== "hidden");
   const [sections, setSections] = createStore<Record<string, SectionState>>({});
-  const [history, setHistory] = createSignal<readonly DebugOverlayStatusSample[]>([]);
+  const [history, setHistory] = createStore<DebugOverlayStatusSample[]>([]);
   const requests = new Map<string, AbortController>();
   let timer: ReturnType<typeof setInterval> | undefined;
 
@@ -60,7 +55,9 @@ function Content(props: { gateway: ApplicationGateway; minimized: boolean }) {
   };
   const reset = () => {
     abortRequests();
-    setHistory([]);
+    setHistory((draft) => {
+      draft.length = 0;
+    });
     setSections((draft) => {
       for (const section of DEBUG_OVERLAY_SECTIONS) {
         draft[section.id] = { status: lifecycle.capture() ? "loading" : "unavailable" };
@@ -68,7 +65,7 @@ function Content(props: { gateway: ApplicationGateway; minimized: boolean }) {
     });
   };
 
-  function refresh(minimized = props.minimized) {
+  function refresh(minimized = host.minimized) {
     const scope = lifecycle.capture();
     if (!scope || document.visibilityState === "hidden") {
       return;
@@ -93,11 +90,12 @@ function Content(props: { gateway: ApplicationGateway; minimized: boolean }) {
             if (section.id === "status") {
               // SAFETY: The status descriptor is the only producer of this snapshot.
               const sample = value as DebugOverlayStatusSnapshot;
-              setHistory((previous) =>
-                previous.at(-1)?.at === sample.sampledAt
-                  ? previous
-                  : [...previous.slice(-89), { at: sample.sampledAt, status: sample }],
-              );
+              setHistory((draft) => {
+                if (draft.at(-1)?.at !== sample.sampledAt) {
+                  draft.splice(0, Math.max(0, draft.length - 89));
+                  draft.push({ at: sample.sampledAt, status: sample });
+                }
+              });
               // Measure the next status interval from the completed sample.
               stopPolling();
               if (document.visibilityState !== "hidden") {
@@ -119,7 +117,10 @@ function Content(props: { gateway: ApplicationGateway; minimized: boolean }) {
         });
     }
   }
-  const visibilityChanged = () => setVisible(document.visibilityState !== "hidden");
+  const visibilityChanged = () => {
+    setVisible(document.visibilityState !== "hidden");
+    syncPolling(host.minimized);
+  };
   function syncPolling(minimized: boolean, initial = false) {
     const snapshot = source.snapshot;
     const changed = lifecycle.transition(snapshot);
@@ -130,7 +131,9 @@ function Content(props: { gateway: ApplicationGateway; minimized: boolean }) {
     if (!statusAllowed) {
       requests.get("status")?.abort();
       requests.delete("status");
-      setHistory([]);
+      setHistory((draft) => {
+        draft.length = 0;
+      });
       updateSection("status", { status: "unavailable" });
     }
     if (
@@ -147,20 +150,19 @@ function Content(props: { gateway: ApplicationGateway; minimized: boolean }) {
       }
     }
   }
-  // Synchronize the Gateway diagnostics polling timer with panel/document visibility.
-  createEffect(
-    () => ({ minimized: props.minimized, visible: visible() }),
-    // Start after the previous keyed content has released shared requests.
-    (current, previous) => syncPolling(current.minimized, previous === undefined),
-  );
   const eventLog = projectGatewayEventLog(source);
   const eventRevision = () =>
     !props.minimized && visible() ? eventLog.read().revision : undefined;
   onSettled(() => {
     // Gateway receipts abort retired diagnostics and synchronously revoke unauthorized status polling.
-    const stopGateway = source.subscribe(() => syncPolling(props.minimized));
+    const synchronize = () => syncPolling(host.minimized);
+    const stopGateway = source.subscribe(synchronize);
     const stopVisibility = listen(document, "visibilitychange", visibilityChanged);
+    pollingSynchronizers.set(host, synchronize);
+    // The previous gateway's keyed content has released its shared diagnostics first.
+    syncPolling(host.minimized, true);
     return () => {
+      pollingSynchronizers.delete(host);
       stopPolling();
       abortRequests();
       stopGateway();
@@ -170,6 +172,9 @@ function Content(props: { gateway: ApplicationGateway; minimized: boolean }) {
   });
   const state = (id: string) => sections[id] ?? { status: "loading" as const };
   const value = (id: string) => {
+    if (id === "events") {
+      eventRevision();
+    }
     const current = state(id);
     return current.status === "ready" ? current.value : undefined;
   };
@@ -194,7 +199,7 @@ function Content(props: { gateway: ApplicationGateway; minimized: boolean }) {
               // SAFETY: A ready status entry contains the status descriptor's snapshot.
               value("status") as DebugOverlayStatusSnapshot
             }
-            history={history()}
+            history={history}
           />
         </Show>
       }
@@ -214,17 +219,7 @@ function Content(props: { gateway: ApplicationGateway; minimized: boolean }) {
                 when={state(entry.id).status === "ready"}
                 fallback={<div class="debug-overlay__empty">{t("debug.overlay.unavailable")}</div>}
               >
-                {createComponent(entry.render, {
-                  get value() {
-                    if (entry.id === "events") {
-                      eventRevision();
-                    }
-                    return value(entry.id);
-                  },
-                  get history() {
-                    return history();
-                  },
-                })}
+                <entry.render value={value(entry.id)} history={history} />
               </Show>
             </Show>
           </section>
@@ -238,16 +233,22 @@ type Props = { context: ApplicationContext | undefined; minimized: boolean };
 
 export const DebugOverlayContent = defineSolidBridge<Props>(
   "openclaw-debug-overlay-content",
-  (props) => {
+  (props, host) => {
     // A bridge's provider ancestry is fixed for this renderer lifetime.
-    const inherited = untrack(() => props.context) ? undefined : useApplication();
+    const inherited = useOptionalApplication();
     return (
       <Show when={(props.context ?? inherited)?.gateway} keyed>
-        {(gateway) => <Content gateway={gateway} minimized={props.minimized} />}
+        {(gateway) => Content(gateway, props, host)}
       </Show>
     );
   },
   {
+    propertyChanged: (host, key) => {
+      if (key === "minimized") {
+        // A batched context replacement must retire the previous diagnostics before polling.
+        onSettled(() => pollingSynchronizers.get(host)?.());
+      }
+    },
     properties: {
       context: { default: undefined, attribute: false },
       minimized: { default: false, type: Boolean },

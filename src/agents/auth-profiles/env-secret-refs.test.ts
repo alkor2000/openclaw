@@ -10,12 +10,20 @@ import * as snapshotSource from "../../infra/sqlite-snapshot-source.js";
 import { withArtifactPreservingStateReads } from "../../state/artifact-preserving-state-reads.js";
 import { writeConfigMachineState } from "../../state/config-machine-state-write.js";
 import { openOpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
+import * as stateReadOnly from "../../state/openclaw-state-db-readonly.js";
+import { resolveOpenClawStateSqlitePath } from "../../state/openclaw-state-db.paths.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { cleanupSessionStateForTest } from "../../test-utils/session-state-cleanup.js";
 import { collectAuthProfileEnvSecretRefIds } from "./env-secret-refs.js";
 import { prepareSharedAuthStoreOwnership } from "./path-resolve.js";
+import * as authJson from "./sqlite-json.js";
 import { closeAuthProfileReadPool } from "./sqlite-read-pool.js";
-import { resolveAuthProfileDatabasePath, writePersistedAuthProfileStoreRaw } from "./sqlite.js";
+import {
+  inspectAuthProfileJsonCellReadOnly,
+  readPersistedAuthProfileRows,
+  resolveAuthProfileDatabasePath,
+  writePersistedAuthProfileStoreRaw,
+} from "./sqlite.js";
 import { AuthProfileStoreUnreadableError } from "./store-unreadable-error.js";
 
 function artifactHashes(root: string): Record<string, string> {
@@ -210,6 +218,68 @@ describe("auth-profile references before managed service environment cleanup", (
           for (const prepared of snapshots) {
             prepared.cleanup();
           }
+        }
+      });
+    },
+  );
+
+  it.each([
+    { consumer: "cell", stage: "row" },
+    { consumer: "rows", stage: "row" },
+    { consumer: "cell", stage: "cleanup" },
+    { consumer: "rows", stage: "cleanup" },
+  ] as const)(
+    "classifies shared auth $stage failure for $consumer",
+    async ({ consumer, stage }) => {
+      await withOpenClawTestState({ prefix: "auth-shared-reader-error-" }, async (state) => {
+        writeConfigMachineState("auth.sharedStore", { location: "state-db" }, { env: state.env });
+        await prepareSharedAuthStoreOwnership(state.env);
+        writePersistedAuthProfileStoreRaw({ version: 1, profiles: {} });
+        const failure = new Error(`synthetic shared auth ${stage} failure`);
+        const read = () =>
+          consumer === "cell"
+            ? inspectAuthProfileJsonCellReadOnly(
+                {
+                  kind: "shared-state",
+                  path: resolveOpenClawStateSqlitePath(state.env),
+                  env: state.env,
+                },
+                "store",
+              )
+            : readPersistedAuthProfileRows(undefined, state.env);
+        const original = stateReadOnly.withExistingOpenClawStateDatabaseReadOnly;
+        const fault =
+          stage === "row"
+            ? vi
+                .spyOn(
+                  authJson,
+                  consumer === "cell" ? "inspectAuthProfileJsonCell" : "readAuthProfileRows",
+                )
+                .mockImplementation(() => {
+                  throw failure;
+                })
+            : vi
+                .spyOn(stateReadOnly, "withExistingOpenClawStateDatabaseReadOnly")
+                .mockImplementation((...args) => {
+                  original(...args);
+                  throw failure;
+                });
+        try {
+          if (stage === "cleanup") {
+            expect(read).toThrow(failure);
+          } else {
+            expect(read()).toEqual(
+              consumer === "cell"
+                ? { status: "unreadable" }
+                : {
+                    store: { status: "unreadable" },
+                    state: { status: "unreadable" },
+                    cacheable: false,
+                  },
+            );
+          }
+        } finally {
+          fault.mockRestore();
         }
       });
     },

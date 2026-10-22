@@ -10,7 +10,10 @@ import {
   resolveAuthProfileDatabaseOwnerId,
   inspectPersistedAuthProfileStoreRaw,
 } from "../../agents/auth-profiles/sqlite.js";
-import { updateAuthProfileStoreWithLock } from "../../agents/auth-profiles/store-runtime.js";
+import {
+  updateAuthProfileStoreWithLock,
+  withAuthProfileStoreAtEffect,
+} from "../../agents/auth-profiles/store-runtime.js";
 import type { AuthProfileStore } from "../../agents/auth-profiles/types.js";
 import {
   clearGatewayRunConfigEnvironment,
@@ -83,6 +86,7 @@ describe.skipIf(!mixedAgentConnection).each(mixedAgentPairs)(
     });
 
     it("reads explicit and shared-main auth with warm readers and cold schema inspection", async () => {
+      withEngineStoreAdmission(() => openOpenClawStateDatabase());
       const store: AuthProfileStore = {
         version: 1,
         profiles: {
@@ -121,6 +125,14 @@ describe.skipIf(!mixedAgentConnection).each(mixedAgentPairs)(
             },
           });
           expect((await reader.read()).store).toEqual({ status: "readable", raw: store });
+          await withAuthProfileStoreAtEffect(
+            path.dirname(database.path),
+            { inheritedAuthDir: path.dirname(database.path), externalCli: { mode: "none" } },
+            async (effect) => {
+              expect((await effect.read()).profiles).toEqual(store.profiles);
+              effect.assertCurrent();
+            },
+          );
           expect(
             withEngineStoreAdmission(() =>
               inspectPersistedAuthProfileStoreRaw(path.dirname(database.path)),

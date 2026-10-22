@@ -9,13 +9,7 @@ import { resolvePromptHistoryLimit } from "openclaw/plugin-sdk/number-runtime";
 import { resolveTextChunkLimit } from "openclaw/plugin-sdk/reply-chunking";
 import type { GetReplyOptions } from "openclaw/plugin-sdk/reply-runtime";
 import { resolveInboundLastRouteSessionKey } from "openclaw/plugin-sdk/routing";
-import {
-  createSubsystemLogger,
-  danger,
-  logVerbose,
-  shouldLogVerbose,
-  sleepWithAbort,
-} from "openclaw/plugin-sdk/runtime-env";
+import { danger, sleepWithAbort } from "openclaw/plugin-sdk/runtime-env";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
 import { resolvePinnedMainDmOwnerFromAllowlist } from "openclaw/plugin-sdk/security-runtime";
 import {
@@ -24,6 +18,7 @@ import {
   resolveAmbientTranscriptWatermarkKey,
   resolveStorePath,
 } from "openclaw/plugin-sdk/session-store-runtime";
+import { runDetachedWebhookWork } from "openclaw/plugin-sdk/webhook-request-guards";
 import type { RegisterTelegramHandlerParams } from "./bot-handlers.types.js";
 import { createTelegramDirectAvatarResolver } from "./bot-message-avatar.js";
 import {
@@ -47,8 +42,6 @@ import { TELEGRAM_TEXT_CHUNK_LIMIT } from "./outbound-adapter.js";
 import { TELEGRAM_RICH_TEXT_LIMIT } from "./rich-message.js";
 import { resolveTelegramRichMessages } from "./rich-messages-config.js";
 import { resolveSpooledUpdatePersistenceRetryDelayMs } from "./telegram-ingress-spool.js";
-
-const telegramInboundLog = createSubsystemLogger("gateway/channels/telegram").child("inbound");
 
 function abortedProcessingResult(
   signal: AbortSignal,
@@ -173,12 +166,6 @@ export const createTelegramMessageProcessor = (
       telegramCfg: turnTelegramCfg,
       opts,
     });
-    const ingressReceivedAtMs =
-      typeof options?.receivedAtMs === "number" && Number.isFinite(options.receivedAtMs)
-        ? options.receivedAtMs
-        : undefined;
-    const ingressDebugEnabled = shouldLogVerbose();
-    const ingressContextStartMs = ingressReceivedAtMs ? Date.now() : undefined;
     const context = await buildTelegramMessageContext({
       ...contextOptions,
       resolveDirectAvatar,
@@ -198,37 +185,8 @@ export const createTelegramMessageProcessor = (
       upsertPairingRequest: upsertChannelPairingRequest,
     });
     if (!context) {
-      if (ingressDebugEnabled && ingressReceivedAtMs && ingressContextStartMs) {
-        logVerbose(
-          `telegram ingress: chatId=${primaryCtx.message.chat.id} dropped after ${Date.now() - ingressReceivedAtMs}ms` +
-            (options?.ingressBuffer ? ` buffer=${options.ingressBuffer}` : ""),
-        );
-      }
       return { kind: "skipped" };
     }
-    if (ingressDebugEnabled && ingressReceivedAtMs && ingressContextStartMs) {
-      logVerbose(
-        `telegram ingress: chatId=${context.chatId} contextReadyMs=${Date.now() - ingressReceivedAtMs}` +
-          ` preDispatchMs=${Date.now() - ingressContextStartMs}` +
-          (options?.ingressBuffer ? ` buffer=${options.ingressBuffer}` : ""),
-      );
-    }
-    if (
-      context.ctxPayload.InboundEventKind !== "room_event" &&
-      context.initialTypingCueSent !== true
-    ) {
-      void context.sendTyping().catch((err: unknown) => {
-        logVerbose(`telegram early typing cue failed for chat ${context.chatId}: ${String(err)}`);
-      });
-    }
-    const logTo = context.primaryCtx.me?.username
-      ? `@${context.primaryCtx.me.username}`
-      : context.ctxPayload.To;
-    const mediaType = allMedia[0]?.contentType ?? allMedia[0]?.kind;
-    const kindLabel = mediaType ? `, ${mediaType}` : "";
-    telegramInboundLog.info(
-      `Inbound message ${context.ctxPayload.From} -> ${logTo} (${context.ctxPayload.ChatType}${kindLabel}, ${context.ctxPayload.RawBody.length} chars)`,
-    );
     const spooledReplay =
       options?.spooledReplay === true || isTelegramSpooledReplayUpdate(primaryCtx.update);
     if (!spooledReplay) {
@@ -257,12 +215,6 @@ export const createTelegramMessageProcessor = (
             kind: "failed-retryable",
             error: dispatchResult.error,
           };
-        }
-        if (ingressDebugEnabled && ingressReceivedAtMs) {
-          logVerbose(
-            `telegram ingress: chatId=${context.chatId} dispatchCompleteMs=${Date.now() - ingressReceivedAtMs}` +
-              (options?.ingressBuffer ? ` buffer=${options.ingressBuffer}` : ""),
-          );
         }
         return { kind: "completed" };
       } catch (err) {
@@ -463,9 +415,10 @@ export const createTelegramMessageProcessor = (
         }
         return await settle(result, "terminal");
       };
-      // The participant is the ingress ownership boundary. Direct and buffered
-      // callers both return when it is durably adopted or terminally rejected.
-      void run();
+      // Ingress returns at adoption; dispatch still owns draft cleanup and fallback delivery.
+      void runDetachedWebhookWork(run).catch((error: unknown) =>
+        settle({ kind: "failed-retryable", error }, "terminal"),
+      );
       return await participant.task;
     }
 

@@ -6,7 +6,6 @@ import { createApplicationContextProvider } from "../../../test-helpers/applicat
 import { mountSolid } from "../../../test-helpers/mount-solid.ts";
 import { createSolidApplicationContextProvider } from "../../../test-helpers/solid-application-context.tsx";
 import { waitForSolid } from "../../../test-helpers/solid-settle.ts";
-import "./chat-html-preview-element.tsx";
 import { HtmlPreview } from "./chat-html-preview-view.tsx";
 import { ChatSvgAttachment } from "./chat-svg-attachment.tsx";
 
@@ -34,8 +33,6 @@ describe("Solid preview consumers", () => {
     const view = mountSolid(
       () => (
         <HtmlPreview
-          state={undefined}
-          onRetry={() => {}}
           content="<h1>Preview</h1>"
           sourceIdentity="preview.html"
           title="Preview"
@@ -58,7 +55,6 @@ describe("Solid preview consumers", () => {
   });
 
   it("loads an SVG image when mounted from a Solid parent", async () => {
-    vi.stubGlobal("IntersectionObserver", undefined);
     const fetchMock = vi.fn(
       async () => new Response('<svg xmlns="http://www.w3.org/2000/svg"><circle r="4"/></svg>'),
     );

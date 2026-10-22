@@ -5,6 +5,7 @@ import { expect, it } from "vitest";
 import { CONTROL_UI_SESSION_PULL_REQUESTS_CHANGED_EVENT } from "../../../src/gateway/control-ui-contract.js";
 import type { ControlUiLinkReaderPreview } from "../../../src/shared/control-ui-link-reader.js";
 import { SESSION_PULL_REQUESTS_SUBSCRIBE_METHOD } from "../lib/session-pull-requests.ts";
+import { installControlUiE2eRendererStallProbe } from "../test-helpers/control-ui-e2e-renderer-stall.ts";
 import {
   defaultControlUiFeatureMethods,
   installMockGateway,
@@ -12,7 +13,10 @@ import {
 } from "../test-helpers/control-ui-e2e.ts";
 import { TEST_LINK_READER } from "../test-helpers/link-reader.ts";
 import { waitForWatchedSessionKey } from "./chat-github-publication.test-support.ts";
-import { createControlUiE2eSuite } from "./control-ui-e2e-suite.test-support.ts";
+import {
+  createControlUiE2eSuite,
+  holdModuleResponse,
+} from "./control-ui-e2e-suite.test-support.ts";
 import {
   expectModifiedNavigation,
   pullPreviewResponse,
@@ -79,7 +83,16 @@ function referencePreview(url: string, subtitle: string, title: string) {
 async function openPullPreviewPage(
   deferPreview = false,
   previewResponse: ControlUiLinkReaderPreview = pullPreviewResponse,
-) {
+  detailResponse?: ControlUiLinkReaderPreview & { body: string },
+  deferHovercard = false,
+): Promise<{
+  card: Locator;
+  commentLink: Locator;
+  gateway: Awaited<ReturnType<typeof installMockGateway>>;
+  page: Page;
+  pullLink: Locator;
+  hovercardModule: Awaited<ReturnType<typeof holdModuleResponse>> | undefined;
+}> {
   const context = await newBrowserContext();
   await context.route("https://github.com/**", (route) =>
     route.fulfill({
@@ -91,10 +104,15 @@ async function openPullPreviewPage(
   );
 
   const page = await context.newPage();
+  const hovercardModule = deferHovercard
+    ? await holdModuleResponse(page, /\/link-reader-hovercard-[^/]+\.js(?:\?|$)/u)
+    : undefined;
+  await installControlUiE2eRendererStallProbe(page);
   await page.clock.install();
   const gateway = await installPreview(page, {
     deferredMethods: deferPreview ? ["forge.preview"] : [],
     methodResponses: {
+      ...(detailResponse ? { "forge.detail": detailResponse } : {}),
       "forge.preview": {
         cases: [
           {
@@ -150,10 +168,69 @@ async function openPullPreviewPage(
       }
     }).observe(document.body, { childList: true, subtree: true });
   }, PULL_HREF);
-  return { card, commentLink, gateway, page, pullLink };
+  return { card, commentLink, gateway, page, pullLink, hovercardModule };
 }
 
 suite.define(() => {
+  it.each([false, true])(
+    "reconciles status and compact metrics (reader first: %s)",
+    async (readerFirst) => {
+      const { card, page, pullLink, gateway } = await openPullPreviewPage(
+        readerFirst,
+        {
+          ...pullPreviewResponse,
+          badge: { label: "Open", tone: "positive" },
+        },
+        {
+          ...pullPreviewResponse,
+          body: "The pull request is merged. This is the current source status.",
+        },
+      );
+      if (!readerFirst) {
+        await pullLink.focus();
+        await expectText(card.locator(".link-reader-hovercard__state"), "Open");
+        await page.keyboard.press("Escape");
+      }
+      await pullLink.click();
+      const panel = page.locator("openclaw-link-reader-panel");
+      await expectText(panel.locator(".lr-state"), "Merged");
+      await page.mouse.move(1, 1);
+      await page.clock.runFor(150);
+      await pullLink.hover();
+      await page.clock.runFor(300);
+      if (readerFirst) {
+        await gateway.resolveDeferred("forge.preview");
+      }
+      await expectText(card.locator(".link-reader-hovercard__state"), "Merged");
+      await expectText(card.locator(".link-reader-hovercard__metadata"), "+101−12");
+      expect((await gateway.getRequests("forge.preview")).length).toBeGreaterThan(0);
+    },
+  );
+
+  it("retains reader status while the hovercard module is still loading", async () => {
+    const { card, page, pullLink, hovercardModule } = await openPullPreviewPage(
+      false,
+      { ...pullPreviewResponse, badge: { label: "Open", tone: "positive" } },
+      { ...pullPreviewResponse, body: "The pull request is merged." },
+      true,
+    );
+    await pullLink.click();
+    await expectText(page.locator("openclaw-link-reader-panel .lr-state"), "Merged");
+    await hovercardModule!.request;
+    expect(
+      await page.evaluate(() =>
+        Boolean(customElements.get("openclaw-link-reader-hovercard-provider")),
+      ),
+    ).toBe(false);
+    hovercardModule!.release();
+    await page.mouse.move(1, 1);
+    await page.clock.runFor(150);
+    await pullLink.hover();
+    await page.clock.runFor(300);
+    await expectText(card.locator(".link-reader-hovercard__state"), "Merged");
+    await expectText(card.locator(".link-reader-hovercard__metadata"), "+101−12");
+  });
+
   it("keeps all preview metadata readable with long authors on narrow screens", async () => {
     const metadata: NonNullable<ControlUiLinkReaderPreview["metadata"]> = [
       { label: "", value: "+1077", tone: "positive" },
@@ -469,62 +546,6 @@ suite.define(() => {
       expect(await isFocused(pullLink)).toBe(true);
     },
   );
-
-  it("enables loaders across providers only after success and forgets the gate on reload", async () => {
-    const { card, gateway, page, pullLink } = await openPullPreviewPage(true);
-    await pullLink.focus();
-    await gateway.waitForRequest("forge.preview");
-    expect(await card.count()).toBe(0);
-    await gateway.resolveDeferred("forge.preview");
-    await expectText(card, pullPreviewResponse.title);
-    await page.keyboard.press("Escape");
-    await expect.poll(() => card.count()).toBe(0);
-
-    await page.evaluate(() => {
-      const source = document.querySelector(
-        "openclaw-link-reader-hovercard-provider",
-      ) as HTMLElement & {
-        client: unknown;
-        agentId?: string;
-        readers: unknown;
-      };
-      const peer = source.cloneNode(false) as typeof source;
-      peer.client = source.client;
-      peer.agentId = source.agentId;
-      peer.readers = source.readers;
-      const anchor = document.createElement("a");
-      anchor.href = "https://github.com/openclaw/openclaw/pull/99817";
-      anchor.textContent = "Cross-provider preview";
-      anchor.style.cssText = "position: fixed; top: 12px; right: 12px; z-index: 10000";
-      peer.append(anchor);
-      document.body.append(peer);
-    });
-    await gateway.deferNext("forge.preview");
-    const peerLink = page.getByRole("link", { name: "Cross-provider preview", exact: true });
-    await peerLink.hover();
-    await expect.poll(() => card.getAttribute("data-loading")).toBe("true");
-    expect(await card.getAttribute("aria-label")).toBe("Loading preview…");
-    await gateway.rejectDeferred("forge.preview", { message: "Not Found" });
-    await expectText(card.getByRole("status"), "Not Found");
-    expect(await card.locator(".skeleton").count()).toBe(0);
-    await page.mouse.move(1, 1);
-    await expect.poll(() => card.count()).toBe(0);
-    await peerLink.hover();
-    await page.clock.runFor(300);
-    await expectText(card.getByRole("status"), "Not Found");
-    expect(await card.locator(".skeleton").count()).toBe(0);
-    expect(await card.getByRole("link", { name: "Open on Forge" }).getAttribute("href")).toBe(
-      "https://github.com/openclaw/openclaw/pull/99817",
-    );
-    expect((await gateway.getRequests("forge.preview")).length).toBe(2);
-
-    await page.reload();
-    await pullLink.waitFor({ state: "visible" });
-    await pullLink.focus();
-    await gateway.waitForRequest("forge.preview");
-    await page.clock.runFor(300);
-    expect(await card.count()).toBe(0);
-  });
 
   it("shows cached permalink failures during backoff and keeps keyboard navigation usable", async () => {
     const { card, commentLink, gateway, page, pullLink } = await openPullPreviewPage(true);

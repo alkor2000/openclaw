@@ -82,19 +82,13 @@ function installSlackNativeReconnectFailureObserver(
         (Number.isFinite(pingTimeoutMs) && pingTimeoutMs >= 0
           ? pingTimeoutMs
           : OPENCLAW_SLACK_CLIENT_PING_TIMEOUT_MS) * nextFailureCount;
-      const logger = Reflect.get(this, "logger") as { debug?: (message: string) => void };
-      logger?.debug?.(
-        `Before trying to reconnect, this client will wait for ${delayMs} milliseconds`,
-      );
       return new Promise((resolve, reject) => {
         const reconnectTimer = setTimeout(() => {
           Reflect.set(this, "reconnectionTimer", undefined);
           if (Reflect.get(this, "shuttingDown")) {
-            logger?.debug?.("Client shutting down, will not attempt reconnect.");
             resolve(undefined);
             return;
           }
-          logger?.debug?.("Continuing with reconnect...");
           this.emit("reconnecting");
           callback.call(this).then(resolve, (error: unknown) => {
             if (callback === Reflect.get(this, "start")) {
@@ -142,20 +136,15 @@ function resolveSlackBoltModule(value: unknown): SlackBoltResolvedExports | null
   };
 }
 
-export function resolveSlackBoltInterop(params: {
-  defaultImport: unknown;
-  namespaceImport: unknown;
-}): SlackBoltResolvedExports {
-  const { defaultImport, namespaceImport } = params;
-  const nestedDefault = asOptionalObjectRecord(defaultImport)?.default;
+export function resolveSlackBoltInterop(namespaceImport: unknown): SlackBoltResolvedExports {
   const namespace = asOptionalObjectRecord(namespaceImport);
-  const namespaceDefault = namespace?.default;
+  const defaultImport = namespace?.default;
+  const nestedDefault = asOptionalObjectRecord(defaultImport)?.default;
   const namespaceReceiver = namespace?.HTTPReceiver;
   const namespaceSocketModeReceiver = namespace?.SocketModeReceiver;
   const directModule =
     resolveSlackBoltModule(defaultImport) ??
     resolveSlackBoltModule(nestedDefault) ??
-    resolveSlackBoltModule(namespaceDefault) ??
     resolveSlackBoltModule(namespaceImport);
   if (directModule) {
     return directModule;
@@ -408,7 +397,7 @@ export async function startSlackSocketAndWaitForDisconnect(params: {
     return value;
   });
   try {
-    await Promise.resolve(params.app.start());
+    await params.app.start();
     if (params.abortSignal?.aborted) {
       return null;
     }

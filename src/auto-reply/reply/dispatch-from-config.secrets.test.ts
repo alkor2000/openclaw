@@ -1,9 +1,9 @@
 import { asNullableRecord } from "@openclaw/normalization-core/record-coerce";
-import { afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { createSubscribedSessionHarness } from "../../agents/embedded-agent-subscribe.e2e-harness.js";
+import * as questionDispatch from "../../agents/harness/gateway-question-dispatch.js";
 import { claimPendingAgentQuestionAnswer } from "../../agents/harness/gateway-question.js";
-import { resetPendingAskUserQuestionsForTest } from "../../agents/tools/ask-user-tool.test-support.js";
 import { createSecretsTool } from "../../agents/tools/secrets-tool.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { ReplyPayload } from "../types.js";
@@ -33,7 +33,6 @@ beforeEach(async () => {
   );
   askUserMocks.isAskUserPromptPending.mockImplementation(actual.isAskUserPromptPending);
 });
-afterEach(() => resetPendingAskUserQuestionsForTest());
 
 const settledResult = <T>(promise: Promise<T>) =>
   promise.then(
@@ -109,6 +108,9 @@ it.for([
     let unsubscribe: (() => void) | undefined;
     const producerCalled = createDeferred();
     const callbackFinished = createDeferred();
+    const questionResolverSpy = vi
+      .spyOn(questionDispatch, "resolveAgentQuestionGatewayCall")
+      .mockReturnValue(gateway);
     const dispatch = settledResult(
       dispatchReplyFromConfig({
         ctx: buildTestCtx({
@@ -160,10 +162,7 @@ it.for([
             args,
           });
           toolOutcome = settledResult(
-            createSecretsTool({ sessionKey, runId, gatewayCall: gateway }).execute(
-              "credential-call",
-              args,
-            ),
+            createSecretsTool({ sessionKey, runId }).execute("credential-call", args),
           );
           await toolOutcome;
           return undefined;
@@ -225,10 +224,14 @@ it.for([
       expect(progress).not.toHaveBeenCalled();
       await expect(dispatch).resolves.toHaveProperty("result");
     } finally {
-      transport.resolve();
-      answer.resolve({ status: "cancelled" });
-      await dispatch;
-      unsubscribe?.();
+      try {
+        transport.resolve();
+        answer.resolve({ status: "cancelled" });
+        await dispatch;
+      } finally {
+        unsubscribe?.();
+        questionResolverSpy.mockRestore();
+      }
     }
   },
 );

@@ -158,19 +158,18 @@ describe("explicit compile publication reuse", () => {
     expect(current.compiledCachePublicationId).not.toBe(identity.compiledCachePublicationId);
   });
 
-  it("rejects a rolled-back reservation before reusing its persisted predecessor", async () => {
+  it("cancels reuse after a persisted read without replacing its accepted row", async () => {
     const { rootDir, config, identity, row } = await publishedVault();
-    await loadMemoryWikiCompiledCache(config);
-    const logPath = path.join(rootDir, ".openclaw-wiki", "log.jsonl");
-    const originalLog = await fs.readFile(logPath);
     const persisted = await lookup(row.key);
-    onNextLookup = () => fs.writeFile(logPath, originalLog);
-    await expect(compileMemoryWikiVault(config)).rejects.toThrow(
-      "Memory Wiki vault changed while its compiled cache was being built.",
+    const controller = new AbortController();
+    onNextLookup = async () => controller.abort(new Error("synthetic cancelled compile"));
+    await expect(compileMemoryWikiVault(config, { signal: controller.signal })).rejects.toThrow(
+      "synthetic cancelled compile",
     );
     expect((await loadMemoryWikiVaultIdentity(rootDir)).compiledCachePublicationId).toBe(
       identity.compiledCachePublicationId,
     );
+    expect(await entries()).toEqual([row]);
     expect(await lookup(row.key)).toEqual(persisted);
   });
 

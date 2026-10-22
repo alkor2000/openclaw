@@ -3,11 +3,13 @@ import type { ModelCatalogResult } from "../../api/types.ts";
 import { t } from "../../i18n/index.ts";
 import { formatUiError } from "../../lib/format-error.ts";
 import { canonicalModelAuthProviderId } from "../../lib/model-auth.ts";
+import { invalidateModelCatalogCache } from "../../lib/model-catalog-cache.ts";
 import { loadModelCatalog, modelCatalogRefreshError } from "../../lib/model-catalog-store.ts";
-import type { SolidControllerHost as ControllerHost } from "../../lit/solid-controller-host.ts";
 import { loadModelProvidersData, type ModelProvidersData } from "./load.ts";
 
 export type ModelProviderRefreshReason = "publication" | "replacement" | "forced";
+
+export type ModelProviderCoreReceipt = { promise: Promise<void> };
 
 type CoreLoadOptions = {
   onStart: (reason: ModelProviderRefreshReason) => void;
@@ -49,15 +51,28 @@ async function loadConnectedProviderData(
 
 export class ModelProviderCoreLoader {
   private active = false;
+  receipt: ModelProviderCoreReceipt | null = null;
+  private completion: ReturnType<typeof Promise.withResolvers<void>> | null = null;
   private catalogRequest: AbortController | null = null;
   catalogError: string | null = null;
   retryProvider: string | undefined;
   private request: AbortController | null = null;
+  private publicationPending = false;
 
   constructor(
-    private readonly host: ControllerHost,
+    private readonly notify: () => void,
     private readonly options: CoreLoadOptions,
   ) {}
+
+  adopt(): void {
+    this.receipt = { promise: Promise.resolve() };
+  }
+
+  private retireCompletion(): void {
+    // A retired transport may ignore abort; release its presentation lifetime now.
+    this.completion?.resolve();
+    this.completion = null;
+  }
 
   get loading(): boolean {
     return this.active;
@@ -72,7 +87,7 @@ export class ModelProviderCoreLoader {
     this.catalogRequest = null;
     this.catalogError = null;
     retired?.abort();
-    this.host.requestUpdate();
+    this.notify();
   }
 
   async discoverCatalog(
@@ -87,7 +102,7 @@ export class ModelProviderCoreLoader {
     const ownsResult = () => this.catalogRequest === request && isCurrent();
     this.catalogRequest = request;
     this.catalogError = null;
-    this.host.requestUpdate();
+    this.notify();
     try {
       const result = await loadModelCatalog(client, {
         agentId,
@@ -108,7 +123,8 @@ export class ModelProviderCoreLoader {
     } finally {
       if (this.catalogRequest === request) {
         this.catalogRequest = null;
-        this.host.requestUpdate();
+        this.refreshPendingPublication(client, agentId);
+        this.notify();
       }
     }
   }
@@ -120,10 +136,14 @@ export class ModelProviderCoreLoader {
     target?: { providerId?: string; data: ModelProvidersData },
   ): Promise<void> {
     if (reason === "publication" && (this.active || this.catalogLoading)) {
-      // Catalog changes during an existing read are best effort until the next refresh.
+      this.publicationPending = true;
       return;
     }
+    this.publicationPending = false;
     this.request?.abort();
+    this.retireCompletion();
+    this.completion = Promise.withResolvers<void>();
+    this.receipt = { promise: this.completion.promise };
     const request = new AbortController();
     this.request = request;
     this.active = true;
@@ -133,7 +153,7 @@ export class ModelProviderCoreLoader {
     if (!target) {
       this.options.onStart(reason);
     }
-    this.host.requestUpdate();
+    this.notify();
     try {
       const data = target
         ? await loadConnectedProviderData(client, agentId, target, request.signal)
@@ -146,24 +166,39 @@ export class ModelProviderCoreLoader {
         this.active = false;
         this.retryProvider = target && data.error ? target.providerId : undefined;
         this.options.onComplete({ client, data });
+        this.completion?.resolve();
+        this.completion = null;
       }
     } catch {
       // Each source reports its own error; a retired request has no result to publish.
     } finally {
       if (this.request === request) {
         this.request = null;
+        this.retireCompletion();
         this.active = false;
-        this.host.requestUpdate();
+        this.refreshPendingPublication(client, agentId);
+        this.notify();
       }
     }
   }
 
+  private refreshPendingPublication(client: GatewayBrowserClient, agentId: string): void {
+    if (this.publicationPending && !this.active && !this.catalogLoading) {
+      // A completed read may have republished facts captured before the notification.
+      invalidateModelCatalogCache(client, { agentId });
+      void this.refresh(client, agentId, "publication");
+    }
+  }
+
   invalidate(): void {
+    this.publicationPending = false;
     this.resetCatalog();
     this.retryProvider = undefined;
+    this.retireCompletion();
+    this.receipt = null;
     this.active = false;
     this.request?.abort();
     this.request = null;
-    this.host.requestUpdate();
+    this.notify();
   }
 }

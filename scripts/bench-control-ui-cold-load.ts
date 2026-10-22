@@ -13,7 +13,7 @@ import { execFileSync } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { parseArgs } from "node:util";
-import { chromium, type Browser } from "playwright";
+import { chromium, type Browser, type Page } from "playwright";
 import { buildSandboxHostPath } from "../src/agents/sandbox-host.js";
 import { CONTROL_UI_BOOTSTRAP_CONFIG_ATTRIBUTE } from "../src/gateway/control-ui-bootstrap-contract.ts";
 import { captureSessionRowGeneration } from "../src/gateway/session-row-identity.js";
@@ -21,6 +21,7 @@ import { shareSidebarSessionRows } from "../src/gateway/session-row-presentation
 import { normalizeControlUiBuildInfo } from "../ui/src/build-info-normalizers.ts";
 import { isChatHistoryState } from "../ui/src/lib/protocol-validators.generated/history-state.js";
 import { createColdLoadProbeInitScript } from "../ui/src/test-helpers/control-ui-cold-load-probes.ts";
+import type { MockGatewayWindow } from "../ui/src/test-helpers/control-ui-e2e-contract.ts";
 import {
   createControlUiMockBootstrapConfig,
   installControlUiMockBootstrapDocument,
@@ -233,6 +234,9 @@ const { values } = parseArgs({
     "init-script": { type: "string", multiple: true, default: [] },
     "sidebar-list-churn": { type: "boolean", default: false },
     "sidebar-live-churn": { type: "boolean", default: false },
+    "sidebar-avatars": { type: "boolean", default: false },
+    "sidebar-expanded": { type: "boolean", default: false },
+    "omit-hello-self-presence": { type: "boolean", default: false },
     "session-event-churn": { type: "boolean", default: false },
     "session-event-duration-ms": { type: "string", default: "30000" },
     "session-event-ancestor-refs": { type: "boolean", default: false },
@@ -258,9 +262,11 @@ const { values } = parseArgs({
     runs: { type: "string", default: "3" },
     "latency-ms": { type: "string", default: "35" },
     "method-latency-ms": { type: "string", multiple: true, default: [] },
+    "sidebar-query-latency-ms": { type: "string", multiple: true, default: [] },
     face: { type: "string", default: "dashboard" },
     "short-route": { type: "boolean", default: false },
     "full-uuid-route": { type: "boolean", default: false },
+    "off-roster-route": { type: "boolean", default: false },
     "frame-gap-ms": { type: "string", default: "4" },
     "sidebar-view": { type: "string", default: "sessions" },
     output: { type: "string", default: ".artifacts/control-ui-cold-load" },
@@ -382,19 +388,25 @@ if (
   throw new Error("history-validator-delay-ms requires warm-reload and a delay from 0 to 10000");
 }
 const methodLatencyMs: Record<string, number> = {};
-for (const value of values["method-latency-ms"]) {
-  const [method, delay, ...extra] = value.split("=");
-  const milliseconds = Number(delay);
-  if (
-    !method ||
-    delay === undefined ||
-    extra.length ||
-    !Number.isFinite(milliseconds) ||
-    milliseconds < 0
-  ) {
-    throw new Error("Expected method-latency-ms method=nonnegative-milliseconds");
+const sidebarQueryLatencyMs: Record<string, number> = {};
+for (const [entries, target] of [
+  [values["method-latency-ms"], methodLatencyMs],
+  [values["sidebar-query-latency-ms"], sidebarQueryLatencyMs],
+] as const) {
+  for (const value of entries) {
+    const [method, delay, ...extra] = value.split("=");
+    const milliseconds = Number(delay);
+    if (
+      !method ||
+      delay === undefined ||
+      extra.length ||
+      !Number.isFinite(milliseconds) ||
+      milliseconds < 0
+    ) {
+      throw new Error("Expected method-latency-ms method=nonnegative-milliseconds");
+    }
+    target[method] = milliseconds;
   }
-  methodLatencyMs[method] = milliseconds;
 }
 const face = values.face;
 if (face !== "chat" && face !== "dashboard") {
@@ -496,15 +508,18 @@ const dirty = explicitBuildId
 const bundleDir = values["bundle-dir"]
   ? path.resolve(values["bundle-dir"])
   : path.join(artifactDir, "ui");
-if (gatewayUrl && !explicitBuildId) {
-  const html = await readFile(path.join(bundleDir, "index.html"), "utf8");
+async function readBundleBuildId(directory: string): Promise<string> {
+  const html = await readFile(path.join(directory, "index.html"), "utf8");
   const identity = html.match(
     /globalThis\.OPENCLAW_CONTROL_UI_BUILD_INFO=(\{.*?\});<\/script>/su,
   )?.[1];
   if (!identity) {
-    throw new Error("Gateway benchmarking requires a bundle with embedded build identity");
+    throw new Error("Prebuilt benchmarking requires a bundle with embedded build identity");
   }
-  buildId = normalizeControlUiBuildInfo(JSON.parse(identity)).buildId;
+  return normalizeControlUiBuildInfo(JSON.parse(identity)).buildId;
+}
+if (values["bundle-dir"] && !explicitBuildId) {
+  buildId = await readBundleBuildId(bundleDir);
 }
 const server = gatewayUrl
   ? undefined
@@ -518,12 +533,20 @@ const comparisonBundleDirs = values["compare-bundle-dir"].map((directory) =>
 const parkedBaselineDir = path.join(artifactDir, "baseline-bundle");
 const bundleSlots = [parkedBaselineDir, ...comparisonBundleDirs];
 let activeBundle = 0;
-async function selectComparisonBundle(index: number) {
+async function selectComparisonBundle(index: number, page?: Page) {
   if (!comparisonBundleDirs.length || activeBundle === index) {
     return;
   }
   await server!.replaceBuild(bundleSlots[index]!, bundleSlots[activeBundle]!);
   activeBundle = index;
+  buildId = explicitBuildId ?? (await readBundleBuildId(bundleDir));
+  await page?.evaluate((id) => {
+    const gateway = (window as MockGatewayWindow).openclawControlUiE2eGateway;
+    if (!gateway) {
+      throw new Error("Mock Gateway is not installed");
+    }
+    gateway.setServerBuildId(id);
+  }, buildId);
 }
 const dashboardFont = values["dashboard-widget"]
   ? await readFile("ui/public/fonts/space-grotesk-latin.woff2")
@@ -557,6 +580,7 @@ const fixture = createControlUiTeamScaleFixture({
   liveRun: values["live-events"] || values["streaming-reply"],
   sidebarListChurn: values["sidebar-list-churn"],
   sidebarLiveChurn: values["sidebar-live-churn"],
+  sidebarAvatars: values["sidebar-avatars"],
   sessionEventChurn: values["session-event-churn"],
   sessionEventDurationMs,
   sessionEventAncestorRefs: values["session-event-ancestor-refs"],
@@ -566,6 +590,7 @@ const fixture = createControlUiTeamScaleFixture({
     : undefined,
   closedMenuMembers: values["closed-menu-members"],
   largeSnapshot: values["large-snapshot"],
+  offRosterSession: values["off-roster-route"],
   transcriptMessages,
   dashboardWidgetFontUrl: dashboardFont
     ? `http://127.0.0.1:${address.port}${dashboardFontPath}`
@@ -775,7 +800,7 @@ try {
       return asset ? route.fulfill({ status: 200, ...asset }) : route.fallback();
     });
   }
-  if (values["sidebar-live-churn"] || values["closed-menu-members"]) {
+  if (values["sidebar-live-churn"] || values["sidebar-avatars"] || values["closed-menu-members"]) {
     await page.route("**/api/users/*/avatar?*", async (route) => {
       const asset = fixture.assets.get(new URL(route.request().url()).pathname);
       if (!asset) {
@@ -853,7 +878,7 @@ try {
     ? `\n(${installRotatingBoardTickets.toString()})(${JSON.stringify(fixture.board)}, window.openclawControlUiE2eGateway);`
     : "";
   await page.addInitScript({
-    content: `;(() => { if (window !== window.top) return; const __name = (fn) => fn; (${installWidgetReadiness.toString()})(); ${createControlUiMockGatewayInitScript(prepared.scenario)}\n${rigProbeScript}\nwindow.__teamScaleSidebarLists = { apply: (mutation) => window.__teamScaleMutate(mutation) }; window.openclawControlUiE2eGateway.setRequestHandler("sessions.list", async ({ params, respond }) => respond(await window.__teamScaleList(params))); window.openclawControlUiE2eGateway.setRequestHandler("cron.list", async ({ params, respond }) => respond(await window.__teamScaleCronList(params)));\n${boardTickets}\n${createColdLoadProbeInitScript({ latencyMs, methodLatencyMs, connectNotBeforeMs, frameGapMs, events: fixture.events, liveEvents: fixture.liveEvents, liveHistory: fixture.liveHistory, ownerProbes: !cpuProfile && !allocations && !values["session-event-churn"], sidebarCounters: !cpuProfile })}\n${streamingReply ? createStreamingReplyProbeInitScript() : ""}\n${extraInitScripts.join("\n")}\n${warmProbes} })();`,
+    content: `;(() => { if (window !== window.top) return; const __name = (fn) => fn; (${installWidgetReadiness.toString()})(); ${createControlUiMockGatewayInitScript(prepared.scenario)}\n${rigProbeScript}\nwindow.__teamScaleSidebarLists = { apply: (mutation) => window.__teamScaleMutate(mutation) }; window.openclawControlUiE2eGateway.setRequestHandler("sessions.list", async ({ params, respond }) => respond(await window.__teamScaleList(params))); window.openclawControlUiE2eGateway.setRequestHandler("cron.list", async ({ params, respond }) => respond(await window.__teamScaleCronList(params)));\n${boardTickets}\n${createColdLoadProbeInitScript({ latencyMs, methodLatencyMs, sidebarQueryLatencyMs, omitHelloSelfPresence: values["omit-hello-self-presence"], connectNotBeforeMs, frameGapMs, events: fixture.events, liveEvents: fixture.liveEvents, liveHistory: fixture.liveHistory, ownerProbes: !cpuProfile && !allocations && !values["session-event-churn"], sidebarCounters: !cpuProfile })}\n${streamingReply ? createStreamingReplyProbeInitScript() : ""}\n${extraInitScripts.join("\n")}\n${warmProbes} })();`,
   });
   // Fetch the real public document; the init script selects the synthetic session.
   // Session-entry authorization is outside this static-delivery benchmark.
@@ -899,7 +924,7 @@ try {
       }
       await page
         .locator('.sidebar-rail [data-sidebar-entry^="session:"]')
-        .nth(29)
+        .nth(fixture.counts.pinned - 1)
         .waitFor({ state: "attached" });
       await page.locator('[data-sidebar-entry="plugin:team-scale-7/overview"]').waitFor();
       if (sidebarView === "online") {
@@ -962,6 +987,70 @@ try {
       throw error;
     }
   }
+  async function expandSidebar() {
+    if (!values["sidebar-expanded"]) {
+      return;
+    }
+    const expansionSaved = async () => {
+      const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open("openclaw-chat-snapshots");
+        request.addEventListener("success", () => resolve(request.result), { once: true });
+        request.addEventListener(
+          "error",
+          () => reject(request.error ?? new Error("Could not open sidebar snapshots")),
+          { once: true },
+        );
+      });
+      try {
+        const records = await new Promise<
+          Array<{
+            model: { sections: Array<{ visibleLimit: number; rows: Array<{ key: string }> }> };
+          }>
+        >((resolve, reject) => {
+          const request = database
+            .transaction("sidebarSnapshots")
+            .objectStore("sidebarSnapshots")
+            .getAll();
+          request.addEventListener("success", () => resolve(request.result), { once: true });
+          request.addEventListener(
+            "error",
+            () => reject(request.error ?? new Error("Could not read sidebar snapshots")),
+            { once: true },
+          );
+        });
+        const visibleKeys = [
+          ...document.querySelectorAll(".sidebar-session-content .sidebar-recent-session"),
+        ].map((row) => row.getAttribute("data-session-key"));
+        return records.some(({ model }) => {
+          const savedKeys = new Set(
+            model.sections.flatMap((section) => section.rows.map((row) => row.key)),
+          );
+          return (
+            model.sections.some(({ visibleLimit }) => visibleLimit > 10) &&
+            visibleKeys.every((key) => key !== null && savedKeys.has(key))
+          );
+        });
+      } finally {
+        database.close();
+      }
+    };
+    // Sticky live rows can exceed ten without an explicit Show more selection.
+    if (!(await page.evaluate(expansionSaved))) {
+      await page
+        .locator(".sidebar-session-content .sidebar-session-pagination__button")
+        .filter({ hasText: "Show more" })
+        .first()
+        .click();
+    }
+    // waitForFunction treats an async predicate's Promise as truthy.
+    const deadline = Date.now() + 30_000;
+    while (!(await page.evaluate(expansionSaved))) {
+      if (Date.now() >= deadline) {
+        throw new Error("Expanded sidebar membership was not persisted");
+      }
+      await page.evaluate(() => new Promise(requestAnimationFrame));
+    }
+  }
   const warmStates: Array<Awaited<ReturnType<typeof persistColdLoadWarmState>>["storage"]> = [];
   const snapshotSaves: Array<
     Omit<Awaited<ReturnType<typeof persistColdLoadWarmState>>, "storage">
@@ -991,13 +1080,25 @@ try {
       await page.locator('[data-navigation-view="online"]').click();
     }
     await settle();
+    await expandSidebar();
     if (values["chat-dashboard-route"] || (face === "dashboard" && values["dashboard-widget"])) {
       // Save the operator's dashboard-first layout through its normal action.
-      const menu = page
-        .locator(".chat-pane-cache__pane--active .chat-dashboard-menu")
-        .filter({ visible: true });
-      await menu.getByRole("button", { name: "Dashboard options", exact: true }).click();
-      await menu.getByRole("menuitem", { name: /^Swap / }).click();
+      if (
+        (await page
+          .locator("openclaw-board-view")
+          .first()
+          .evaluate((board) => board.closest("[data-region]")?.getAttribute("data-region"))) !==
+        "main"
+      ) {
+        const menu = page
+          .locator(".chat-pane-cache__pane--active .chat-dashboard-menu")
+          .filter({ visible: true });
+        await menu.getByRole("button", { name: "Dashboard options", exact: true }).click();
+        await menu
+          .getByRole("menuitem", { name: /^Swap / })
+          .or(menu.getByRole("menuitemcheckbox", { name: /^Swap / }))
+          .click();
+      }
       await page.waitForFunction(
         () =>
           document
@@ -1016,6 +1117,7 @@ try {
     await page.locator('aside.sidebar[data-snapshot-saved="true"]').waitFor();
     const warmInput: Parameters<typeof persistColdLoadWarmState>[0] = {
       sessionKey: fixture.selectedSessionKey,
+      offRosterSession: values["off-roster-route"],
       sidebarView: sidebarView === "online" ? "online" : "sessions",
     };
     const { storage: warmStorage, ...snapshotSave } = await page.evaluate(
@@ -1026,9 +1128,10 @@ try {
     snapshotSaves.push(snapshotSave);
     for (let index = 1; index < bundleSlots.length; index++) {
       await restoreColdLoadWarmState(page, warmStorage);
-      await selectComparisonBundle(index);
+      await selectComparisonBundle(index, page);
       await page.reload({ waitUntil: "domcontentloaded" });
       await settle();
+      await expandSidebar();
       const { storage, ...saved } = await page.evaluate(persistColdLoadWarmState, warmInput);
       warmStates.push(storage);
       snapshotSaves.push(saved);
@@ -1052,7 +1155,7 @@ try {
       await route.fallback();
     });
   }
-  await selectComparisonBundle(0);
+  await selectComparisonBundle(0, page);
   for (let run = 0; run < runs; run++) {
     const cpuPhases: Record<string, ColdLoadCpuTables> = {};
     async function recordCpu(phase: string, profile: Parameters<typeof mapColdLoadCpuProfile>[0]) {
@@ -1085,7 +1188,7 @@ try {
     if (!firstLoad) {
       await restoreColdLoadWarmState(page, warmStates[bundleIndex]!);
     }
-    await selectComparisonBundle(bundleIndex);
+    await selectComparisonBundle(bundleIndex, page);
     runTransfer =
       sidebarRowTransfer === "delta" || (sidebarRowTransfer === "interleaved" && run % 2 === 1)
         ? "delta"
@@ -1409,8 +1512,17 @@ try {
         deltas: number;
         milliseconds: Record<string, number>;
       }> = [];
+      const streamingTrace: unknown[] = [];
+      collectedTrace = streamingTrace;
       if (cpuProfile) {
         await cdp.send("Profiler.start");
+      }
+      if (traced) {
+        await cdp.send("Tracing.start", {
+          categories:
+            "toplevel,blink.user_timing,devtools.timeline,disabled-by-default-devtools.timeline.stack,v8",
+          transferMode: "ReportEvents",
+        });
       }
       if (values["streaming-allocations"]) {
         await cdp.send("HeapProfiler.startSampling", {
@@ -1490,6 +1602,17 @@ try {
       }
       if (cpuProfile) {
         await recordCpu("streaming", (await cdp.send("Profiler.stop")).profile);
+      }
+      if (traced) {
+        const complete = new Promise<void>((resolve) => {
+          cdp.once("Tracing.tracingComplete", () => resolve());
+        });
+        await cdp.send("Tracing.end");
+        await complete;
+        await writeFile(
+          path.join(artifactDir, `run-${run + 1}.streaming.trace.json`),
+          JSON.stringify({ traceEvents: streamingTrace }),
+        );
       }
       streaming = {
         ...(await page.evaluate(() => Reflect.get(window, "__streamingReply").finish())),
@@ -1934,6 +2057,9 @@ try {
         comparisonBundleDirs,
         fixture: fixture.counts,
         sidebarView,
+        sidebarAvatars: values["sidebar-avatars"],
+        sidebarExpanded: values["sidebar-expanded"],
+        omitHelloSelfPresence: values["omit-hello-self-presence"],
         streamingReply: values["streaming-reply"],
         streamingAllocations: values["streaming-allocations"],
         sessionSwitch: values["session-switch"],
@@ -1957,11 +2083,13 @@ try {
           : undefined,
         latencyMs,
         methodLatencyMs,
+        sidebarQueryLatencyMs,
         connectNotBeforeMs,
         dashboardWidget: values["dashboard-widget"],
         face,
         shortRoute: values["short-route"],
         fullUuidRoute: values["full-uuid-route"],
+        offRosterRoute: values["off-roster-route"],
         frameGapMs,
         captureMs,
         sessionEventDurationMs,

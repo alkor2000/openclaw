@@ -23,7 +23,6 @@ import {
 import { readChannelContextAdmissionEvidence } from "../../channels/message-access/admission-evidence.js";
 import { copyChildSessionPublication } from "../../channels/message-access/child-session-publication.js";
 import { getRuntimeConfig, type OpenClawConfig } from "../../config/config.js";
-import { bindConfiguredModelAuthProfileScope } from "../../config/sessions/auth-profile-override-provenance.js";
 import { conversationIdentityFromMsgContext } from "../../config/sessions/conversation-identity-inbound.js";
 import { resolveGroupSessionKey } from "../../config/sessions/group.js";
 import { sessionPersonalProfileId } from "../../config/sessions/session-entry-provenance.js";
@@ -47,6 +46,7 @@ import { getGroupThreadTurn } from "../group-thread-context.js";
 import { resolveInternalTurnTranscript } from "../internal-turn-source.js";
 import { getRequesterProfile } from "../requester-profile.js";
 import type { OriginatingChannelType } from "../templating.js";
+import { resolveReplyScheduledToolPolicy } from "./agent-runner-run-params.js";
 import { resolveCurrentTurnImages } from "./current-turn-images.js";
 import { resolveEffectiveReplyRoute } from "./effective-reply-route.js";
 import type { PreparedReplyRunAdmission } from "./get-reply-run-admission.js";
@@ -58,6 +58,7 @@ import {
 import { hasInboundAudio } from "./inbound-media.js";
 import { normalizeMessageTimestampMs } from "./message-timestamp.js";
 import { resolveOriginMessageProvider } from "./origin-routing.js";
+import { resolveReplySteeringIntent } from "./reply-steering-intent.js";
 import { resolveReplyToMode } from "./reply-threading.js";
 import { resolveInboundReplyToolAuthorityOverlay } from "./reply-tool-authority-inbound.js";
 import { resolveRoutedDeliveryThreadId } from "./routed-delivery-thread.js";
@@ -95,9 +96,7 @@ export async function executePreparedReplyRun(
     shouldFollowup,
     hasQueuedFollowups,
     isActive,
-    authProfileId,
-    authProfileIdSource,
-    configuredPrimaryProvider,
+    runtimeAuthSelection,
   } = state;
   const {
     prefixedCommandBody,
@@ -516,6 +515,10 @@ export async function executePreparedReplyRun(
       normalizeOptionalString(sessionCtx.ChatId),
     originatingChatType: replyRoute.chatType,
     run: {
+      scheduledAutomation: opts?.scheduledAutomation,
+      scheduledToolPolicy: resolveReplyScheduledToolPolicy({
+        scheduledAutomation: opts?.scheduledAutomation,
+      }),
       onOperationAdmitted: opts?.onReplyOperationAdmitted,
       internalEventExecution: opts?.internalEventExecution,
       providerReviewAcknowledgment: opts?.providerReviewAcknowledgment,
@@ -583,8 +586,7 @@ export async function executePreparedReplyRun(
       // them to the subagent fallback ladder like hidden subagent sessions.
       subagentSpawnLineage: (preparedSessionState.sessionEntry?.spawnDepth ?? 0) > 0,
       autoFallbackPrimaryProbe: params.autoFallbackPrimaryProbe,
-      authProfileId,
-      authProfileIdSource,
+      ...runtimeAuthSelection,
       thinkingCatalog,
       thinkLevel: resolvedThinkLevel,
       thinkingExplicit: params.thinkingExplicit,
@@ -642,6 +644,7 @@ export async function executePreparedReplyRun(
         : {}),
       extraSystemPrompt: extraSystemPromptParts.join("\n\n") || undefined,
       sourceReplyDeliveryMode,
+      bootstrapContextMode: opts?.bootstrapContextMode,
       taskSuggestionDeliveryMode: opts?.taskSuggestionDeliveryMode,
       silentReplyPromptMode,
       extraSystemPromptStatic,
@@ -657,7 +660,6 @@ export async function executePreparedReplyRun(
     },
   };
   const sourceReplyDeliveryRuntimeOptions = opts as SourceReplyDeliveryRuntimeOptions | undefined;
-  bindConfiguredModelAuthProfileScope(followupRun.run, configuredPrimaryProvider);
   copyChildSessionPublication(sessionCtx, followupRun.run);
   if (command.senderIsOwner && channelOwnerAuthority) {
     bindCommandOwnerAuthority(followupRun.run, channelOwnerAuthority);
@@ -686,6 +688,10 @@ export async function executePreparedReplyRun(
   const execute = () =>
     runReplyAgent({
       ...params,
+      steeringIntent: resolveReplySteeringIntent({
+        directives: params.directives,
+        resetTriggered: effectiveResetTriggered,
+      }),
       commandBody: prefixedCommandBody,
       transcriptCommandBody,
       followupRun,

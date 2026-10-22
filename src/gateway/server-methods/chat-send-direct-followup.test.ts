@@ -18,6 +18,7 @@ import {
 import { withGatewayToolCallerIdentity } from "../../agents/tools/gateway-caller-context.js";
 import type { dispatchInboundMessage } from "../../auto-reply/dispatch.js";
 import type { executeAgentTurn } from "../../auto-reply/reply/agent-runner-execution.js";
+import * as restartRecovery from "../../auto-reply/reply/agent-runner-restart-recovery.js";
 import { withFullRuntimeReplyConfig } from "../../auto-reply/reply/get-reply-fast-path.js";
 import * as replyRunHelpers from "../../auto-reply/reply/get-reply-run-helpers.js";
 import { clearSessionQueues } from "../../auto-reply/reply/queue/cleanup.js";
@@ -28,6 +29,7 @@ import {
   getAgentEventLifecycleGeneration,
   rotateAgentEventLifecycleGeneration,
 } from "../../infra/agent-events.js";
+import { createRestartRecoveryClaimChangedError } from "../../infra/agent-lifecycle-error.js";
 import * as runAuthority from "../../infra/agent-run-registry.js";
 import { withSessionTurn } from "../../sessions/session-controller.admission.js";
 import { getSessionControllerOperation } from "../../sessions/session-controller.js";
@@ -38,6 +40,7 @@ import type { UserTurnTranscriptRecorder } from "../../sessions/user-turn-transc
 import { ensureProfileForEmail } from "../../state/user-profiles.js";
 import { dispatchInboundMessageMock, installGatewayTestHooks } from "../test-helpers.js";
 import { handleChatAbortRequest } from "./chat-abort-handler.js";
+import * as chatReplyMedia from "./chat-reply-media.js";
 import { loadRealChatDispatch, successfulChatTurn } from "./chat-send-authority.test-support.js";
 import {
   setClientProfile,
@@ -346,6 +349,36 @@ it.for([false, true])(
     const queued = createDeferred();
     const dispatched = createDeferred();
     const settled = createDeferred();
+    const mediaCaptured = createDeferred();
+    const releaseMedia = createDeferred();
+    const stopped = createDeferred();
+    let dispatchReturned = false;
+    let mediaHeld = false;
+    const captureMedia = chatReplyMedia.captureWebchatReplyMediaScope;
+    const mediaCapture = cancel
+      ? vi
+          .spyOn(chatReplyMedia, "captureWebchatReplyMediaScope")
+          .mockImplementation(async (params) => {
+            const media = await captureMedia(params);
+            if (dispatchReturned && !mediaHeld && params.sessionKey === scope.sessionKey) {
+              mediaHeld = true;
+              mediaCaptured.resolve();
+              await releaseMedia.promise;
+            }
+            return media;
+          })
+      : undefined;
+    const clearRun = context.chatRunState.clearRun;
+    const clearStoppedRun = cancel
+      ? vi.spyOn(context.chatRunState, "clearRun").mockImplementation((runId) => {
+          clearRun(runId);
+          if (runId === sendParams.idempotencyKey) {
+            stopped.resolve();
+          }
+        })
+      : undefined;
+    let stop: Promise<void> | undefined;
+    let broadcastsAtStop = 0;
     const consumed: string[] = [];
     let recorder: UserTurnTranscriptRecorder | undefined;
     const directReady = createDeferred();
@@ -372,6 +405,7 @@ it.for([false, true])(
       try {
         return await dispatchActual({ ...params, cfg: config });
       } finally {
+        dispatchReturned = true;
         dispatched.resolve();
       }
     });
@@ -459,9 +493,10 @@ it.for([false, true])(
       expect(consumed).toEqual([]);
       expect(injected).not.toHaveBeenCalled();
       if (cancel) {
+        await wait(mediaCaptured.promise);
         const abortParams = { sessionKey: scope.sessionKey, runId: sendParams.idempotencyKey };
         const respond = vi.fn<RespondFn>();
-        await handleChatAbortRequest({
+        stop = handleChatAbortRequest({
           params: abortParams,
           req: { type: "req", id: "stop-queued-input", method: "chat.abort", params: abortParams },
           client,
@@ -469,6 +504,11 @@ it.for([false, true])(
           respond,
           isWebchatConnect: () => true,
         });
+        void stop.catch(() => {});
+        await waitForGate(stopped.promise, stop, "Stop completed without clearing its chat buffer");
+        broadcastsAtStop = vi.mocked(context.broadcast).mock.calls.length;
+        releaseMedia.resolve();
+        await wait(stop);
         expect(respond).toHaveBeenCalledWith(true, {
           ok: true,
           aborted: true,
@@ -489,28 +529,117 @@ it.for([false, true])(
       await command;
       if (cancel) {
         expect(consumed).toEqual([]);
+        await fixture.finishDispatch();
+        expect(
+          vi
+            .mocked(context.broadcast)
+            .mock.calls.slice(broadcastsAtStop)
+            .filter(
+              ([event, payload]) =>
+                event === "chat" &&
+                isRecord(payload) &&
+                payload.runId === sendParams.idempotencyKey &&
+                payload.state === "delta",
+            ),
+        ).toEqual([]);
+        expect(
+          context.chatRunState.runs.get(sendParams.idempotencyKey)?.releaseBufferAuthority,
+        ).toBeUndefined();
         return;
       }
       await wait(settled.promise);
       expect(consumed).toEqual([expect.stringContaining(sendParams.message)]);
       expect((await listSessionPendingInputs(scope)).total).toBe(0);
     } finally {
-      runs.detachActiveEmbeddedRun(scope.sessionId, handle);
-      runAuthority.releaseAgentRunDelegatedAuthority(authority);
+      releaseMedia.resolve();
       releaseDirect.resolve();
       releaseCleanup.resolve();
-      await command?.catch(() => {});
-      clearSessionQueues(
-        [scope.sessionKey],
-        captureSessionTarget({
-          storeScope: scope.storePath,
-          sessionKey: scope.sessionKey,
-          incarnation: scope.sessionId,
-          agentId: scope.agentId,
-        }),
-      );
-      await fixture.cleanup();
-      runtimeLoader.mockRestore();
+      try {
+        runs.detachActiveEmbeddedRun(scope.sessionId, handle);
+        runAuthority.releaseAgentRunDelegatedAuthority(authority);
+        await command?.catch(() => {});
+        clearSessionQueues(
+          [scope.sessionKey],
+          captureSessionTarget({
+            storeScope: scope.storePath,
+            sessionKey: scope.sessionKey,
+            incarnation: scope.sessionId,
+            agentId: scope.agentId,
+          }),
+        );
+        await stop?.catch(() => {});
+        await fixture.cleanup();
+      } finally {
+        mediaCapture?.mockRestore();
+        clearStoppedRun?.mockRestore();
+        runtimeLoader.mockRestore();
+      }
     }
   },
 );
+
+it("preserves direct pre-adoption rejection guidance instead of publishing queued cancellation", async ({
+  signal,
+}) => {
+  const fixture = await createFixture({ active: false, preserveContent: true });
+  const runId = "direct-admission-rejected-before-adoption";
+  fixture.params.idempotencyKey = runId;
+  const config = withFullRuntimeReplyConfig(fixture.context.getRuntimeConfig());
+  fixture.context.getRuntimeConfig = () => config;
+  const dispatchActual = await loadRealChatDispatch();
+  const dispatched = createDeferred();
+  const originalCreate = restartRecovery.createReplyAgentRestartRecoveryController;
+  const admissionFailure = createRestartRecoveryClaimChangedError();
+  let inputSignal: AbortSignal | undefined;
+  const rejectAdmission = vi
+    .spyOn(restartRecovery, "createReplyAgentRestartRecoveryController")
+    .mockImplementation((context) => {
+      const recovery = originalCreate(context);
+      if (context.opts?.runId !== runId) {
+        return recovery;
+      }
+      return {
+        ...recovery,
+        admitUserTurn: async () => {
+          throw admissionFailure;
+        },
+      };
+    });
+  runtime.execute.mockReset();
+  dispatchInboundMessageMock.mockImplementation(async (raw: unknown) => {
+    const params = raw as Parameters<typeof dispatchInboundMessage>[0];
+    inputSignal = params.replyOptions?.turnAdoptionLifecycle?.abortSignal;
+    try {
+      return await dispatchActual({ ...params, cfg: config });
+    } finally {
+      dispatched.resolve();
+    }
+  });
+  const guidance =
+    "⚠️ This conversation changed before your message could start. Check the latest messages, then try again if needed.";
+  try {
+    const ack = await fixture.send();
+    expect(ack.mock.calls[0]?.[1]).toMatchObject({ runId, status: "started" });
+    await withinTest(dispatched.promise, signal);
+    await fixture.finishDispatch();
+    expect(rejectAdmission).toHaveBeenCalledOnce();
+    expect(inputSignal?.aborted).toBe(false);
+    expect(runtime.execute).not.toHaveBeenCalled();
+    expect(fixture.context.dedupe.get(`chat:${runId}`)).toMatchObject({
+      ok: false,
+      payload: { runId, status: "error", summary: guidance },
+    });
+    expect(fixture.context.broadcast).not.toHaveBeenCalledWith(
+      "chat",
+      expect.objectContaining({ runId, state: "aborted" }),
+      expect.anything(),
+    );
+    const replay = await fixture.send();
+    expect(replay.mock.calls[0]?.[0]).toBe(false);
+    expect(replay.mock.calls[0]?.[1]).toMatchObject({ runId, status: "error", summary: guidance });
+    expect(dispatchInboundMessageMock).toHaveBeenCalledOnce();
+  } finally {
+    rejectAdmission.mockRestore();
+    await fixture.cleanup();
+  }
+});

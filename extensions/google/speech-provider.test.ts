@@ -5,6 +5,7 @@ import {
 } from "openclaw/plugin-sdk/provider-http-test-mocks";
 import type { SpeechSynthesisRequest } from "openclaw/plugin-sdk/speech-core";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { assertSupportedGoogleTtsModel, normalizeGoogleTtsModel } from "./speech-models.js";
 
 const transcode = vi.hoisted(() =>
   vi.fn<typeof import("openclaw/plugin-sdk/media-runtime").transcodeAudioBufferToOpus>(),
@@ -151,6 +152,17 @@ afterAll(() => {
 });
 
 describe("Google speech provider", () => {
+  it.each(["constructor", "toString", "__proto__", "hasOwnProperty"])(
+    "preserves prototype-like model IDs as strings: %s",
+    (model) => {
+      for (const input of [model, `google/${model}`]) {
+        const normalized = normalizeGoogleTtsModel(input);
+        expect(normalized).toBe(model);
+        expect(() => assertSupportedGoogleTtsModel(normalized)).not.toThrow();
+      }
+    },
+  );
+
   it("decodes URL-safe Gemini audio as WAV and preserves audio tags", async () => {
     const pcm = Buffer.from([0xfb, 0xff, 8, 0, 9, 0, 10, 0]);
     post.mockImplementation(async () => responseResult(audioResponse(pcm.toString("base64url"))));
@@ -398,6 +410,27 @@ describe("Google speech provider", () => {
     await expect(synthesize()).rejects.toBe(error);
     expect(result.release).toHaveBeenCalledOnce();
     expect(post).toHaveBeenCalledOnce();
+  });
+
+  it("redacts the active request credential from speech errors", async () => {
+    const credential = "fixture-google-speech-credential";
+    const actual = await vi.importActual<typeof import("openclaw/plugin-sdk/provider-http")>(
+      "openclaw/plugin-sdk/provider-http",
+    );
+    await assertOkOrThrowProviderErrorMock.withImplementation(
+      actual.assertOkOrThrowProviderError,
+      async () => {
+        post.mockResolvedValue(
+          responseResult(
+            Response.json({ error: { message: `Rejected ${credential}` } }, { status: 400 }),
+          ),
+        );
+        const failure = synthesize({ providerConfig: { apiKey: credential } });
+        await expect(failure).rejects.toMatchObject({ status: 400, statusCode: 400 });
+        await expect(failure).rejects.not.toThrow(credential);
+        expect(post).toHaveBeenCalledOnce();
+      },
+    );
   });
 
   it("sends Gemini 3.8 style as metadata and preserves the transcript verbatim", async () => {

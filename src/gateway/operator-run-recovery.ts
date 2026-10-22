@@ -13,6 +13,7 @@ import type { InternalSessionEntry } from "../config/sessions/types.js";
 import { getAgentEventLifecycleGeneration } from "../infra/agent-events.js";
 import { isPairedDeviceTokenIdentityCurrent } from "../infra/device-pairing-identity.js";
 import { loadPairedDevicePairingStoreRecordReadOnly } from "../infra/device-pairing-store-readonly.js";
+import { GatewayOperatorRecoveryAuthorizationError } from "../infra/restart-recovery-errors.js";
 import { onSessionIdentityMutation } from "../sessions/session-lifecycle-events.js";
 import { intersectOperatorScopes } from "../shared/operator-scope-compat.js";
 import { onUserProfilesChanged } from "../state/user-profile-events.js";
@@ -22,12 +23,16 @@ import {
   projectUserProfileDisplay,
   readResidentUserProfileRevision,
 } from "../state/user-profile-list.js";
-import { isGatewayAuthGrantCurrent } from "./auth-policy.js";
+import { captureGatewayAuthPolicy, isGatewayAuthGrantCurrent } from "./auth-policy.js";
+import type { GatewayAuthPolicy } from "./auth-policy.types.js";
 import {
   captureGatewayDeviceRevocation,
   onGatewayDeviceSourceRevoked,
 } from "./device-revocation.js";
-import { resumeGatewayOperatorAccessGrant } from "./operator-access-policy.js";
+import {
+  GatewayOperatorAccessDeniedError,
+  resumeGatewayOperatorAccessGrant,
+} from "./operator-access-policy.js";
 import {
   onOperatorRolePolicyChanged,
   resolveOperatorRolePolicyForAssignment,
@@ -37,6 +42,7 @@ import {
   sourceRolePolicy,
 } from "./operator-role-source-policy.js";
 import {
+  bindGatewayOperatorContinuationAuthority,
   captureChannelOperatorRunAuthority,
   intersectOperatorRunModelPolicy,
 } from "./operator-run-authority.js";
@@ -88,6 +94,8 @@ export function readGatewayOperatorRecoverySource(
 
 export type RestoredGatewayOperatorAuthority = {
   authority: AdmittedRunOperatorAuthority;
+  /** Original caller policy remains authoritative when its recovered execution is canceled. */
+  assertPolicyCurrent: () => void;
   authenticatedUserProfile: GatewayAuthenticatedUserProfile;
   controlUiAdmin: boolean;
   release: () => void;
@@ -113,14 +121,17 @@ async function restoreGatewayOperatorSnapshot(params: {
   const signal = new AbortController();
   const revoke = (cause?: unknown) =>
     signal.abort(
-      new Error("Restart recovery operator authority changed; start a new user turn.", { cause }),
+      cause instanceof GatewayOperatorRecoveryAuthorizationError
+        ? new GatewayOperatorRecoveryAuthorizationError(undefined, { cause })
+        : new Error("Restart recovery operator authority changed; start a new user turn.", {
+            cause,
+          }),
     );
-  const assertOwner = () => {
+  const assertLifetime = () => {
     if (references === 0) {
       throw new Error("Restart recovery operator authority is no longer active.");
     }
     signal.signal.throwIfAborted();
-    assertCurrent();
   };
   const subscriptions: Array<() => void> = [];
   if (params.subscribeToClaim) {
@@ -143,7 +154,8 @@ async function restoreGatewayOperatorSnapshot(params: {
   const release = releaseHold();
   try {
     const prepared = await params.prepareSource();
-    assertOwner();
+    assertLifetime();
+    assertCurrent();
     if (!prepared) {
       release();
       return undefined;
@@ -155,7 +167,11 @@ async function restoreGatewayOperatorSnapshot(params: {
         throw new Error("Restart recovery authentication owner changed; start a new user turn.");
       }
       subscriptions.push(
-        generationOwner.onInvalidated(snapshot.sharedGeneration, revoke, snapshot.authPolicy),
+        generationOwner.onInvalidated(
+          snapshot.sharedGeneration,
+          () => revoke(new GatewayOperatorRecoveryAuthorizationError()),
+          snapshot.authPolicy,
+        ),
       );
     }
     const device = captureGatewayDeviceRevocation(
@@ -168,8 +184,9 @@ async function restoreGatewayOperatorSnapshot(params: {
     if (releaseDeviceNotification) {
       subscriptions.push(releaseDeviceNotification);
     }
+    let authPolicy: GatewayAuthPolicy = snapshot.authPolicy;
     const assertSourcePolicy = () => {
-      assertOwner();
+      assertLifetime();
       const cfg = getConfig();
       const role = resolveOperatorRolePolicyForAssignment(
         snapshot.profileId,
@@ -179,20 +196,32 @@ async function restoreGatewayOperatorSnapshot(params: {
       );
       if (
         !device.isCurrent() ||
-        !isOperatorRoleSourcePolicyCurrent(
-          snapshot.rolePolicy,
-          sourceRolePolicy(role),
-          snapshot.scopes,
-        ) ||
-        !isGatewayAuthGrantCurrent(snapshot.authPolicy, cfg) ||
         (snapshot.sharedGeneration !== undefined &&
           context.sharedGatewaySessionGenerationState !== generationOwner)
       ) {
         throw new Error("Restart recovery operator source policy changed.");
       }
+      if (
+        !isOperatorRoleSourcePolicyCurrent(
+          snapshot.rolePolicy,
+          sourceRolePolicy(role),
+          snapshot.scopes,
+        ) ||
+        !isGatewayAuthGrantCurrent(authPolicy, cfg)
+      ) {
+        throw new GatewayOperatorRecoveryAuthorizationError(
+          "Restart recovery operator source policy changed.",
+        );
+      }
+      // Retain this config's issued policy only after validating the original grant.
+      authPolicy = captureGatewayAuthPolicy(cfg, authPolicy);
       return cfg;
     };
     let assertPolicy = assertSourcePolicy;
+    const assertRecoveryCurrent = () => {
+      assertCurrent();
+      return assertPolicy();
+    };
     const recheck = () => {
       if (references > 0 && !signal.signal.aborted) {
         try {
@@ -207,13 +236,13 @@ async function restoreGatewayOperatorSnapshot(params: {
     subscriptions.push(
       onOperatorRolePolicyChanged((change) => {
         if (change.kind === "assignment" && change.profileId === snapshot.profileId) {
-          revoke();
+          revoke(new GatewayOperatorRecoveryAuthorizationError());
         } else if (change.kind === "config" && change.context === gatewayOwner) {
           recheck();
         }
       }),
     );
-    assertSourcePolicy();
+    assertRecoveryCurrent();
     identity = await prepareUserProfileIdentity(snapshot.profileId);
     const profileIdentity = identity;
     let githubAccountIds: readonly number[] | undefined;
@@ -226,7 +255,9 @@ async function restoreGatewayOperatorSnapshot(params: {
         (profile.githubLogin ?? null) !== snapshot.githubLogin ||
         githubAccountIds?.some((accountId) => !profile.githubAccountIds?.includes(accountId))
       ) {
-        throw new Error("Restart recovery operator identity changed.");
+        throw new GatewayOperatorRecoveryAuthorizationError(
+          "Restart recovery operator identity changed.",
+        );
       }
       githubAccountIds ??= profile.githubAccountIds ?? [];
       return { cfg, profile };
@@ -252,24 +283,30 @@ async function restoreGatewayOperatorSnapshot(params: {
         // A policy callback can change committed identity/config synchronously.
         return assertFacts().cfg;
       } catch (error) {
-        revoke(error);
-        throw error;
+        const failure =
+          signal.signal.reason instanceof GatewayOperatorRecoveryAuthorizationError
+            ? signal.signal.reason
+            : error instanceof GatewayOperatorAccessDeniedError
+              ? new GatewayOperatorRecoveryAuthorizationError(error.message, { cause: error })
+              : error;
+        revoke(failure);
+        throw failure;
       }
     };
     subscriptions.push(onUserProfilesChanged(recheck));
-    assertPolicy();
+    assertRecoveryCurrent();
     if (snapshot.device) {
       const paired = await loadPairedDevicePairingStoreRecordReadOnly(snapshot.device.deviceId);
       if (
         !isPairedDeviceTokenIdentityCurrent(paired, "operator", snapshot.device, snapshot.scopes)
       ) {
-        revoke();
+        revoke(new GatewayOperatorRecoveryAuthorizationError());
       }
     }
-    assertPolicy();
+    assertRecoveryCurrent();
     await prepared.revalidate();
-    assertPolicy();
-    const assertRestoredPolicy = Object.assign(assertPolicy, {
+    assertRecoveryCurrent();
+    const assertRestoredPolicy = Object.assign(assertRecoveryCurrent, {
       onSessionCompactionCommitted: prepared.onSessionCompactionCommitted
         ? (
             ...args: Parameters<NonNullable<SessionSourceAssertion["onSessionCompactionCommitted"]>>
@@ -295,25 +332,38 @@ async function restoreGatewayOperatorSnapshot(params: {
       scopes: snapshot.scopes,
       gatewayAccessGrant: snapshot.grant,
       getRuntimeConfig: getConfig,
-      assertCurrent: assertRestoredPolicy,
+      assertCurrent: assertPolicy,
       signal: signal.signal,
     });
     const originalModels = snapshot.modelPolicy
       ? restoreOperatorModelPolicySnapshot(snapshot.modelPolicy)
       : undefined;
-    const authority = createAdmittedRunOperatorAuthority({
+    const retainPolicy = () => {
+      assertPolicy();
+      references += 1;
+      return releaseHold();
+    };
+    const policyAuthority = createAdmittedRunOperatorAuthority({
       ...live,
       signal: signal.signal,
       recoverySnapshot: snapshot,
-      retain: () => {
-        assertPolicy();
-        references += 1;
-        return releaseHold();
-      },
+      retain: retainPolicy,
       get modelPolicy() {
         return intersectOperatorRunModelPolicy(originalModels, live.modelPolicy);
       },
     });
+    const authority = createAdmittedRunOperatorAuthority({
+      ...policyAuthority,
+      assertCurrent: assertRestoredPolicy,
+      retain: () => {
+        assertCurrent();
+        return retainPolicy();
+      },
+      get modelPolicy() {
+        return policyAuthority.modelPolicy;
+      },
+    });
+    bindGatewayOperatorContinuationAuthority(authority, policyAuthority);
     authority.assertCurrent();
     const profile = readResidentUserProfileRevision(snapshot.profileId, profileCatalogPath({}));
     if (!profile) {
@@ -322,6 +372,9 @@ async function restoreGatewayOperatorSnapshot(params: {
     const { id, ...display } = projectUserProfileDisplay(profile);
     return {
       authority,
+      assertPolicyCurrent: () => {
+        assertPolicy();
+      },
       authenticatedUserProfile: { profileId: id, ...display, updatedAt: profile.updated_at },
       controlUiAdmin: snapshot.controlUiAdmin,
       release,

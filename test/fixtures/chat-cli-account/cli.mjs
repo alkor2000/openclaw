@@ -6,7 +6,9 @@ if (process.argv.includes("--version")) {
   process.exit(0);
 }
 const receipt = process.env.OPENCLAW_CHAT_AUTH_PROOF_RECEIPT;
-if (!receipt) throw new Error("Task-owned receipt path missing");
+if (!receipt) {
+  throw new Error("Task-owned receipt path missing");
+}
 await appendFile(receipt, JSON.stringify({ kind: "launch", runtime: "node-fixture" }) + "\n");
 process.stdout.write(
   JSON.stringify({

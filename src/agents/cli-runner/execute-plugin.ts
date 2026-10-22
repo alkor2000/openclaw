@@ -20,6 +20,7 @@ import type {
   CliBackendUserInputResult,
 } from "../../plugins/cli-backend.types.js";
 import type { RunExit, TerminationReason } from "../../process/supervisor/types.js";
+import { assertionSucceeds } from "../../shared/assertion.js";
 import { runWithAgentToolSourceExecutionScope } from "../agent-tool-source-execution-guard.js";
 import {
   recordAdjustedParamsForToolCall,
@@ -44,7 +45,7 @@ import {
 } from "./cli-native-tool-approval.js";
 import { createCliAbortError } from "./execute-node-claude.js";
 import { closePluginIterator, waitForIteratorValue } from "./execute-plugin-iterator.js";
-import { createCliPluginWatchdog, type CliWatchdogClock } from "./execute-plugin-watchdog.js";
+import { createCliPluginWatchdog } from "./execute-plugin-watchdog.js";
 import { createSteeredCliMessageInjection } from "./execute-plugin.steered-transcript.js";
 import { attachCliReplyBackend, createCliRunCurrentAssertion } from "./execution-target.js";
 import { createCliFailoverError as failover } from "./exit-error.js";
@@ -336,14 +337,7 @@ function createPluginUserInputHandler(params: {
             onPartialReply: run.onPartialReply,
           },
           signal,
-          isActive: () => {
-            try {
-              assertQuestionActive();
-              return true;
-            } catch {
-              return false;
-            }
-          },
+          isActive: () => assertionSucceeds(assertQuestionActive),
           questionId: request.toolCallId ? (batch) => `${request.toolCallId}:${batch}` : undefined,
         }),
       );
@@ -384,14 +378,13 @@ export async function executePluginOwnedProcess(params: {
   forceNewSession?: boolean;
   sessionId?: string;
   noOutputTimeoutMs: number;
-  watchdogClock?: CliWatchdogClock;
   consumeStdout: (chunk: string) => void;
   onOutstandingWorkChange?: (active: boolean) => void;
   activeToolCount?: () => number;
   compactionActive?: () => boolean;
-  onCompactionActiveChange?: (listener: () => void) => () => void;
+  setOnCompactionActiveChange?: (listener: (() => void) | undefined) => void;
   getActiveLoopbackAskUserDeadline?: () => number | undefined;
-  onActiveLoopbackAskUserDeadlineChange?: (listener: () => void) => () => void;
+  setOnActiveLoopbackAskUserDeadlineChange?: (listener: (() => void) | undefined) => void;
   onNoOutputTimeout?: (error: FailoverError) => void;
   onInterrupted?: (reason: CliTerminalInterruption["reason"]) => boolean;
   mcpCapture?: {
@@ -460,8 +453,6 @@ export async function executePluginOwnedProcess(params: {
     reportOutstandingWork();
   };
   let watchdog: ReturnType<typeof createCliPluginWatchdog> | undefined;
-  let stopAskUserDeadlineListener: (() => void) | undefined;
-  let stopCompactionWorkListener: (() => void) | undefined;
 
   let messageInjection: CliBackendMessageInjection | undefined;
   const detachReplyBackend = attachCliReplyBackend(
@@ -498,37 +489,32 @@ export async function executePluginOwnedProcess(params: {
       createCliAbortError,
     );
     assertCurrent();
-    watchdog = createCliPluginWatchdog(
-      {
-        provider: run.provider,
-        model: params.context.modelId,
-        sessionId: run.sessionId,
-        lane: run.lane,
-        overallTimeoutMs: clampPositiveTimerTimeoutMs(run.timeoutMs),
-        noOutputTimeoutMs: clampPositiveTimerTimeoutMs(params.noOutputTimeoutMs),
-        useResume: params.useResume,
-        getActiveAskUserDeadline: params.getActiveLoopbackAskUserDeadline,
-        activeToolCount: () => Math.max(params.activeToolCount?.() ?? 0, outstanding.approvals),
-        backgroundTaskCount: () => outstanding.background,
-        compactionActive: () => params.compactionActive?.() ?? false,
-        hasObservedActivity: () => outstanding.observed,
-        hasReplayUnsafeActivity: () => outstanding.replayUnsafe,
-        onNoOutputTimeout: (error) => {
-          termination.reason = "no-output-timeout";
-          params.onNoOutputTimeout?.(error);
-          controller.abort(error);
-        },
-        onOverallTimeout: () => {
-          termination.reason = "overall-timeout";
-          controller.abort(new Error("CLI plugin runtime exceeded its execution timeout."));
-        },
+    watchdog = createCliPluginWatchdog({
+      provider: run.provider,
+      model: params.context.modelId,
+      sessionId: run.sessionId,
+      lane: run.lane,
+      overallTimeoutMs: clampPositiveTimerTimeoutMs(run.timeoutMs),
+      noOutputTimeoutMs: clampPositiveTimerTimeoutMs(params.noOutputTimeoutMs),
+      useResume: params.useResume,
+      getActiveAskUserDeadline: params.getActiveLoopbackAskUserDeadline,
+      activeToolCount: () => Math.max(params.activeToolCount?.() ?? 0, outstanding.approvals),
+      backgroundTaskCount: () => outstanding.background,
+      compactionActive: () => params.compactionActive?.() ?? false,
+      hasObservedActivity: () => outstanding.observed,
+      hasReplayUnsafeActivity: () => outstanding.replayUnsafe,
+      onNoOutputTimeout: (error) => {
+        termination.reason = "no-output-timeout";
+        params.onNoOutputTimeout?.(error);
+        controller.abort(error);
       },
-      params.watchdogClock,
-    );
-    stopAskUserDeadlineListener = params.onActiveLoopbackAskUserDeadlineChange?.(() =>
-      watchdog?.reset(),
-    );
-    stopCompactionWorkListener = params.onCompactionActiveChange?.(() => reportOutstandingWork());
+      onOverallTimeout: () => {
+        termination.reason = "overall-timeout";
+        controller.abort(new Error("CLI plugin runtime exceeded its execution timeout."));
+      },
+    });
+    params.setOnActiveLoopbackAskUserDeadlineChange?.(() => watchdog?.reset());
+    params.setOnCompactionActiveChange?.(() => reportOutstandingWork());
 
     watchdog.reset();
     if (
@@ -558,9 +544,10 @@ export async function executePluginOwnedProcess(params: {
     } else {
       params.mcpCapture?.beginCapture(params.mcpCapture.captureKey, assertCaptureCurrent);
     }
+    const historyWriter = params.context.cliHistoryWriter;
     const prepareExecutionAdmission = async () => {
       assertCurrent();
-      await params.context.cliHistoryWriter?.assertReadable();
+      await historyWriter?.assertReadable();
       await prepareRuntimeAuthProfileExecution(run, assertCurrent);
       assertCurrent();
     };
@@ -581,6 +568,14 @@ export async function executePluginOwnedProcess(params: {
         abortSignal: signal,
         assertCurrent,
         prepareExecutionAdmission,
+        // Host-internal: native login can change after preparation, so the
+        // bundled runtime checks again where saved context leaves the host.
+        ...(historyWriter?.bindsNativeLogin
+          ? {
+              assertPrivateInputCurrent: () =>
+                historyWriter.checkNativeLoginBoundary(historyWriter.replaysHistory),
+            }
+          : {}),
         timeoutMs: run.timeoutMs,
         ...(run.executionMode ? { executionMode: run.executionMode } : {}),
         ...(run.cliToolAvailability ? { toolAvailability: run.cliToolAvailability } : {}),
@@ -694,8 +689,8 @@ export async function executePluginOwnedProcess(params: {
   } finally {
     params.mcpCapture?.registerTurnInterrupt?.(undefined);
     watchdog?.dispose();
-    stopAskUserDeadlineListener?.();
-    stopCompactionWorkListener?.();
+    params.setOnActiveLoopbackAskUserDeadlineChange?.(undefined);
+    params.setOnCompactionActiveChange?.(undefined);
     params.onOutstandingWorkChange?.(false);
     // Permission callbacks can be retained by the plugin or its subprocess.
     // Closing the turn fences those capabilities before any outer cleanup runs.

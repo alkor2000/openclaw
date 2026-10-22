@@ -32,6 +32,7 @@ import { recordSessionToolActionFact } from "./sessions-access.js";
 import { sendReplyResult } from "./sessions-send-helpers.js";
 import { runSessionsSendA2AFlow } from "./sessions-send-tool.a2a.js";
 import type { SessionsSendStart } from "./sessions-send-tool.delivery.js";
+import type { AgentStepSession } from "./sessions-send-tool.types.js";
 import { jsonResult } from "./tool-results.js";
 const log = createSubsystemLogger("agents/sessions-send");
 
@@ -225,12 +226,15 @@ export function prepareSessionsSendReplyContext(params: {
   isIsolatedCronRequester: boolean;
   targetIsSubagent: boolean;
   requesterSessionKey: string;
-  targetSession: Parameters<typeof isRequesterParentOfBackgroundAcpSession>[0];
+  targetSession:
+    | (NonNullable<Parameters<typeof isRequesterParentOfBackgroundAcpSession>[0]> &
+        AgentStepSession)
+    | undefined;
   requesterTarget: GatewaySessionStoreTargetWithStore;
   requesterSessionId?: string;
   context: Omit<
     SessionsSendReplyContext,
-    "replyMode" | "requesterSession" | "requesterDeliveryGeneration"
+    "replyMode" | "requesterSession" | "requesterDeliveryGeneration" | "targetSession"
   >;
 }): SessionsSendReplyContext {
   const caller = getGatewayToolCallerIdentity();
@@ -270,6 +274,12 @@ export function prepareSessionsSendReplyContext(params: {
     requester,
     requesterSession,
     requesterDeliveryGeneration,
+    targetSession: params.targetSession
+      ? {
+          sessionId: params.targetSession.sessionId,
+          lifecycleRevision: params.targetSession.lifecycleRevision,
+        }
+      : undefined,
     replyMode: taskOwned ? undefined : params.targetIsSubagent ? "one-way" : "peer",
   };
 }
@@ -362,11 +372,14 @@ export async function finishSessionsSendReply(params: {
       completion,
       skip: registryCompletion || delayedDelivery.status === "skipped",
       targetSessionKey: acceptedTargetSessionKey,
+      targetSession: start.a2aSession ?? replyContext.targetSession,
+      replyAdmission: start.replyAdmission,
       displayKey: start.a2aSessionKey ?? replyContext.displayKey,
       notifyRequesterOnWaitFailure: notifyRequesterOnWaitFailure && !isIsolatedCronRequester,
     });
   const result =
-    timeoutSeconds === 0
+    // An active turn has no final-response identity correlated to this accepted input.
+    timeoutSeconds === 0 || start.targetDisposition === "steered"
       ? undefined
       : completion
         ? await completion.take(timeoutMs)

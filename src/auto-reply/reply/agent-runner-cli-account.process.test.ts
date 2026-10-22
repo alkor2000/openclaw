@@ -23,6 +23,7 @@ import {
   patchSessionEntryCore,
 } from "../../config/sessions/session-accessor.js";
 import { readSessionEntryInWorker } from "../../config/sessions/session-entry-read-runtime.js";
+import { admitScheduledOccurrence } from "../../cron/execution-context-admission.js";
 import { executeCronRun } from "../../cron/isolated-agent/run-executor.js";
 import { prepareCronRunContext } from "../../cron/isolated-agent/run-prepare.js";
 import type { CronStoredJob } from "../../cron/types.js";
@@ -64,6 +65,7 @@ const SELF_FIXTURE_CLI_SOURCE = fileURLToPath(
 
 const CONFIGURED_PROFILE = "anthropic:configured-fixture";
 const CLI_PROFILE = "google:cli-fixture";
+const OTHER_CLI_PROFILE = "google:other-fixture";
 const runtime = "google-gemini-cli";
 const model = "fixture-model";
 const noActivity = async () => {};
@@ -73,18 +75,35 @@ const fixtureBackends = resolveGlobalMap<string, CliBackendPlugin[]>(
 
 // Chat/event barriers retain an unchanged positive control; scheduled runs keep their account gate.
 it.each([
-  { kind: "chat", stage: "placement", pin: null },
-  { kind: "chat", stage: "placement", pin: "user" },
-  { kind: "chat", stage: "placement", pin: "user-link" },
-  { kind: "chat", stage: "before-execution", pin: null },
-  { kind: "chat", stage: "before-execution", pin: "user" },
-  { kind: "chat", stage: "before-execution", pin: "user-link" },
-  { kind: "cron-event", stage: "before-execution", pin: null },
-  { kind: "cron-event", stage: "before-execution", pin: "user-link" },
-  { kind: "scheduled-cron", stage: "account-admission", pin: null },
+  { kind: "chat", stage: "placement", pin: null, accountScope: "cross-provider" },
+  { kind: "chat", stage: "placement", pin: "user", accountScope: "cross-provider" },
+  { kind: "chat", stage: "placement", pin: "user-link", accountScope: "cross-provider" },
+  { kind: "chat", stage: "before-execution", pin: null, accountScope: "cross-provider" },
+  { kind: "chat", stage: "before-execution", pin: "user", accountScope: "cross-provider" },
+  { kind: "chat", stage: "before-execution", pin: "user-link", accountScope: "cross-provider" },
+  { kind: "cron-event", stage: "before-execution", pin: null, accountScope: "cross-provider" },
+  {
+    kind: "cron-event",
+    stage: "before-execution",
+    pin: "user-link",
+    accountScope: "cross-provider",
+  },
+  { kind: "scheduled-cron", stage: "account-admission", pin: null, accountScope: "cross-provider" },
+  { kind: "chat", stage: "placement", pin: "user", accountScope: "same-provider" },
+  { kind: "chat", stage: "placement", pin: "user-link", accountScope: "same-provider" },
+  { kind: "chat", stage: "placement", pin: "user", accountScope: "selected-profile" },
 ] as const)(
-  "protects $kind $pin intent at $stage before actual CLI launch",
-  async ({ kind, stage, pin }) => {
+  "protects $kind $pin intent at $stage ($accountScope) before actual CLI launch",
+  async ({ kind, stage, pin, accountScope }) => {
+    const configuredProvider = accountScope === "cross-provider" ? "anthropic" : "google";
+    const configuredModel = accountScope === "cross-provider" ? "primary-fixture" : model;
+    const configuredProfile = accountScope === "cross-provider" ? CONFIGURED_PROFILE : CLI_PROFILE;
+    const replacementPin =
+      accountScope === "cross-provider"
+        ? CONFIGURED_PROFILE
+        : accountScope === "same-provider"
+          ? OTHER_CLI_PROFILE
+          : CLI_PROFILE;
     await withOpenClawTestState({ label: "chat-cli-account-process" }, async (state) => {
       const previousRegistry = captureActivePluginRegistrySnapshot();
       const entered = createDeferred();
@@ -127,7 +146,7 @@ it.each([
           defaults: {
             workspace: state.workspaceDir,
             model: {
-              primary: `anthropic/primary-fixture@${CONFIGURED_PROFILE}`,
+              primary: `${configuredProvider}/${configuredModel}@${configuredProfile}`,
               fallbacks: [`google/${model}`],
             },
             models: {
@@ -174,6 +193,7 @@ it.each([
           profiles: {
             [CONFIGURED_PROFILE]: { provider: "anthropic", mode: "api_key" as const },
             [CLI_PROFILE]: { provider: "google", mode: "api_key" as const },
+            [OTHER_CLI_PROFILE]: { provider: "google", mode: "api_key" as const },
           },
           order: { google: [CLI_PROFILE], anthropic: [CONFIGURED_PROFILE] },
         },
@@ -191,6 +211,11 @@ it.each([
               key: "synthetic-anthropic-key",
             },
             [CLI_PROFILE]: { type: "api_key", provider: "google", key: "synthetic-google-key" },
+            [OTHER_CLI_PROFILE]: {
+              type: "api_key",
+              provider: "google",
+              key: "synthetic-other-key",
+            },
           },
         },
         agentDir,
@@ -231,6 +256,7 @@ it.each([
         | Parameters<Parameters<typeof executeCronRun>[0]["onPromptAdmission"]>[0]
         | undefined;
       let cronWinner: string | undefined;
+      let cronOccurrence: Awaited<ReturnType<typeof admitScheduledOccurrence>> | undefined;
       try {
         const api = builder.createApi(record, { config: cfg, registrationMode: "full" });
         let capturedAuthProfile: string | undefined;
@@ -354,9 +380,9 @@ it.each([
                   sessionFile: path.join(state.root, "logical-session.jsonl"),
                   workspaceDir: state.workspaceDir,
                   config: cfg,
-                  provider: "anthropic",
-                  model: "primary-fixture",
-                  authProfileId: CONFIGURED_PROFILE,
+                  provider: configuredProvider,
+                  model: configuredModel,
+                  authProfileId: configuredProfile,
                   authProfileIdSource: "user",
                   blockReplyBreak: "message_end",
                   timeoutMs: 10_000,
@@ -368,8 +394,8 @@ it.each([
               // an auth-selector or fallback result. Outer selection is outside this boundary.
               const selection = await resolveSessionAuthSelection({
                 cfg,
-                provider: "anthropic",
-                modelId: "primary-fixture",
+                provider: configuredProvider,
+                modelId: configuredModel,
                 agentId: "main",
                 agentDir,
                 sessionEntry: entry,
@@ -377,7 +403,7 @@ it.each([
                 storePath: target.storePath,
                 isNewSession: false,
               });
-              expect(selection?.profileId).toBe(CONFIGURED_PROFILE);
+              expect(selection?.profileId).toBe(configuredProfile);
               followupRun.run.authProfileId = selection?.profileId;
               followupRun.run.authProfileIdSource = selection?.source;
               bindConfiguredModelAuthProfileScope(
@@ -421,12 +447,13 @@ it.each([
                 agentDir,
                 workspaceDir: state.workspaceDir,
               });
+              let agentRunStarted = false;
               const common: AgentFallbackCandidateCommonParams = {
                 agentHarnessRuntimeOverride: undefined,
                 assistantErrorTranscript: createAssistantErrorTranscript(),
                 modelRoutingProvenance: {
-                  requestedProvider: "anthropic",
-                  requestedModel: "primary-fixture",
+                  requestedProvider: configuredProvider,
+                  requestedModel: configuredModel,
                   stage: "fallback",
                   fallbackReason: "timeout",
                 },
@@ -451,7 +478,10 @@ it.each([
                 currentTurnImages: { images: [] },
                 signalExecutionPhaseForTyping: () => {},
                 prepareAgentRunStart: () => {},
-                notifyAgentRunStart: () => {},
+                notifyAgentRunStart: () => {
+                  agentRunStarted = true;
+                },
+                hasAgentRunStarted: () => agentRunStarted,
                 preserveProgressCallbackStartOrder: false,
                 presentation: createAgentTurnPresentation({
                   turn,
@@ -511,7 +541,14 @@ it.each([
             createdActor: { type: "system" },
           };
           const cancel = new AbortController();
+          cronOccurrence = await admitScheduledOccurrence({
+            cfg,
+            job,
+            agentId: "main",
+            trigger: kind === "cron-event" ? "event" : "cron",
+          });
           const input = {
+            occurrence: cronOccurrence,
             cfg,
             deps: createDefaultDeps(),
             job,
@@ -574,6 +611,7 @@ it.each([
                       withAgentRunLifecycleGeneration(generation, () =>
                         executeCronRun({
                           ...ctx,
+                          occurrence: input.occurrence,
                           cfg,
                           job,
                           trigger: input.trigger,
@@ -665,7 +703,7 @@ it.each([
             current
               ? {
                   ...current,
-                  authProfileOverride: CONFIGURED_PROFILE,
+                  authProfileOverride: replacementPin,
                   authProfileOverrideSource: pin,
                   authProfileOverrideCompactionCount: undefined,
                 }
@@ -678,7 +716,7 @@ it.each([
           expect(persisted).toMatchObject({
             sessionId: entry.sessionId,
             lifecycleRevision: barrierEntry?.lifecycleRevision,
-            authProfileOverride: CONFIGURED_PROFILE,
+            authProfileOverride: replacementPin,
             authProfileOverrideSource: pin,
           });
         }
@@ -688,7 +726,7 @@ it.each([
           (error: unknown) => ({ ok: false as const, error }),
         );
         const launches = await readLaunches();
-        if (pin) {
+        if (pin && accountScope !== "selected-profile") {
           const refusal = outcome.ok
             ? outcome.value.meta.error?.message
             : formatErrorMessage(outcome.error);
@@ -698,6 +736,12 @@ it.each([
           expect
             .soft(launches, "same-revision pin change must prevent actual Node child launch")
             .toHaveLength(0);
+          if (accountScope === "same-provider") {
+            expect(outcome.ok).toBe(false);
+            if (!outcome.ok) {
+              expect(hasRecordedModelFallbackStop(outcome.error)).toBe(true);
+            }
+          }
         } else {
           if (!outcome.ok) {
             throw outcome.error;
@@ -719,6 +763,7 @@ it.each([
         release.resolve();
         await Promise.allSettled([run]);
         await cronPromptAdmission?.finish();
+        cronOccurrence?.release();
         await deferredLifecycle?.complete();
         preparedRunAdmission?.close();
         uninstallPlacement?.();

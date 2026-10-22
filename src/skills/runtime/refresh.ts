@@ -1,11 +1,14 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import path from "node:path";
 import { getAgentWorkspaceAccess } from "../../agents/workspace-access.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { observeOwnedDirectory } from "../../infra/owned-directory-observation.js";
+import { isPathInside } from "../../infra/path-guards.js";
 import { runtimeProcessEntrypoints } from "../../infra/runtime-process-entrypoints.js";
 import { resolveRuntimeWorkerUrl } from "../../infra/runtime-worker-url.js";
 import { WorkerTaskPool } from "../../infra/worker-task-pool.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
+import type { PluginMetadataSnapshot } from "../../plugins/plugin-metadata-snapshot.types.js";
 import { resolveGlobalSingleton } from "../../shared/global-singleton.js";
 import type { readWorkspaceSkillStatusFacts } from "../discovery/status-files.js";
 import { resolveSkillDiscoveryLimits } from "../loading/skill-root-discovery.js";
@@ -104,6 +107,14 @@ function observeSource(source: Source) {
   }
   for (const directory of directories) {
     if (!source.observations.has(directory)) {
+      // Windows cannot rename a workspace while a watch holds a descendant directory.
+      // One recursive workspace handle still reports edits in each selected subtree.
+      const watchRoot =
+        process.platform === "win32"
+          ? ([source.workspaceDir, source.selection.request.executionWorkspaceDir]
+              .filter((root): root is string => Boolean(root && isPathInside(root, directory)))
+              .toSorted((a, b) => a.length - b.length)[0] ?? path.dirname(directory))
+          : undefined;
       source.observations.set(
         directory,
         observeOwnedDirectory(
@@ -119,7 +130,7 @@ function observeSource(source: Source) {
               }, 50).unref(),
             );
           },
-          { recursive: true, reconcileIntervalMs: SAFETY_REFRESH_MS },
+          { recursive: true, reconcileIntervalMs: SAFETY_REFRESH_MS, watchRoot },
         ),
       );
     }
@@ -227,7 +238,6 @@ function scanDirtySources(): Promise<void> {
       for (const source of recovered) {
         notifySkillsWatchAvailable({
           workspaceDir: source.workspaceDir,
-          sourceScope: { executionWorkspaceDir: source.selection.request.executionWorkspaceDir },
         });
       }
     }
@@ -458,6 +468,7 @@ export async function refreshSkillsDiscovery(
   params: {
     workspaceDir?: string;
     config?: OpenClawConfig;
+    pluginMetadataSnapshot?: PluginMetadataSnapshot;
     reason?: "manual" | "workshop" | "config-change";
   } = {},
 ): Promise<void> {
@@ -478,6 +489,7 @@ export async function refreshSkillsDiscovery(
           registerSkillsWatcher({
             workspaceDir: resolveAgentWorkspaceDir(params.config!, agentId),
             config: params.config,
+            pluginMetadataSnapshot: params.pluginMetadataSnapshot,
             agentId,
           }),
         ),
@@ -487,7 +499,10 @@ export async function refreshSkillsDiscovery(
     }
   } else {
     if (!state.sources.size && params.workspaceDir) {
-      await registerSkillsWatcher({ workspaceDir: params.workspaceDir });
+      await registerSkillsWatcher({
+        workspaceDir: params.workspaceDir,
+        pluginMetadataSnapshot: params.pluginMetadataSnapshot,
+      });
     }
     await scanDirtySources();
   }

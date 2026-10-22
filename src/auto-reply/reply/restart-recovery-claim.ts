@@ -6,6 +6,7 @@ import { captureRequesterOrigin } from "../../agents/requester-origin.js";
 import { createRestartRecoveryRequesterSource } from "../../agents/requester-run-recovery-source.js";
 import {
   buildRestartRecoveryClaimCleanupPatch,
+  canReplaceAbortedRestartRecoveryClaim,
   getRestartRecoveryPendingFinalSourceRunId,
   hasRestartRecoverySourceClaim,
   hasRestartRecoveryTerminalRun,
@@ -41,7 +42,7 @@ import {
   createRestartRecoveryClaimChangedError,
   isAgentRunStaleLifecycleError,
 } from "../../infra/agent-lifecycle-error.js";
-import { SqliteWorkerError } from "../../infra/sqlite-worker-contract.js";
+import { wrapSqliteWorkerError } from "../../infra/sqlite-worker-contract.js";
 import { isMainSessionRestartRecoveryInputProvenance } from "../../sessions/input-provenance.js";
 import type { AgentTurnRestartClaimCleanup } from "./agent-runner-completion.types.js";
 import type {
@@ -74,9 +75,7 @@ export function createReplyRestartRecoveryClaimController(
   let confirmedArmed = false;
   let sessionActor: SessionActor | undefined;
   let readTarget: SessionEntryTargetPatchScope | undefined;
-  const recordReadTarget = (target: SessionEntryTargetPatchScope) => {
-    readTarget ??= target;
-  };
+  const recordReadTarget = (target: SessionEntryTargetPatchScope) => (readTarget ??= target);
   const preparedTarget = () => {
     if (!readTarget) {
       throw new Error("Restart recovery claim has no admitted session target");
@@ -241,7 +240,7 @@ export function createReplyRestartRecoveryClaimController(
       return committed;
     }
     if (outcome.kind === "unknown") {
-      throw new SqliteWorkerError(outcome.error.message, "outcome-unknown");
+      throw wrapSqliteWorkerError(outcome.error.message, "outcome-unknown", outcome.error);
     }
     options.rolledBack?.();
     if (authorityFailure) {
@@ -445,6 +444,7 @@ export function createReplyRestartRecoveryClaimController(
             sessionKey: params.sessionKey,
             sourceRunId: recoveryRunId,
             inputProvenance: params.inputProvenance,
+            requesterOrigin,
           })
         : undefined;
     if (
@@ -457,20 +457,14 @@ export function createReplyRestartRecoveryClaimController(
       return "admitted";
     }
     const updatedAt = Date.now();
-    const canTransferAbortedControlUiClaim = Boolean(
-      admissionRunId &&
-      activeClaimRunId &&
-      admissionRunId !== activeClaimRunId &&
-      entry.abortedLastRun === true &&
-      (entry.status === undefined || entry.status === "interrupted") &&
-      entry.pendingFinalDelivery === undefined &&
-      entry.restartRecoveryBeforeAgentReplyState === undefined &&
-      entry.restartRecoveryDeliveryReceiptState === undefined &&
-      entry.restartRecoverySourceIngress === "control-ui",
+    const canReplaceAbortedClaim = canReplaceAbortedRestartRecoveryClaim(
+      entry,
+      params.sessionKey,
+      admissionRunId,
     );
     if (
       activeClaimRunId &&
-      !canTransferAbortedControlUiClaim &&
+      !canReplaceAbortedClaim &&
       (entry.abortedLastRun === true ||
         !isTerminalSessionStatus(entry.status) ||
         entry.status === "interrupted" ||
@@ -485,10 +479,10 @@ export function createReplyRestartRecoveryClaimController(
           terminalSourceRunId: normalizeOptionalString(entry.restartRecoveryDeliverySourceRunId),
         })
       : {};
-    const transfersControlUiClaim = canTransferAbortedControlUiClaim && !recoverableDeliveryContext;
-    const hasDeliveryClaim = Boolean(
-      recoverableDeliveryContext || transfersControlUiClaim || operatorSource,
-    );
+    const transfersControlUiClaim =
+      canReplaceAbortedClaim &&
+      entry.restartRecoverySourceIngress === "control-ui" &&
+      !recoverableDeliveryContext;
     const claimSourceRunId =
       transfersControlUiClaim || operatorSource
         ? recoveryRunId
@@ -506,7 +500,10 @@ export function createReplyRestartRecoveryClaimController(
       restartRecoveryDeliveryToolCallId: undefined,
       restartRecoveryDeliveryContext: recoverableDeliveryContext,
       restartRecoveryDeliveryRequestFingerprint: undefined,
-      restartRecoveryDeliveryRunId: hasDeliveryClaim ? recoveryRunId : undefined,
+      restartRecoveryDeliveryRunId:
+        recoverableDeliveryContext || transfersControlUiClaim || operatorSource
+          ? recoveryRunId
+          : undefined,
       restartRecoveryOperatorSource: operatorSource,
       restartRecoveryRequesterSource: claimSourceRunId
         ? createRestartRecoveryRequesterSource({
@@ -530,7 +527,9 @@ export function createReplyRestartRecoveryClaimController(
         ? "channel"
         : transfersControlUiClaim
           ? "control-ui"
-          : operatorSource?.snapshot.sourceIngress,
+          : operatorSource && params.inputProvenance?.kind === "inter_session"
+            ? "internal"
+            : operatorSource?.snapshot.sourceIngress,
       restartRecoverySourceReplyDeliveryMode: transfersControlUiClaim
         ? undefined
         : params.sourceReplyDeliveryMode,

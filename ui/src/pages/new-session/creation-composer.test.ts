@@ -1,8 +1,13 @@
 import { expectDefined } from "@openclaw/normalization-core";
-import { createComponent, createSignal, flush } from "solid-js";
+import { createComponent, createEffect, createSignal, flush, useContext } from "solid-js";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { createDeferred } from "../../../../test/helpers/promise.ts";
 import { canReloadControlUiDocument } from "../../app/document-reload-guard.ts";
+import {
+  SessionBackgroundLayoutContext,
+  SessionBackgroundLayoutScope,
+} from "../../components/session-background-layout-context.tsx";
+import { createBackgroundFadeLayout } from "../../components/session-background-layout.ts";
 import type { SessionCreateOutcome } from "../../lib/sessions/create.ts";
 import { createTestGatewayClient } from "../../test-helpers/gateway-client.ts";
 import { mountSolid } from "../../test-helpers/mount-solid.ts";
@@ -42,35 +47,67 @@ afterEach(() => {
 });
 
 describe("creation-owned follow-up input", () => {
-  it("replaces the native input owner when another creation becomes visible", () => {
+  it("replaces the input owner and keeps its background fade through replacement and removal", () => {
     const { context, composer } = fixture();
     const next = new CreationComposer(context, "main", false, vi.fn());
     onTestFinished(() => next.dispose());
     composer.setMessage("first creation");
     next.setMessage("next creation");
-    const [current, setCurrent] = createSignal(composer);
+    const [current, setCurrent] = createSignal<CreationComposer | undefined>(composer);
+    let inputTop = 200;
+    let registeredCount = () => 0;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      return this.classList.contains("agent-chat__input")
+        ? DOMRect.fromRect({ y: inputTop, height: 100 })
+        : DOMRect.fromRect({ height: 1000 });
+    });
+    const background = document.createElement("div");
+    function Layout() {
+      const scope = useContext(SessionBackgroundLayoutContext)!;
+      registeredCount = () => scope.targets().length;
+      const layout = createBackgroundFadeLayout(background);
+      createEffect(scope.targets, (targets) => layout.update(true, targets));
+      return background;
+    }
     const { container } = mountSolid(
       () =>
-        createComponent(CreationComposerView, {
-          get composer() {
-            return current();
+        createComponent(SessionBackgroundLayoutScope, {
+          get children() {
+            return [
+              createComponent(Layout, {}),
+              createComponent(CreationComposerView, {
+                get composer() {
+                  return current();
+                },
+                onOpenImage: vi.fn(),
+              }),
+            ];
           },
-          onOpenImage: vi.fn(),
         }),
       { wrapper: createSolidApplicationContextProvider(context).wrapper },
     );
     const firstInput = container.querySelector("textarea");
     expect(firstInput?.value).toBe("first creation");
-
+    expect(background.style.getPropertyValue("--session-background-fade-end")).toBe("250px");
+    expect(registeredCount()).toBe(1);
+    inputTop = 400;
     setCurrent(next);
     flush();
     const nextInput = expectDefined(container.querySelector("textarea"), "next creation input");
     expect(nextInput).not.toBe(firstInput);
-    expect(nextInput?.value).toBe("next creation");
+    expect(nextInput.value).toBe("next creation");
     nextInput.value = "edited next creation";
     next.flushInput?.();
     expect(next.message).toBe("edited next creation");
     expect(composer.message).toBe("first creation");
+    expect(background.style.getPropertyValue("--session-background-fade-end")).toBe("450px");
+    expect(registeredCount()).toBe(1);
+    setCurrent(undefined);
+    flush();
+    expect(background.style.getPropertyValue("--session-background-fade-end")).toBe("550px");
+    expect(registeredCount()).toBe(0);
   });
 
   it("stages ordered messages and files without a destination, persistence, or RPC", () => {

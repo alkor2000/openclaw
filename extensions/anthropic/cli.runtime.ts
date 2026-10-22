@@ -11,7 +11,7 @@ import { toErrorObject } from "openclaw/plugin-sdk/error-runtime";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { hasClaudeRawToolInvocation } from "./cli-output.js";
-import type { ClaudeCliSecretInput } from "./cli-process.js";
+import type { ClaudeCliExecuteContext, ClaudeCliSecretInput } from "./cli-process.js";
 import { prepareClaudeCliTransportArgs } from "./cli-runtime-args.js";
 import { createClaudeCliTransport } from "./cli-transport.js";
 import { createClaudeCliUserInputAuthorizer } from "./cli-user-input.js";
@@ -52,7 +52,7 @@ function readReplayedTaskId(
 }
 
 type ClaudeCliTurn = {
-  context: CliBackendExecuteContextV2;
+  context: ClaudeCliExecuteContext;
   controller: AbortController;
   userInput: ReturnType<typeof createClaudeCliUserInputAuthorizer>;
   events: PassThrough;
@@ -118,6 +118,24 @@ function activeTurn(session: ClaudeCliSession): ClaudeCliTurn | undefined {
   } catch {
     return undefined;
   }
+}
+
+function privateInputHolds(turn: ClaudeCliTurn): boolean {
+  try {
+    turn.context.assertPrivateInputCurrent?.();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function carriesTurnContext(request: Record<string, unknown>, response: unknown): boolean {
+  return (
+    request.callback_id === "UserPromptSubmit" &&
+    isRecord(response) &&
+    isRecord(response.hookSpecificOutput) &&
+    response.hookSpecificOutput.additionalContext !== undefined
+  );
 }
 
 async function authorizeTool(
@@ -575,7 +593,7 @@ function createSession(capability?: CliBackendLiveSessionCapability): ClaudeCliS
 }
 
 export async function* executeClaudeCli(
-  context: CliBackendExecuteContextV2,
+  context: ClaudeCliExecuteContext,
   secretInput?: ClaudeCliSecretInput,
 ): AsyncIterable<Record<string, unknown>> {
   context.assertCurrent();
@@ -660,7 +678,10 @@ export async function* executeClaudeCli(
             // The transport invokes this synchronously at its final write, after all awaits.
             return () => {
               if (admittedTurn && activeTurn(session) === admittedTurn && !signal.aborted) {
-                return response;
+                // Saved turn context leaves here, so it takes the private-input check too.
+                return carriesTurnContext(request, response) && !privateInputHolds(admittedTurn)
+                  ? {}
+                  : response;
               }
               const message = "The OpenClaw run is no longer active.";
               if (request.subtype === "can_use_tool") {
@@ -693,12 +714,13 @@ export async function* executeClaudeCli(
       }
       await context.prepareExecutionAdmission();
       context.assertCurrent();
+      context.assertPrivateInputCurrent?.();
       if (session.closed || session.currentTurn !== turn) {
         throw turn.error ?? new Error("Claude CLI closed before its prompt was accepted.");
       }
       context.registerTurnInterrupt?.({
         async interrupt() {
-          context.assertCurrent?.();
+          context.assertCurrent();
           if (session.currentTurn !== turn && turn.sawTerminalResult) {
             return;
           }

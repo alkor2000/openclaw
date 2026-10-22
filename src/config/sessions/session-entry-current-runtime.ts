@@ -9,6 +9,7 @@ import type {
   CapturedSessionEntryCurrentRead,
   SessionEntryCurrentSource,
 } from "./session-entry-current.types.js";
+import { captureSessionExecutionPolicy } from "./session-entry-execution-policy.js";
 import type { SessionEntryReadWorkerOwner } from "./session-entry-read-runtime.js";
 import { isSessionStoreReadCandidateCurrent } from "./session-store-read-candidates.js";
 import { withSessionHistoryWorkerDatabase } from "./session-transcript-worker-runtime.js";
@@ -27,7 +28,10 @@ export function captureNativeSessionEntryCurrentRead(
     kind: memory.source ? "incognito" : "missing",
     assertSourceCurrent: () => memory.assertCurrent(),
     readCurrent() {
-      return memory.read(scope.sessionKey, "list");
+      const entry = memory.read(scope.sessionKey, "list");
+      return entry
+        ? { ...entry, executionPolicy: captureSessionExecutionPolicy(entry) }
+        : undefined;
     },
   };
 }
@@ -205,9 +209,10 @@ export async function prepareRuntimeAuthProfileExecution(
     assertCurrent();
     throw createAgentRunSupersededAbortError();
   }
+  // Placement may install a new pin before this binding is captured.
   if (
-    pin !== binding.pin &&
-    (!pin || (pin !== params.authProfileId?.trim() && pin !== binding.selectedProfileId))
+    (!pin && binding.pin !== undefined) ||
+    (pin && pin !== params.authProfileId?.trim() && pin !== binding.selectedProfileId)
   ) {
     const refusal = new Error(
       "Session account pin changed during preparation; retry with the current account.",

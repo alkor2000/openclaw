@@ -20,6 +20,15 @@ export type ClaudeCliProcessContext = Pick<
   "command" | "argv0" | "args" | "cwd" | "env" | "abortSignal" | "assertCurrent"
 >;
 
+/**
+ * Host-internal, like the forwarded auth credential and not part of the plugin SDK: a host
+ * whose history owner can change while the run lasts (a native login) passes a check for
+ * where saved turn context leaves after startup, the prompt send and the prompt hook answer.
+ */
+export type ClaudeCliExecuteContext = CliBackendExecuteContextV2 & {
+  assertPrivateInputCurrent?: () => void;
+};
+
 export type ClaudeCliSecretInput = { fd: 3; createData: () => Buffer };
 
 const STDERR_CAPTURE_CHARS = 8_192;

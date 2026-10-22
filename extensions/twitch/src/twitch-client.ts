@@ -122,9 +122,7 @@ export class TwitchClientManager {
     cfg?: OpenClawConfig,
     accountId?: string,
   ): Promise<ChatClient> {
-    const tokenResolution = resolveTwitchToken(cfg, {
-      accountId,
-    });
+    const tokenResolution = resolveTwitchToken(cfg, accountId);
 
     if (!tokenResolution.token) {
       const resolvedAccountId = accountId ?? DEFAULT_ACCOUNT_ID;
@@ -159,7 +157,12 @@ export class TwitchClientManager {
             switch (level) {
               case LogLevel.CRITICAL:
               case LogLevel.ERROR:
-                this.logger.error(message);
+                // ircv3 parser errors can quote the raw incoming line or parameter.
+                this.logger.error(
+                  message.startsWith("Error parsing message: ")
+                    ? "Twitch IRC message parsing failed"
+                    : message,
+                );
                 break;
               case LogLevel.WARNING:
                 this.logger.warn(message);

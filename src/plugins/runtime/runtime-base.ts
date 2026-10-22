@@ -2,8 +2,11 @@ import { GATEWAY_SERVER_CAPS } from "../../../packages/gateway-protocol/src/serv
 import { getRuntimeConfig } from "../../config/io.runtime.js";
 import { resolveStateDir } from "../../config/paths.js";
 import { createRuntimeConfig } from "./runtime-config.js";
+import { createRuntimeLlmFacade } from "./runtime-llm-facade.js";
 import { createRuntimeSystem } from "./runtime-system.js";
 import type { PluginRuntimeBase, PluginRuntime } from "./types.js";
+
+export const COMMAND_NATIVE_SUBAGENTS_CAPABILITY = "command-native-subagents-v1";
 
 function unavailable(method: string): () => never {
   return () => {
@@ -15,9 +18,12 @@ function unavailable(method: string): () => never {
 export function createRuntimeBase(): PluginRuntimeBase {
   let system: PluginRuntime["system"] | undefined;
   return {
-    getConfig: getRuntimeConfig,
-    capabilities: Object.freeze([GATEWAY_SERVER_CAPS.SENDER_RESTRICTED_HIDDEN_HELPERS]),
+    capabilities: Object.freeze([
+      GATEWAY_SERVER_CAPS.SENDER_RESTRICTED_HIDDEN_HELPERS,
+      COMMAND_NATIVE_SUBAGENTS_CAPABILITY,
+    ]),
     config: createRuntimeConfig(),
+    llm: createRuntimeLlmFacade(getRuntimeConfig),
     // Only the registry proxy grants storage, never the base runtime directly.
     state: {
       resolveStateDir,

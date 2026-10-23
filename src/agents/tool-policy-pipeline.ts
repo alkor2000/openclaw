@@ -7,12 +7,13 @@ import { isFrozenClawToolAllowPolicy } from "../claws/tool-policy-runtime.js";
 import { rememberBoundedKey } from "../infra/dedupe.js";
 import type { AnyAgentTool } from "./agent-tools.types.js";
 import { isKnownCoreToolId } from "./tool-catalog.js";
-import { auditToolPolicyFilter } from "./tool-policy-audit.js";
-import { filterToolsByPolicy } from "./tool-policy-match.js";
+import { auditToolPolicyFilter, labelForRuleKind } from "./tool-policy-audit.js";
+import { createToolPolicyMatcher, filterToolsByPolicy } from "./tool-policy-match.js";
 import {
   analyzeAllowlistByToolType,
   buildPluginToolGroups,
   expandPolicyWithPluginGroups,
+  expandToolGroups,
   normalizeToolPolicyName,
   type DeclaredToolAllowlistContext,
   type ToolPolicyLike,
@@ -180,6 +181,26 @@ export function applyToolPolicyPipeline<TTool extends { name: string }>(params: 
             unavailableCoreToolReason: step.unavailableCoreToolReason,
           });
           const warning = `tools: ${step.label} allowlist contains unknown entries (${entries}). ${suffix}`;
+          if (rememberBoundedKey(seenToolPolicyWarnings, warning, MAX_TOOL_POLICY_WARNING_CACHE)) {
+            params.warn(warning);
+          }
+        }
+      }
+      if (params.tools.length > 0) {
+        const unmatchedDeny = policy.deny?.filter((entry) => {
+          const denial = expandPolicyWithPluginGroups({ deny: [entry] }, pluginGroups);
+          if (
+            step.suppressUnavailableCoreToolWarning &&
+            expandToolGroups(denial?.deny).some(isKnownCoreToolId)
+          ) {
+            return false;
+          }
+          const allowed = createToolPolicyMatcher(denial);
+          // Earlier layers may already have removed a valid match from `filtered`.
+          return params.tools.every((tool) => allowed(tool.name));
+        });
+        if (unmatchedDeny?.length) {
+          const warning = `tools: ${labelForRuleKind(step.label, "deny")} entries matched no tool in this resolved surface (${unmatchedDeny.join(", ")}).`;
           if (rememberBoundedKey(seenToolPolicyWarnings, warning, MAX_TOOL_POLICY_WARNING_CACHE)) {
             params.warn(warning);
           }

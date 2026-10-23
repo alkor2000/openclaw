@@ -72,7 +72,7 @@ function createMatchedPolicyRuleForTool(policy: ToolPolicyLike, ruleKind: ToolPo
     );
 }
 
-function labelForRuleKind(stepLabel: string, ruleKind: ToolPolicyRuleKind): string {
+export function labelForRuleKind(stepLabel: string, ruleKind: ToolPolicyRuleKind): string {
   if (ruleKind !== "deny") {
     return stepLabel;
   }

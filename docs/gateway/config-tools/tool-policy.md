@@ -185,6 +185,12 @@ runtime contract, limits, and debugging steps.
 
 Global tool allow/deny policy (deny wins). Case-insensitive, supports `*` wildcards. Applied even when Docker sandbox is off.
 
+During tool resolution, deny entries that match no tool in the resolved surface
+produce a warning, deduplicated per process. Check reported patterns against the
+available tool names: `recall__ops_*`, for example, does not match
+`recall__ops-memory-apply`. Rules for other or deferred tool surfaces can still be
+valid; the warning describes the current surface and does not reject configuration.
+
 ```json5
 {
   tools: { deny: ["browser", "canvas"] },

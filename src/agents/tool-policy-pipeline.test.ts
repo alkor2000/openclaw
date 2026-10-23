@@ -285,6 +285,94 @@ describe("tool-policy-pipeline", () => {
     expect(warnings).toHaveLength(1);
   });
 
+  test("warns once when a deny-only pattern misses the available MCP tool", () => {
+    const warnings: string[] = [];
+    const tools = [{ name: "recall__ops-memory-apply" }];
+    const apply = () =>
+      runPipeline({
+        tools,
+        warn: (message) => warnings.push(message),
+        steps: buildDefaultToolPolicyPipelineSteps({
+          agentId: "worker",
+          agentPolicy: { deny: ["recall__ops_*"] },
+        }),
+      });
+
+    expect(apply()).toEqual(tools);
+    expect(apply()).toEqual(tools);
+    expect(warnings).toEqual([
+      "tools: agents.worker.tools.deny entries matched no tool in this resolved surface (recall__ops_*).",
+    ]);
+  });
+
+  test("checks deny matches against the whole input surface rather than the truncated removal audit", () => {
+    const warnings: string[] = [];
+    const tools = [
+      ...Array.from({ length: 60 }, (_, i) => ({ name: `bulk_${i}` })),
+      { name: "tail" },
+    ];
+    const result = runPipeline({
+      tools,
+      warn: (message) => warnings.push(message),
+      steps: buildDefaultToolPolicyPipelineSteps({
+        globalPolicy: { deny: ["bulk_*", "tail", "missing_tail_*"] },
+      }),
+    });
+
+    expect(result).toEqual([]);
+    expect(warnings).toEqual([
+      "tools: tools.deny entries matched no tool in this resolved surface (missing_tail_*).",
+    ]);
+  });
+
+  test("does not report matching deny rules removed by an earlier layer", () => {
+    const warnings: string[] = [];
+    expect(
+      runPipeline({
+        tools: [{ name: "exec" }],
+        warn: (message) => warnings.push(message),
+        steps: buildDefaultToolPolicyPipelineSteps({
+          globalPolicy: { deny: ["exec"] },
+          agentPolicy: { deny: ["bash"] },
+        }),
+      }),
+    ).toEqual([]);
+    expect(warnings).toEqual([]);
+  });
+
+  test.each(["group:fs", "read*", "memory-owner", "group:plugins"])(
+    "does not warn for a matching deny group or pattern: %s",
+    (entry) => {
+      const warnings: string[] = [];
+      runPipeline({
+        tools: [{ name: "read" }, { name: "memory_search" }],
+        toolMeta: (tool) =>
+          tool.name === "memory_search" ? { pluginId: "memory-owner" } : undefined,
+        warn: (message) => warnings.push(message),
+        steps: buildDefaultToolPolicyPipelineSteps({ globalPolicy: { deny: [entry] } }),
+      });
+      expect(warnings).toEqual([]);
+    },
+  );
+
+  test("keeps core-only deny diagnostics out of the bundled-plugin subset pass", () => {
+    const warnings: string[] = [];
+    runPipeline({
+      tools: [{ name: "plugin_tool" }],
+      toolMeta: () => ({ pluginId: "fixture" }),
+      warn: (message) => warnings.push(message),
+      steps: [
+        {
+          policy: { deny: ["group:fs"] },
+          label: "tools.allow",
+          stripPluginOnlyAllowlist: true,
+          suppressUnavailableCoreToolWarning: true,
+        },
+      ],
+    });
+    expect(warnings).toEqual([]);
+  });
+
   test("evicts the oldest warning when the dedupe cache is full", () => {
     const warnings: string[] = [];
     const warn = (index: number) =>

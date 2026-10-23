@@ -177,6 +177,7 @@ async function submitRealTurn(input: {
     runtimeModel: model.id,
     systemPromptText: systemPrompt,
     runAbortSignal: new AbortController().signal,
+    hasBaselineTools: () => session.getActiveToolNames().length > 0,
     applyPromptBuildToolsAllow: () => ["lookup"],
     setActiveSessionSystemPrompt: (text) => session.setBaseSystemPrompt(text),
     setLeasedSteering: () => {},

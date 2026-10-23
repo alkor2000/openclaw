@@ -8,11 +8,10 @@ import { CompactAttachmentCard } from "./chat-attachment-card-solid.tsx";
 import { MessageImages, type MessageImagesProps } from "./chat-message-images-solid.tsx";
 import {
   projectMessageMedia,
-  releaseChatMediaResourceSubscriber,
+  releaseChatMediaResourceOwner,
   type ImageRenderOptions,
 } from "./chat-message-media.ts";
 import "../../../test-helpers/load-styles.ts";
-import "@awesome.me/webawesome/dist/components/dropdown/dropdown.js";
 import "../../activity/session-activity-media.css";
 
 const browserMode = "__vitest_browser__" in globalThis;
@@ -73,7 +72,7 @@ function unmountImages(container: HTMLElement) {
 
 afterEach(() => {
   for (const subscriber of subscribers.splice(0)) {
-    releaseChatMediaResourceSubscriber(subscriber);
+    releaseChatMediaResourceOwner(subscriber);
   }
   cleanupSolid();
   views.clear();
@@ -121,6 +120,32 @@ function geometry(container: HTMLElement) {
   return { width: imageRect.width, height: imageRect.height, nextTop: nextRect.top };
 }
 
+function expectContentSizedError(card: HTMLElement) {
+  const header = card.querySelector<HTMLElement>(".chat-assistant-attachment-card__header")!;
+  const style = getComputedStyle(header);
+  const children = [...header.children].map((child) => child.getBoundingClientRect().height);
+  const contentHeight =
+    style.flexDirection === "column"
+      ? children.reduce((sum, height) => sum + height, 0) + Number.parseFloat(style.rowGap)
+      : Math.max(...children);
+  const headerHeight =
+    contentHeight + Number.parseFloat(style.paddingTop) + Number.parseFloat(style.paddingBottom);
+  const cardStyle = getComputedStyle(card);
+  const border =
+    Number.parseFloat(cardStyle.borderTopWidth) + Number.parseFloat(cardStyle.borderBottomWidth);
+  expect(header.getBoundingClientRect().height).toBeCloseTo(headerHeight, 0);
+  expect(card.getBoundingClientRect().height).toBeCloseTo(headerHeight + border, 0);
+  const reason = card.querySelector<HTMLElement>(".chat-assistant-attachment-card__status-reason")!;
+  expect(reason.textContent?.trim()).not.toBe("");
+  expect(reason.scrollWidth).toBeLessThanOrEqual(reason.clientWidth + 1);
+  expect(reason.scrollHeight).toBeLessThanOrEqual(reason.clientHeight + 1);
+  expect(getComputedStyle(reason).whiteSpace).toBe("normal");
+  expect(getComputedStyle(reason).textOverflow).not.toBe("ellipsis");
+  const action = card.querySelector("button")!;
+  expect(action.getBoundingClientRect().height).toBeGreaterThanOrEqual(24);
+  expect(action.getBoundingClientRect().width).toBeGreaterThanOrEqual(44);
+}
+
 function svgResponse(width: number, height: number) {
   return new Response(
     `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"><rect width="100%" height="100%" fill="#cc6633"/></svg>`,
@@ -160,7 +185,7 @@ describe.runIf(browserMode)("chat image loading geometry", () => {
     await image.decode();
     expect(image.naturalWidth).toBe(400);
     expect(fetchMock).toHaveBeenCalledOnce();
-    expect(new URL(fetchMock.mock.calls[0]![0], location.href).searchParams.get("v")).toBe("3");
+    expect(new URL(fetchMock.mock.calls[0]![0], location.href).searchParams.get("v")).toBe("4");
   });
 
   it("keeps a horizontally clipped image keyboard reachable before admission", async () => {
@@ -176,7 +201,7 @@ describe.runIf(browserMode)("chat image loading geometry", () => {
     }));
     const onOpenImage = vi.fn<NonNullable<ImageRenderOptions["onOpenImage"]>>();
     const draw = () =>
-      drawImages(container, { images, options: { onRequestUpdate: draw, onOpenImage } });
+      drawImages(container, { images, options: { mediaOwner: draw, onOpenImage } });
     subscribers.push(draw);
     draw();
     await vi.waitFor(() => expect(container.querySelectorAll("img")).toHaveLength(1));
@@ -209,8 +234,8 @@ describe.runIf(browserMode)("chat image loading geometry", () => {
     ["landscape", 1200, 800, 500, 400, 400 / 1.5, "assistant", true],
     ["portrait", 800, 1600, 500, 180, 360, "user", true],
     ["tiny image", 1, 1, 500, 160, 160, "assistant", true],
-    ["narrow pane", 1200, 800, 180, 128, 128 / 1.5, "user", true],
-    ["panorama", 1200, 80, 500, 400, 400 / 15, "assistant", true],
+    ["narrow pane", 1200, 800, 180, 180, 120, "user", true],
+    ["panorama", 1200, 80, 500, 400, 32, "assistant", true],
     ["tiny tall image", 80, 1600, 500, 160, 360, "user", true],
     ["unknown dimensions", 800, 1600, 500, 400, 400 / 1.5, "assistant", false],
   ] as const)(
@@ -295,7 +320,7 @@ describe.runIf(browserMode)("chat image loading geometry", () => {
       const draw = () =>
         drawImages(container, {
           images,
-          options: { sessionKey: "image-proof", agentId: "main", onRequestUpdate: draw },
+          options: { sessionKey: "image-proof", agentId: "main", mediaOwner: draw },
           nextMessage: true,
         });
       subscribers.push(draw);
@@ -358,7 +383,7 @@ describe.runIf(browserMode)("chat image loading geometry", () => {
       expect(before).toHaveLength(count);
       for (const rect of before) {
         expect(rect.width).toBe(tile);
-        expect(rect.height).toBe(tile - 52);
+        expect(rect.height).toBe(tile);
       }
       const nextTop = container.querySelector("[data-next-message]")!.getBoundingClientRect().top;
       ready.resolve();
@@ -437,7 +462,7 @@ describe.runIf(browserMode)("chat image loading geometry", () => {
         frames[0]!.getBoundingClientRect().bottom,
       );
       const messageColumn = container.querySelector<HTMLElement>(".chat-group-messages")!;
-      const fallbackWidth = Math.min(400, messageColumn.clientWidth - 52);
+      const fallbackWidth = Math.min(400, messageColumn.clientWidth);
       for (const [index, expectedWidth] of [160, 84, 160, fallbackWidth, fallbackWidth].entries()) {
         const element = frames[index]!;
         await page.getByAltText(images[index]!.alt, { exact: true }).hover();
@@ -449,14 +474,15 @@ describe.runIf(browserMode)("chat image loading geometry", () => {
         const surface = element.querySelector(".chat-image-surface")!;
         const surfaceRect = surface.getBoundingClientRect();
         expect(getComputedStyle(element, "::after").content).toBe("none");
-        expect(actionsRect.left).toBeGreaterThanOrEqual(surfaceRect.right + 8);
+        expect(actionsRect.left).toBeGreaterThanOrEqual(surfaceRect.left);
         expect(actionsRect.right).toBeLessThanOrEqual(frameRect.right);
-        expect(actionsRect.top).toBe(frameRect.top);
+        expect(actionsRect.top).toBeGreaterThanOrEqual(surfaceRect.top);
+        expect(actionsRect.bottom).toBeLessThanOrEqual(surfaceRect.bottom);
         const action = element.querySelector<HTMLButtonElement>(".chat-image-action")!;
         const rect = action.getBoundingClientRect();
-        expect(rect.width).toBe(44);
-        expect(rect.height).toBe(44);
-        expect(action.contains(document.elementFromPoint(rect.x + 22, rect.y + 22))).toBe(true);
+        expect(rect.width).toBe(30);
+        expect(rect.height).toBe(30);
+        expect(action.contains(document.elementFromPoint(rect.x + 15, rect.y + 15))).toBe(true);
         expect(surfaceRect.width).toBeCloseTo(expectedWidth, 0);
         expect(getComputedStyle(surface).overflow).toBe("hidden");
       }
@@ -513,7 +539,7 @@ describe.runIf(browserMode)("chat image loading geometry", () => {
       const draw = () =>
         drawImages(container, {
           images,
-          options: { sessionKey: "unavailable-geometry", agentId: "main", onRequestUpdate: draw },
+          options: { sessionKey: "unavailable-geometry", agentId: "main", mediaOwner: draw },
           role,
           withDocument,
           nextMessage: true,
@@ -550,11 +576,7 @@ describe.runIf(browserMode)("chat image loading geometry", () => {
       const gap = Number.parseFloat(galleryStyle.rowGap);
       const columns = role === "user" ? galleryStyle.gridTemplateColumns.split(" ").length : 1;
       const rowHeights = Array.from({ length: Math.ceil(before.length / columns) }, (_, row) =>
-        Math.max(
-          ...before
-            .slice(row * columns, (row + 1) * columns)
-            .map((slot, offset) => (row * columns + offset < count ? fileHeight : slot.height)),
-        ),
+        Math.max(...before.slice(row * columns, (row + 1) * columns).map((slot) => slot.height)),
       );
       const compactHeight =
         rowHeights.reduce((sum, height) => sum + height, 0) + gap * (rowHeights.length - 1);
@@ -588,8 +610,9 @@ describe.runIf(browserMode)("chat image loading geometry", () => {
       };
       for (const [index, card] of cards.entries()) {
         expect(card.getBoundingClientRect().width).toBe(before[index]!.width);
-        expect(Math.abs(card.getBoundingClientRect().height - fileHeight)).toBeLessThanOrEqual(1);
-        expect(Math.abs(before[index]!.height - fileHeight)).toBeLessThanOrEqual(1);
+        expectContentSizedError(card);
+        expect(before[index]!.height).toBeCloseTo(card.getBoundingClientRect().height, 1);
+        expect(card.parentElement!.querySelector(".chat-image-actions")).toBeNull();
         const cardCorners = cornerInsets(card);
         const rect = card.getBoundingClientRect();
         // Compare both outlines at the same subpixel coordinates so browser hit
@@ -625,8 +648,8 @@ describe.runIf(browserMode)("chat image loading geometry", () => {
       ).toEqual(before.slice(1).map(({ width, height }) => ({ width, height })));
       allowed.resolve(Response.json({ available: true }));
       await waitForFast(() => expect(frame(container).querySelector("img")).not.toBeNull());
-      for (const remaining of [...gallery.children].slice(1, count)) {
-        expect(remaining.getBoundingClientRect().height).toBe(fileHeight);
+      for (const [index, remaining] of [...gallery.children].slice(1, count).entries()) {
+        expect(remaining.getBoundingClientRect().height).toBe(before[index + 1]!.height);
       }
     },
   );
@@ -652,7 +675,13 @@ describe.runIf(browserMode)("chat image loading geometry", () => {
       expect(container.querySelector(".chat-assistant-attachment-card")?.textContent).toContain(
         "load",
       );
-      expect(geometry(container).height).toBe(74);
+      const card = container.querySelector<HTMLElement>(".chat-assistant-attachment-card")!;
+      expect(
+        frame(container).querySelector('.chat-image-actions [aria-label="Image actions"]'),
+      ).not.toBeNull();
+      expectContentSizedError(card);
+      expect(geometry(container).height).toBeCloseTo(card.getBoundingClientRect().height, 1);
+      expect(geometry(container).height).toBeLessThan(before.height);
       const { page } = await import("vitest/browser");
       await page.getByRole("button", { name: "Retry", exact: true }).click();
       await waitForFast(() => expect(container.querySelector("img")).not.toBeNull());

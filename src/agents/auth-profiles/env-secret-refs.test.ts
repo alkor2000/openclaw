@@ -4,6 +4,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi, type MockInstance } from "vitest";
 import { clearMissingManagedServiceEnvKeys } from "../../daemon/service-managed-env.js";
+import { listDirectoryTreeStrictSync } from "../../infra/directory-walk.js";
 import * as nativeSqlite from "../../infra/node-sqlite.js";
 import { cleanupSnapshotOperations } from "../../infra/sqlite-readonly-location-cleanup.js";
 import * as snapshotSource from "../../infra/sqlite-snapshot-source.js";
@@ -28,16 +29,14 @@ import { AuthProfileStoreUnreadableError } from "./store-unreadable-error.js";
 
 function artifactHashes(root: string): Record<string, string> {
   return Object.fromEntries(
-    fs
-      .readdirSync(root, { recursive: true, withFileTypes: true })
-      .filter((entry) => entry.isFile())
-      .map((entry) => {
-        const filename = path.join(entry.parentPath, entry.name);
-        return [
-          path.relative(root, filename),
-          createHash("sha256").update(fs.readFileSync(filename)).digest("hex"),
-        ];
-      }),
+    listDirectoryTreeStrictSync(root)
+      .filter((entry) => entry.dirent.isFile())
+      .map(({ relativePath }) => [
+        relativePath,
+        createHash("sha256")
+          .update(fs.readFileSync(path.join(root, relativePath)))
+          .digest("hex"),
+      ]),
   );
 }
 

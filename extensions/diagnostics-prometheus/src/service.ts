@@ -30,7 +30,7 @@ import {
   createGatewayWorkMetricsRecorder,
   recordSessionDiagnosticEvent,
 } from "./service-sessions.js";
-import { recordWorkerRequest } from "./service-worker.js";
+import { createWorkerRequestMetricsRecorder } from "./service-worker.js";
 
 const BYTE_BUCKETS = [
   1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864, 268435456, 1073741824,
@@ -81,11 +81,6 @@ function recordDiagnosticEvent(
     case "sessions.event.rows.reset":
       if (metadata.trusted) {
         recordSessionRetention(store, evt);
-      }
-      return;
-    case "worker.request":
-      if (metadata.trusted) {
-        recordWorkerRequest(store, evt);
       }
       return;
     case "diagnostic.phase.completed":
@@ -580,11 +575,14 @@ function createMetricsHandler(store: PrometheusMetricStore): OpenClawPluginHttpR
     res.statusCode = 200;
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
-    res.setHeader("Content-Length", String(Buffer.byteLength(body)));
-    // Avoid Node concatenating and flattening a second copy of the scrape with
-    // the HTTP headers. The body is already a complete, immutable string.
+    res.setHeader("Content-Length", String(body.length));
     res.flushHeaders();
-    res.end(req.method === "HEAD" ? undefined : body);
+    res.end(req.method === "HEAD" ? undefined : body, (error?: Error | null) => {
+      // Only the completed response owns this backing store; prefixes stay in the metric store.
+      if (!error) {
+        body.buffer.transfer(0);
+      }
+    });
     return true;
   };
 }
@@ -609,6 +607,7 @@ export function createDiagnosticsPrometheusExporter() {
   });
   let unsubscribe: (() => void) | undefined;
   let unsubscribeWork: (() => void) | undefined;
+  let unsubscribeWorkerRequests: (() => void) | undefined;
   let internalDiagnostics: TrustedExporterDiagnosticsBridge | undefined;
   const reportExporterStatus = (update: PrometheusExporterHealthUpdate) => {
     try {
@@ -652,6 +651,9 @@ export function createDiagnosticsPrometheusExporter() {
       unsubscribeWork = ctx.internalDiagnostics?.onGatewayWorkMetrics?.(
         createGatewayWorkMetricsRecorder(store),
       );
+      unsubscribeWorkerRequests = ctx.internalDiagnostics?.onWorkerRequestMetrics?.(
+        createWorkerRequestMetricsRecorder(store),
+      );
       unsubscribe = subscribe(
         (event, metadata) => {
           try {
@@ -663,7 +665,7 @@ export function createDiagnosticsPrometheusExporter() {
           }
         },
         // Metrics do not consume logs; avoid enabling their diagnostic copy/formatting path.
-        { exclude: ["log.record"] },
+        { exclude: ["log.record", "worker.request"], includePromptStats: false },
         { includePrivateData: false },
       );
       internalDiagnostics = ctx.internalDiagnostics;
@@ -675,6 +677,8 @@ export function createDiagnosticsPrometheusExporter() {
       });
     },
     stop() {
+      unsubscribeWorkerRequests?.();
+      unsubscribeWorkerRequests = undefined;
       unsubscribeWork?.();
       unsubscribeWork = undefined;
       unsubscribe?.();

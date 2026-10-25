@@ -2,6 +2,7 @@
 import { afterEach, assert, describe, expect, it, onTestFinished, vi } from "vitest";
 import { createDeferred } from "../../../../test/helpers/promise.js";
 import type { GatewaySessionRow, ModelCatalogResult } from "../../api/types.ts";
+import { makeBootRoster } from "../../app/bootstrap.test-support.ts";
 import { disposeQuestionPromptState } from "../../app/question-prompt.ts";
 import { buildCatalogSessionKey } from "../../lib/sessions/catalog-key.ts";
 import { sessionMutationGatewayHello } from "../../test-helpers/gateway-methods.ts";
@@ -289,12 +290,7 @@ it.each([
       createGatewayBrowserClientFixture({ recoveryScopeReady: true }),
     );
     state.sessionKey = "agent:main:setup";
-    context.agents.state.agentsList = {
-      defaultId: "main",
-      mainKey: "main",
-      scope: "global",
-      agents: [{ id: "main" }],
-    };
+    context.agents.state.agentsList = makeBootRoster({ scope: "global" });
     state.handleSendChat = vi.fn();
     state.chatMessage = draft;
     state.chatModelCatalogInitialized = true;
@@ -335,12 +331,7 @@ it.each([
       createGatewayBrowserClientFixture({ recoveryScopeReady: true }),
     );
     state.sessionKey = "agent:main:choice";
-    context.agents.state.agentsList = {
-      defaultId: "main",
-      mainKey: "main",
-      scope: "global",
-      agents: [{ id: "main" }],
-    };
+    context.agents.state.agentsList = makeBootRoster({ scope: "global" });
     state.sessionsResult = {
       ts: 1,
       path: "",
@@ -456,7 +447,7 @@ it.each([
       expect(state.sessionsResult.sessions[0]).toBe(historyRow);
       expect(historyRow?.model).toBe("primary-model");
       retireChatMetadataRequests(state);
-      expect(state.chatModelCatalogInitialized).toBe(!restricted);
+      expect(state.chatModelCatalogInitialized).toBe(false);
     } finally {
       catalog.resolve({ models: [] });
       await pending;

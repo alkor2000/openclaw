@@ -1,12 +1,14 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { observeHostDataSql } from "../../test/helpers/sqlite-statement-execution-counter.js";
 import { createAgentTeam } from "../agents/agent-team.js";
 import { ensureAgentWorkspace } from "../agents/workspace.js";
 import { readConfigFileSnapshot } from "../config/config.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { listDirectoryTreeStrict } from "../infra/directory-walk.js";
 import { openNodeSqliteDatabase } from "../infra/node-sqlite.js";
+import { defaultRuntime } from "../runtime.js";
 import { publishAgentDeletionJournalStatus } from "../state/agent-deletion-journal-status.js";
 import { closeOpenClawAgentDatabasesForTest } from "../state/openclaw-agent-db.js";
 import { withOpenClawStateDatabaseReadSnapshot } from "../state/openclaw-state-db-readonly.js";
@@ -17,7 +19,6 @@ import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { agentsAddCommand } from "./agents.commands.add.js";
 import { agentsTeamCreateCommand } from "./agents.commands.team.js";
 import { ensureOnboardingAgent } from "./onboard-agent.js";
-import { createCapturingTestRuntime } from "./test-runtime-config-helpers.js";
 
 const specialists = ["researcher", "writer", "reviewer"];
 
@@ -33,6 +34,7 @@ it.aroundEach(async (runTest) => {
       try {
         await runTest();
       } finally {
+        vi.restoreAllMocks();
         closeOpenClawAgentDatabasesForTest();
         closeOpenClawStateDatabaseForTest();
       }
@@ -114,7 +116,7 @@ it("rejects unfinished role adoption without workspace or config changes", async
   await fs.rm(path.join(workspace, "SOUL.md"));
   await fs.rm(path.join(workspace, "IDENTITY.md"));
   const readWorkspace = async () => {
-    const entries = await fs.readdir(workspace, { recursive: true, withFileTypes: true });
+    const entries = (await listDirectoryTreeStrict(workspace)).map((walkEntry) => walkEntry.dirent);
     return Promise.all(
       entries
         .filter((entry) => entry.isFile())
@@ -125,11 +127,13 @@ it("rejects unfinished role adoption without workspace or config changes", async
     );
   };
   const before = await readWorkspace();
-  const { runtime } = createCapturingTestRuntime();
-  const adding = agentsAddCommand(
-    { name: "Editor", role: "writer", workspace, nonInteractive: true, json: true },
-    runtime,
-  );
+  const adding = agentsAddCommand({
+    name: "Editor",
+    role: "writer",
+    workspace,
+    nonInteractive: true,
+    json: true,
+  });
   await expect.soft(adding).rejects.toThrow("unfinished bootstrap");
   expect.soft(await readWorkspace()).toEqual(before);
   expect.soft(await fs.readFile(configPath, "utf8")).toBe(original);
@@ -148,16 +152,13 @@ it.each([false, true])(
     const coordinatorId = hasAmbientOwner ? "docs-lead" : "coordinator";
     const specialistIds = specialists.map((id) => (hasAmbientOwner ? `docs-${id}` : id));
     const workspaceRoot = path.join(root, hasAmbientOwner ? "team-workspaces" : "workspace");
-    const { runtime, logs } = createCapturingTestRuntime();
-    await agentsTeamCreateCommand(
-      {
-        ...(hasAmbientOwner ? { coordinator: "lead", prefix: "docs", workspaceRoot } : {}),
-        nonInteractive: true,
-        json: true,
-      },
-      runtime,
-    );
-    const summary: unknown = JSON.parse(logs.join("\n"));
+    const json = vi.spyOn(defaultRuntime, "writeJson").mockImplementation(() => {});
+    await agentsTeamCreateCommand({
+      ...(hasAmbientOwner ? { coordinator: "lead", prefix: "docs", workspaceRoot } : {}),
+      nonInteractive: true,
+      json: true,
+    });
+    const summary: unknown = json.mock.calls[0]?.[0];
     expect(summary).toMatchObject({
       coordinatorId,
       ambientOwnerId: hasAmbientOwner ? "ambient" : coordinatorId,

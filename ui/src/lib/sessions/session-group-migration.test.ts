@@ -1,9 +1,10 @@
 // @vitest-environment node
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, expect, it, onTestFinished, vi } from "vitest";
 import { createDeferred } from "../../../../test/helpers/promise.js";
 import type { GatewayBrowserClient, GatewayHelloOk } from "../../api/gateway.ts";
 import { createConnectionBootstrapCoordinator } from "../../app/connection-bootstrap.ts";
 import { createStorageMock } from "../../test-helpers/storage.ts";
+import { sessionRequest as groupRequests } from "./hydration-family.test-support.ts";
 import { createSessionCapability } from "./index.ts";
 import {
   createGatewayHarness as sharedGatewayHarness,
@@ -11,13 +12,13 @@ import {
   sessionsResult,
 } from "./session-capability.test-support.ts";
 import type { SessionGateway } from "./session-capability.ts";
-import { sessionRpc as groupRequests, sessionChanged } from "./session-rpc.test-support.ts";
+import { sessionChanged } from "./session-rpc.test-support.ts";
 
 const legacyKey = "openclaw:sessions:custom-groups";
 const clientGroup = { name: "Client", position: 0 };
 const clientDefaults = { name: "Client", cwd: "/repos/client", worktree: true };
 const expectedClient = [{ ...clientGroup, ...clientDefaults }];
-type Groups = { groups: { name: string }[] };
+type Groups = { groups: { name: string; position: number }[] };
 type Defaults = { defaults: (typeof clientDefaults)[] };
 
 function legacyGroups() {
@@ -51,11 +52,11 @@ afterEach(() => {
 it.each(["disconnected", "disposed"] as const)(
   "retires automatic group loads for a %s owner",
   async (boundary) => {
-    const stale = createDeferred<{ groups: { name: string }[] }>();
+    const stale = createDeferred<{ groups: { name: string; position: number }[] }>();
     let reads = 0;
     const request = vi.fn(async (method: string) => {
       if (method === "sessions.groups.list") {
-        return ++reads === 1 ? stale.promise : { groups: [{ name: "Current" }] };
+        return ++reads === 1 ? stale.promise : { groups: [{ name: "Current", position: 0 }] };
       }
       if (method === "sessions.groups.defaults") {
         return { defaults: [{ name: "Current", cwd: "/workspace/current", worktree: true }] };
@@ -84,7 +85,7 @@ it.each(["disconnected", "disposed"] as const)(
       } else if (boundary === "disposed") {
         sessions.dispose();
       }
-      stale.resolve({ groups: [{ name: "Stale" }] });
+      stale.resolve({ groups: [{ name: "Stale", position: 0 }] });
       await completion;
       expect(reads).toBe(1);
       expect(sessions.state.groupSettings).not.toContainEqual({ name: "Stale", position: 0 });
@@ -112,7 +113,7 @@ it("migrates browser groups with operator.write", async () => {
   legacyGroups();
   const request = groupRequests({
     "sessions.groups.list": () => ({ groups: [] }),
-    "sessions.groups.put": () => ({ groups: [{ name: "Research" }] }),
+    "sessions.groups.put": () => ({ groups: [{ name: "Research", position: 0 }] }),
     "sessions.groups.defaults": () => ({ defaults: [{ name: "Research" }] }),
   });
   const sessions = createTestSessionCapability(createGateway(request, ["operator.write"]));
@@ -131,26 +132,21 @@ it("does not replace saved groups from an invalidated legacy import", async () =
   let reads = 0;
   const request = groupRequests({
     "sessions.groups.list": () => (++reads === 1 ? stale.promise : current.promise),
-    "sessions.groups.put": () => ({ groups: [{ name: "Research" }] }),
+    "sessions.groups.put": () => ({ groups: [{ name: "Research", position: 0 }] }),
     "sessions.groups.defaults": () => ({ defaults: [clientDefaults] }),
   });
   const sessions = createTestSessionCapability(createGateway(request, ["operator.write"]));
-  try {
-    const staleLoad = sessions.groupsLoad();
-    sessions.groupsInvalidate();
-    const currentLoad = sessions.groupsLoad();
-    stale.resolve({ groups: [] });
-    await staleLoad;
-
-    expect(request).not.toHaveBeenCalledWith("sessions.groups.put", expect.anything());
-    expect(localStorage.getItem(legacyKey)).toBe(legacy);
-    current.resolve({ groups: [{ name: "Client" }] });
-    await currentLoad;
-    expect(sessions.state.groupSettings).toEqual(expectedClient);
-  } finally {
-    current.resolve({ groups: [{ name: "Client" }] });
-    sessions.dispose();
-  }
+  onTestFinished(() => current.resolve({ groups: [clientGroup] }));
+  const staleLoad = sessions.groupsLoad();
+  sessions.groupsInvalidate();
+  const currentLoad = sessions.groupsLoad();
+  stale.resolve({ groups: [] });
+  await staleLoad;
+  expect(request).not.toHaveBeenCalledWith("sessions.groups.put", expect.anything());
+  expect(localStorage.getItem(legacyKey)).toBe(legacy);
+  current.resolve({ groups: [clientGroup] });
+  await currentLoad;
+  expect(sessions.state.groupSettings).toEqual(expectedClient);
 });
 
 it("clears cached cwd when a defaults update omits the removed value", async () => {

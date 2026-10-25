@@ -34,22 +34,16 @@ export type NativeCommitReceipt = {
   facts: unknown;
 };
 
-export function readNativeCommitReceipt(value: unknown): NativeCommitReceipt | undefined {
-  if (
-    !isRecord(value) ||
-    value.version !== 1 ||
-    typeof value.sequence !== "number" ||
-    !Number.isSafeInteger(value.sequence) ||
-    value.sequence < 1 ||
-    !Object.hasOwn(value, "facts")
-  ) {
-    return undefined;
-  }
-  return {
-    version: 1,
-    sequence: value.sequence,
-    facts: value.facts,
-  };
+// The private MessagePort already detached this receipt from its sender.
+export function isNativeCommitReceipt(value: unknown): value is NativeCommitReceipt {
+  return (
+    isRecord(value) &&
+    value.version === 1 &&
+    typeof value.sequence === "number" &&
+    Number.isSafeInteger(value.sequence) &&
+    value.sequence >= 1 &&
+    Object.hasOwn(value, "facts")
+  );
 }
 
 // Keep the latest committed evidence for settlement if ordinary delivery fails.
@@ -85,6 +79,21 @@ export type SqliteWorkerNativeSettlementOwner = {
 export type RetainedWorkerTransactionAdmission = {
   readonly settled: Promise<SqliteWorkerOperationSettlement>;
 };
+
+/** Observe each finish after the previously installed handler, including failure. */
+export function observeSqliteWorkerAdmissionFinish(
+  admission: { finish(): void },
+  observer: () => void,
+): void {
+  const finish = admission.finish.bind(admission);
+  admission.finish = () => {
+    try {
+      finish();
+    } finally {
+      observer();
+    }
+  };
+}
 
 export type CapturedSqliteWorkerCommitReceipt =
   | { kind: "inline"; facts: unknown; payloadBytes: number }

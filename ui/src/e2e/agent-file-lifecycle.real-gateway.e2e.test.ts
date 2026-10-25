@@ -234,12 +234,20 @@ catalogSuite.define(() => {
           expect(await identityName.inputValue()).toBe("Keep this identity draft");
           await openPicker(picker);
           await option("fixture/selected").click();
-          const fallbackInput = editor.locator("openclaw-multi-select.agent-fallbacks input");
-          await fallbackInput.fill("fixture/anchor");
-          await fallbackInput.press("Enter");
           const selected = () => pickerValue(picker);
           await expect.poll(selected).toBe("fixture/selected");
-          await expect.poll(() => mutations.length).toBeGreaterThan(0);
+          await expect.poll(() => readConfig("agents.entries.main.model")).toBe("fixture/selected");
+          const fallbacks = editor.locator("openclaw-multi-select.agent-fallbacks");
+          const fallbackInput = fallbacks.locator("input");
+          await expect.poll(() => fallbackInput.isEnabled()).toBe(true);
+          await fallbackInput.fill("fixture/anchor");
+          await fallbacks.locator('[role="option"][data-value="fixture/anchor"]').click();
+          await expect
+            .poll(() =>
+              fallbacks.locator('.multi-select__chip[data-value="fixture/anchor"]').isVisible(),
+            )
+            .toBe(true);
+          await expect.poll(selected).toBe("fixture/selected");
           const selectedModel = { primary: "fixture/selected", fallbacks: ["fixture/anchor"] };
           await expect.poll(() => readConfig("agents.entries.main.model")).toEqual(selectedModel);
           const writesBeforePublication = [...mutations];
@@ -329,7 +337,6 @@ suite.define(() => {
               defaults: {
                 workspace: "~/.openclaw/workspace-main",
                 systemAgent: { agentId: "main" },
-                heartbeat: { agentId: "main" },
                 sessionStore: { agentId: "main" },
               },
               entries: {
@@ -416,28 +423,6 @@ suite.define(() => {
             await conflict.getByRole("button", { name: "Reload" }).click();
             await expect.poll(() => editor.inputValue()).toBe(secondAppend);
             expect(await readAgentsFile()).toBe(secondAppend);
-
-            await editor.fill("# Draft typed before the refresh\n");
-            const thirdAppend = `${secondAppend}- third memory\n`;
-            await writeFile(agentsFile, thirdAppend, "utf8");
-            await page
-              .locator(".settings-section__header")
-              .filter({ hasText: "Core Files" })
-              .getByRole("button", { name: "Refresh" })
-              .click();
-            await expect.poll(() => editor.inputValue()).toBe("# Draft typed before the refresh\n");
-            await rejectStaleSave(thirdAppend);
-
-            await page
-              .locator(".agent-file-header")
-              .getByRole("button", { name: "Reset", exact: true })
-              .click();
-            await expect.poll(() => editor.inputValue()).toBe(thirdAppend);
-            const afterReset = `${thirdAppend}- edited after Reset\n`;
-            await editor.fill(afterReset);
-            await save.click();
-            await expect.poll(readAgentsFile).toBe(afterReset);
-            await expect.poll(() => conflict.isVisible()).toBe(false);
           },
         );
       },

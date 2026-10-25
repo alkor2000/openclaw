@@ -84,6 +84,9 @@ const stateSnapshotReads = resolveGlobalSingleton(
       RetainedReadScope & {
         readSource(): StateReadSnapshotSource | undefined;
         prepareSource?: () => Promise<void>;
+        forkSource: Awaited<
+          ReturnType<typeof prepareOpenClawStateReadSnapshotSource>
+        >["forkSource"];
         env: NodeJS.ProcessEnv;
         callerSignal?: AbortSignal;
       }
@@ -109,6 +112,38 @@ export function getActiveOpenClawStateDatabaseReadSnapshot(
   return current?.path === resolveReadOnlyPath(options) ? current.readSource() : undefined;
 }
 
+/** Prepare lazy snapshot bytes without blocking asynchronous discovery callers. */
+export async function getActiveOpenClawStateDatabaseReadSnapshotAsync(
+  options: OpenClawStateDatabaseOptions = {},
+): Promise<Readonly<{ location: string; cleanClose?: boolean }> | undefined> {
+  const current = stateSnapshotReads.getStore();
+  if (current?.path !== resolveReadOnlyPath(options)) {
+    return undefined;
+  }
+  // Retain preparation through cancellation/drainage, then recheck read admission
+  // before publishing the same identity used by synchronous readers.
+  return current.work.track(async () => {
+    await current.prepareSource?.();
+    resolveStateReadCallerSignal()?.throwIfAborted();
+    return getActiveOpenClawStateDatabaseReadSnapshot(options);
+  });
+}
+
+/** Fork only bytes already owned by this matching report, retaining it until the child settles. */
+export async function forkActiveOpenClawStateDatabaseReadSnapshot(
+  options: OpenClawStateDatabaseOptions = {},
+) {
+  const pathname = resolveReadOnlyPath(options);
+  const current = stateSnapshotReads.getStore();
+  if (current?.path !== pathname) {
+    return undefined;
+  }
+  assertRetainedReadScopeAdmission(pathname, [current]);
+  const signal = resolveStateReadCallerSignal();
+  signal?.throwIfAborted();
+  return current.work.track(() => current.forkSource(signal));
+}
+
 /** Use a SQLite snapshot or the PostgreSQL read owner without redirecting live writers. */
 export async function withOpenClawStateDatabaseReadSnapshot<T>(
   operation: () => Promise<T>,
@@ -117,8 +152,16 @@ export async function withOpenClawStateDatabaseReadSnapshot<T>(
     reuseCleanClose?: boolean;
     /** Selected reports acquire shared bytes only when a reader actually needs them. */
     lazy?: boolean;
+    /** Command owners may cancel preparation before the callback acquires its read scope. */
+    signal?: AbortSignal;
   } = {},
 ): Promise<T> {
+  const inheritedSignal = resolveStateReadCallerSignal();
+  const callerSignal =
+    options.signal && inheritedSignal
+      ? AbortSignal.any([options.signal, inheritedSignal])
+      : (options.signal ?? inheritedSignal);
+  callerSignal?.throwIfAborted();
   const postgres = isStatePostgres();
   if (!postgres) {
     assertStateFileSnapshotAllowed();
@@ -133,7 +176,6 @@ export async function withOpenClawStateDatabaseReadSnapshot<T>(
     return await operation();
   }
   const env = options.env ?? process.env;
-  const callerSignal = resolveStateReadCallerSignal();
   const controller = new AbortController();
   let closeSnapshotWork: ((reason: unknown) => void) | undefined;
   const run = async () => {
@@ -153,6 +195,7 @@ export async function withOpenClawStateDatabaseReadSnapshot<T>(
       {
         readSource: source.readSource,
         prepareSource: source.prepareSource,
+        forkSource: source.forkSource,
         env,
         callerSignal,
       },

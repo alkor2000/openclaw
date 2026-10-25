@@ -1,11 +1,13 @@
+import { hash } from "node:crypto";
 import type { ResponseFunctionToolCall } from "openai/resources/responses/responses.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createAiTransportHost, runWithAiTransportHost } from "../host.js";
 import { cleanupSessionResources } from "../session-resources.js";
 import {
   claimOpenAIResponsesHttpContinuation,
   recordResponsesContinuationState,
   resolveResponsesContinuationRequest as resolve,
+  responsesContinuationPrefixFingerprint,
+  responsesContinuationRequestFingerprint,
   type ResponsesContinuationRequest,
   type ResponsesContinuationState,
 } from "./openai-responses-continuation.js";
@@ -165,6 +167,126 @@ afterEach(() => {
 });
 
 describe("OpenAI Responses continuation", () => {
+  it("preserves persisted request and prefix hashes across JSON normalization and key order", () => {
+    const text = `${"x".repeat(17_000)}🦞 café e\u0301 \ud800\n`;
+    const encodedText = JSON.stringify(text);
+    const toJSON = vi.fn(() => ({ z: true, omitted: undefined, text, a: Infinity }));
+    const request = {
+      store: true,
+      provider_options: { toJSON },
+      model: "fixture-model",
+      metadata: { openclaw_turn_id: "turn-1", stable: "yes", openclaw_turn_attempt: "1" },
+      input: [firstUser],
+      tools: [],
+      instructions: "current instructions",
+      previous_response_id: "resp_previous",
+      omitted: undefined,
+    };
+    const requestHash = hash(
+      "sha256",
+      `{"metadata":{"stable":"yes"},"model":"fixture-model","provider_options":{"a":null,"text":${encodedText},"z":true},"store":true}`,
+    );
+    expect(responsesContinuationRequestFingerprint(request)).toBe(requestHash);
+    expect(toJSON).toHaveBeenCalledOnce();
+    expect(
+      responsesContinuationRequestFingerprint({
+        model: "fixture-model",
+        metadata: { stable: "yes" },
+        provider_options: { a: null, text, z: true },
+        store: true,
+      }),
+    ).toBe(requestHash);
+    expect(responsesContinuationRequestFingerprint({ ...request, store: false })).not.toBe(
+      requestHash,
+    );
+
+    const content = vi.fn(() => [{ type: "input_text", text, omitted: undefined }]);
+    const input = [{ type: "message", role: "user", content: { toJSON: content } }];
+    const prefixHash = hash(
+      "sha256",
+      `[{"content":[{"text":${encodedText},"type":"input_text"}],"role":"user","type":"message"},{"content":[{"text":"answer","type":"output_text"}],"phase":"final_answer","role":"assistant","type":"message"}]`,
+    );
+    expect(responsesContinuationPrefixFingerprint(input, [assistantOutput])).toBe(prefixHash);
+    expect(content).toHaveBeenCalledOnce();
+    expect(
+      responsesContinuationPrefixFingerprint([
+        { content: [{ text, type: "input_text" }], role: "user", type: "message" },
+        assistantOutput,
+      ]),
+    ).toBe(prefixHash);
+    expect(
+      responsesContinuationPrefixFingerprint([userInput(`${text}changed`)], [assistantOutput]),
+    ).not.toBe(prefixHash);
+  });
+
+  it.each([
+    {
+      name: "omitted fields, sparse arrays, nonfinite numbers and signed zero",
+      // oxlint-disable-next-line no-sparse-arrays -- A genuine array hole must compare as JSON null.
+      value: { omit: undefined, values: [, undefined, Number.NaN, Infinity, -0], text: "🦞\ud800" },
+      expected: { values: [null, null, null, null, 0], text: "🦞\ud800" },
+    },
+    {
+      name: "built-in serializers",
+      value: {
+        at: new Date("2026-01-01Z"),
+        url: new URL("https://example.test/"),
+        data: Buffer.from([1, 2]),
+      },
+      expected: {
+        at: "2026-01-01T00:00:00.000Z",
+        url: "https://example.test/",
+        data: { type: "Buffer", data: [1, 2] },
+      },
+    },
+    {
+      name: "key-sensitive serializers on objects and functions",
+      value: {
+        nested: { toJSON: (key: string) => ({ key }) },
+        array: [Object.assign(() => {}, { toJSON: (key: string) => key })],
+      },
+      expected: { nested: { key: "nested" }, array: ["0"] },
+    },
+    {
+      name: "own __proto__ fields and null-prototype objects",
+      value: Object.assign(
+        Object.create(null),
+        JSON.parse('{"__proto__":{"own":true},"omit":null}'),
+      ),
+      expected: JSON.parse('{"omit":null,"__proto__":{"own":true}}'),
+    },
+    {
+      name: "proxy serializers",
+      value: new Proxy(
+        { text: "plain" },
+        {
+          get: (target, key) =>
+            key === "toJSON" ? () => ({ text: "wire" }) : Reflect.get(target, key),
+        },
+      ),
+      expected: { text: "wire" },
+    },
+  ])("compares continuation envelopes using JSON semantics: $name", ({ value, expected }) => {
+    const state = continuationState();
+    state.lastRequest.provider_options = expected;
+    const request = { ...nextRequest(), provider_options: value };
+    expect(resolve(state, request).continuationStatus).toBe("continued");
+    state.lastRequest.provider_options = { changed: true };
+    expect(resolve(state, request).continuationStatus).toBe("request_changed");
+  });
+
+  it("rejects unserializable history without retaining a failed comparison", () => {
+    const cycle: Record<string, unknown> = {};
+    cycle.self = cycle;
+    const state = continuationState();
+    for (const value of [cycle, 1n]) {
+      expect(() => resolve(state, { ...nextRequest(), provider_options: value })).toThrow(
+        TypeError,
+      );
+    }
+    expect(resolve(state, nextRequest()).continuationStatus).toBe("continued");
+  });
+
   it("matches JSON wire semantics and provider-only assistant replay metadata", () => {
     const continued = resolve(continuationState(), nextRequest());
     expect(continued).toMatchObject({
@@ -486,27 +608,6 @@ describe("OpenAI Responses continuation", () => {
     cleanupSessionResources("session-1");
     commitBaseline(stale, "resp_stale");
     expect(previousResponseId()).toBeUndefined();
-  });
-
-  it("keeps matching-session and all-session cleanup inside one runtime owner", () => {
-    const firstHost = createAiTransportHost();
-    const secondHost = createAiTransportHost();
-    const commit = (owner: typeof firstHost, sessionId: string, responseId: string) =>
-      runWithAiTransportHost(owner, () => {
-        commitBaseline(claim({ sessionId }), responseId);
-      });
-    const previous = (owner: typeof firstHost, sessionId: string) =>
-      runWithAiTransportHost(owner, () => previousResponseId(sessionId));
-    commit(firstHost, "shared", "first-shared");
-    commit(firstHost, "other", "first-other");
-    commit(secondHost, "shared", "second-shared");
-    commit(secondHost, "other", "second-other");
-    cleanupSessionResources("shared", firstHost);
-    expect(previous(firstHost, "shared")).toBeUndefined();
-    expect(previous(secondHost, "shared")).toBe("second-shared");
-    cleanupSessionResources(undefined, firstHost);
-    expect(previous(firstHost, "other")).toBeUndefined();
-    expect(previous(secondHost, "other")).toBe("second-other");
   });
 });
 

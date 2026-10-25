@@ -5,6 +5,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, beforeEach, expect, vi } from "vitest";
 import { registerAcpSessionResetControls } from "../../acp/control-plane/manager.reset-controls.js";
+import type { AgentHarness } from "../../agents/harness/types.js";
 import { setRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
 import type { InternalSessionEntry as SessionEntry } from "../../config/sessions.js";
 import type { InternalHookEvent } from "../../hooks/internal-hooks.js";
@@ -114,11 +115,22 @@ export async function loadSeededTranscriptEvents(params: {
 }
 
 const sessionCleanupMocks = vi.hoisted(() => ({
-  clearSessionLifecycleQueues:
-    vi.fn<
-      (typeof import("../../auto-reply/reply/queue/cleanup.js"))["clearSessionLifecycleQueues"]
-    >(),
-  stopSessionResetSubagents: vi.fn(async () => {}),
+  clearSessionQueues: vi.fn((keys: Array<string | undefined>) => {
+    const clearedKeys = Array.from(
+      new Set(
+        keys
+          .map((key) => (typeof key === "string" ? key.trim() : ""))
+          .filter((key) => key.length > 0),
+      ),
+    );
+    return clearedKeys;
+  }),
+  stopSessionResetSubagents: vi.fn(
+    async (params: { beforeKill?: () => boolean | Promise<boolean> }) => {
+      await params.beforeKill?.();
+      return { stopped: 0, failed: 0 };
+    },
+  ),
 }));
 
 const sessionHookMocks = vi.hoisted(() => ({
@@ -184,8 +196,8 @@ vi.mock("../../auto-reply/reply/queue/cleanup.js", async () => {
   );
   return {
     ...actual,
-    clearSessionLifecycleQueues: sessionCleanupMocks.clearSessionLifecycleQueues.mockImplementation(
-      actual.clearSessionLifecycleQueues,
+    clearSessionQueues: sessionCleanupMocks.clearSessionQueues.mockImplementation(
+      actual.clearSessionQueues,
     ),
   };
 });
@@ -304,7 +316,7 @@ function createGatewaySessionsTestHarness(startServer: boolean, setup?: GatewayS
     const { clearConfigCache, clearRuntimeConfigSnapshot } = await getGatewayConfigModule();
     clearRuntimeConfigSnapshot();
     clearConfigCache();
-    sessionCleanupMocks.clearSessionLifecycleQueues.mockClear();
+    sessionCleanupMocks.clearSessionQueues.mockClear();
     sessionCleanupMocks.stopSessionResetSubagents.mockClear();
     sessionHookMocks.hasInternalHookListeners.mockReset();
     sessionHookMocks.hasInternalHookListeners.mockReturnValue(true);
@@ -331,7 +343,8 @@ function createGatewaySessionsTestHarness(startServer: boolean, setup?: GatewayS
     Object.values(acpManagerMocks).forEach((mock) => mock.mockClear());
     browserSessionTabMocks.closeTrackedBrowserTabsForSessions.mockClear();
     browserSessionTabMocks.closeTrackedBrowserTabsForSessions.mockResolvedValue(0);
-    bundleMcpRuntimeMocks.disposeSessionMcpRuntime.mockClear();
+    // Unconsumed one-shot callbacks can retain the previous case's database admission.
+    bundleMcpRuntimeMocks.disposeSessionMcpRuntime.mockReset();
     bundleMcpRuntimeMocks.disposeSessionMcpRuntime.mockResolvedValue(undefined);
     bundleMcpRuntimeMocks.retireSessionMcpRuntime.mockReset();
     bundleMcpRuntimeMocks.retireSessionMcpRuntime.mockImplementation(async ({ sessionId }) => {
@@ -523,7 +536,6 @@ export function sessionStoreEntry(sessionId: string, overrides: Partial<SessionE
 export function expectActiveRunCleanup(
   requesterSessionKey: string,
   expectedQueueKeys: string[],
-  sessionId: string,
   requesterAgentId: string,
 ) {
   expect(sessionCleanupMocks.stopSessionResetSubagents).toHaveBeenCalledWith(
@@ -533,22 +545,31 @@ export function expectActiveRunCleanup(
       agentId: requesterAgentId,
     }),
   );
-  expect(sessionCleanupMocks.clearSessionLifecycleQueues).toHaveBeenCalledTimes(1);
-  expect(sessionCleanupMocks.clearSessionLifecycleQueues).toHaveBeenCalledWith(
+  expectSessionQueueCleanup(expectedQueueKeys, requesterSessionKey, requesterAgentId);
+  expect(embeddedRunMock.abortCalls).toEqual([]);
+  expect(embeddedRunMock.waitCalls).toEqual([]);
+}
+
+function expectSessionQueueCleanup(
+  expectedQueueKeys: string[],
+  requesterSessionKey: string,
+  requesterAgentId: string,
+) {
+  expect(sessionCleanupMocks.clearSessionQueues).toHaveBeenCalledTimes(1);
+  expect(sessionCleanupMocks.clearSessionQueues).toHaveBeenCalledWith(
+    expect.arrayContaining(expectedQueueKeys),
     expect.objectContaining({
-      keys: expect.arrayContaining(expectedQueueKeys),
       agentId: requesterAgentId,
+      aliases: expect.arrayContaining(expectedQueueKeys),
       sessionKey: requesterSessionKey,
-      sessionId,
-      assertCurrent: expect.any(Function),
     }),
+    undefined,
+    expect.any(Function),
   );
-  expect(embeddedRunMock.abortCalls).toEqual([sessionId]);
-  expect(embeddedRunMock.waitCalls).toEqual([sessionId]);
 }
 
 export function expectNoSessionQueueCleanup() {
-  expect(sessionCleanupMocks.clearSessionLifecycleQueues).not.toHaveBeenCalled();
+  expect(sessionCleanupMocks.clearSessionQueues).not.toHaveBeenCalled();
 }
 
 type SessionsHandlers = Awaited<ReturnType<typeof getSessionsHandlers>>;
@@ -588,12 +609,12 @@ export async function directSessionReq<TPayload = unknown>(
     throw new Error(`missing sessions handler for ${method}`);
   }
   const contextKey = opts?.context ?? defaultDirectContext;
-  const existingContext = directContexts.get(contextKey);
+  const context = directContexts.get(contextKey) ?? createDirectChatContext();
   const contextFields: GatewayRequestContext = createDirectChatContext({
+    // Later requests must not orphan active reply buffers and their release callbacks.
+    chatRunState: context.chatRunState,
     broadcastToConnIds: vi.fn(),
-    chatAbortControllers: existingContext?.chatAbortControllers ?? new Map(),
-    chatQueuedTurns: existingContext?.chatQueuedTurns ?? new Map(),
-    dedupe: existingContext?.dedupe ?? new Map(),
+    dedupe: new Map(),
     getSessionEventSubscriberConnIds: () => new Set<string>(),
     readPreparedGatewayModelCatalog: async () => {
       const catalog = await contextFields.loadGatewayModelCatalogSnapshot();
@@ -602,7 +623,6 @@ export async function directSessionReq<TPayload = unknown>(
     getRuntimeConfig,
     ...opts?.context,
   });
-  const context = existingContext ?? createDirectChatContext();
   Object.assign(context, contextFields);
   directContexts.set(contextKey, context);
   if (
@@ -684,3 +704,22 @@ export {
   browserSessionTabMocks,
   bundleMcpRuntimeMocks,
 };
+
+export function createRepositoryDeviceHarness(failureMessage: string): AgentHarness {
+  return {
+    id: "repository-device",
+    label: "Repository device",
+    autoSelection: { providerIds: ["repository-provider"] },
+    supports: () => ({ supported: true }),
+    cloudPlacement: {
+      mode: "remote-exec",
+      devicePlacement: {
+        requiredNodeCommands: ["runtime.repository.v1"],
+        consumesWorkerSlot: false,
+      },
+    },
+    runAttempt: async () => {
+      throw new Error(failureMessage);
+    },
+  };
+}

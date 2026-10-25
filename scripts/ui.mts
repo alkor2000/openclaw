@@ -444,10 +444,7 @@ async function buildAndPublishUi(
       script,
     ];
     const cache =
-      env.OPENCLAW_BUILD_CACHE !== "0" &&
-      env.BUILD_ALL_CACHE_ROOT?.trim() &&
-      toolCall.args.length === 2 &&
-      toolCall.args[1] === "build"
+      env.OPENCLAW_BUILD_CACHE !== "0" && toolCall.args.length === 2 && toolCall.args[1] === "build"
         ? await import("./lib/build-artifact-cache.mts")
         : undefined;
     const sourcePluginInventory =
@@ -482,7 +479,9 @@ async function buildAndPublishUi(
           "package.json",
           "pnpm-lock.yaml",
           "tsconfig.json",
-          "docs/assets/openclaw-hero-dark.png",
+          // Poster generation reads bundled fonts outside the UI source tree.
+          "src/gateway/assets/session-card/Lato-Regular.ttf",
+          "src/gateway/assets/session-card/InstrumentSerif-Regular.ttf",
           // Package metadata discovers new generations; all copied files (including
           // deferred chunks absent from Vite's module graph) invalidate reuse.
           ...(() => {
@@ -541,6 +540,7 @@ async function buildAndPublishUi(
       cache?.restoreBuildStepCacheOutputs(cacheState, {
         rootDir: repoRoot,
         artifactRoot: staging,
+        staging: true,
       });
     if (reuseOutput) {
       const { runnerImport } = await import("vite");
@@ -559,6 +559,13 @@ async function buildAndPublishUi(
             [
               {
                 ...toolCall,
+                options: {
+                  ...toolCall.options,
+                  env: {
+                    ...toolCall.options.env,
+                    OPENCLAW_CONTROL_UI_PREPARED_SETTINGS_ROOT: repoRoot,
+                  },
+                },
                 args: distArtifactEntryArgs(
                   toolCall.args[0]!,
                   [...toolCall.args.slice(1), "--outDir", staging],
@@ -578,7 +585,8 @@ async function buildAndPublishUi(
         return result;
       }
     }
-    if (cache && cacheState) {
+    // A cache hit refreshes identity only in staging; its validated seed is immutable.
+    if (cache && cacheState && !reuseOutput) {
       const consumedInputs: string[] = JSON.parse(
         fs.readFileSync(path.join(staging, ".build-inputs.json"), "utf8"),
       );

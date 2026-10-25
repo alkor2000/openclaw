@@ -10,7 +10,7 @@ import {
 import { awaitGateBeforeSettlement, createDeferred } from "../../../test/helpers/promise.js";
 import { observeHostDataSql } from "../../../test/helpers/sqlite-statement-execution-counter.js";
 import { resolveAgentDir } from "../../agents/agent-scope.js";
-import { waitForEmbeddedAgentRunEnd } from "../../agents/embedded-agent-runner/runs.js";
+import { modelDefinition } from "../../agents/model-auth.fixtures.test-support.js";
 import { isRecordedModelFallbackStop } from "../../agents/model-fallback-stop.js";
 import { acquireAgentRunPreparedModelRuntime } from "../../agents/prepared-model-runtime.js";
 import { SessionTranscriptMessageCommittedError } from "../../agents/sessions/session-manager-message-error.js";
@@ -24,7 +24,6 @@ import {
   resolveCoreToolExecutionLocation,
 } from "../../agents/tool-catalog.js";
 import { patchSessionEntryCore } from "../../config/sessions/session-accessor.js";
-import { resolveSqliteReadScope } from "../../config/sessions/session-accessor.sqlite-scope.js";
 import { setActiveNodeContexts } from "../../infra/active-node-context.js";
 import { resolveNodeWorkerLaunchToolNames } from "../../infra/node-runner-inventory.js";
 import { requireNodeSqlite } from "../../infra/node-sqlite.js";
@@ -34,6 +33,7 @@ import {
   initializeGlobalHookRunner,
   resetGlobalHookRunner,
 } from "../../plugins/hook-runner-global.js";
+import { waitForSessionRunEnd } from "../../sessions/session-controller.native-runtime.js";
 import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
 import { closeStateDatabaseForTest } from "../../test-utils/database-cleanup.js";
 import { observeMainThreadSql } from "../../test-utils/main-thread-sql-spies.test-support.js";
@@ -329,10 +329,7 @@ describe("worker turn execution", () => {
         expect(outcome).toBeInstanceOf(SessionTranscriptMessageCommittedError);
         expect(outcome).toMatchObject({
           committedMessageId,
-          committedTarget: {
-            ...sessionTarget,
-            storePath: resolveSqliteReadScope(sessionTarget).path,
-          },
+          committedTarget: sessionTarget,
           cause: expectedFailure,
         });
         expect(isRecordedModelFallbackStop(outcome)).toBe(true);
@@ -371,7 +368,7 @@ describe("worker turn execution", () => {
           ownerEpoch: request.plan.admission.ownerEpoch,
           turnClaim: request.turnClaim,
         });
-        expect(runtime?.getInheritedPublicationToolName()).toBeUndefined();
+        expect(runtime?.getAdditionalInheritedToolNames()).toEqual([]);
         throw new WorkerRunnerCapacityError();
       });
       const tunnel = createWorkerTurnTunnel({
@@ -742,7 +739,7 @@ describe("worker turn execution", () => {
       abort.abort(new Error("cancel after terminal acknowledgement"));
       release.resolve();
       expect(await operation).toMatchObject({ payloads: [{ text: "Committed reply 🦞" }] });
-      await waitForEmbeddedAgentRunEnd(SESSION_ID, null);
+      await waitForSessionRunEnd(SESSION_ID, null);
       expect((await openSessionManager()).getPersistedEntries()).toEqual(committed);
       expect(readWorkerTurnTranscriptStorageRows()).toEqual(committedRows);
       expect(await placements.listPendingWorkspaceResultsAsync()).toEqual([]);
@@ -901,16 +898,13 @@ describe("worker turn execution", () => {
                     api: "openai-completions",
                     apiKey: "synthetic-worker-api-key",
                     models: [
-                      {
-                        id: "plain",
+                      modelDefinition("plain", {
                         name: "Plain",
                         reasoning: testCase.reasoning,
                         thinkingLevelMap: testCase.thinkingLevelMap,
-                        input: ["text"],
                         contextWindow: 8192,
                         maxTokens: 2048,
-                        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                      },
+                      }),
                     ],
                   },
                 },
@@ -935,7 +929,7 @@ describe("worker turn execution", () => {
       expect(descriptor?.assignment.systemPrompt).not.toContain("Use `sessions_spawn`");
       expect(runLocal).not.toHaveBeenCalled();
       expect(descriptor?.assignment.toolAuthority).toMatchObject({
-        allowedToolNames: [],
+        allowedToolNames: ["exec", "process"],
         exec: { host: "gateway", security: "full", ask: "always" },
       });
     },

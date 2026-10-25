@@ -12,11 +12,87 @@ import {
   installMockGateway,
   sessionsListResponse,
 } from "./session-management.test-support.ts";
+import { sessionsList } from "./session-ownership-fixtures.test-support.ts";
+import { selectAllSidebarSessions } from "./sidebar-navigation.test-support.ts";
+import {
+  chooseSidebarMenuOption,
+  chooseSidebarOwner,
+  closeSidebarMenu,
+} from "./sidebar-session-menu.test-support.ts";
 
 const suite = createSessionManagementE2eSuite();
 const rosterMatch = { includeGlobal: true };
 
 suite.define(() => {
+  it("keeps inline-owner titles clear of surfaced actions", async () => {
+    const context = await suite.newBrowserContext(createControlUiE2eContextOptions());
+    const page = await context.newPage();
+    const response = sessionsList(undefined, false, { categories: false });
+    response.sessions[0]!.label =
+      "A long owner-scoped session title that must stop before the archive action";
+    const gateway = await installMockGateway(page, {
+      sessionKey: "agent:main:ada",
+      presenceUsers: [{ self: true, id: "profile-patrick", name: "Patrick" }],
+      methodResponses: {
+        "sessions.list": {
+          cases: [
+            {
+              match: { ownerId: "profile-ada" },
+              response: { ...response, count: 1, sessions: [response.sessions[0]] },
+            },
+            { response },
+          ],
+        },
+      },
+    });
+    try {
+      await page.goto(controlUiSessionUrl(suite.server.baseUrl, "agent:main:ada"));
+      await selectAllSidebarSessions(page);
+      await chooseSidebarMenuOption(page, "Group by", "Person");
+      await closeSidebarMenu(page);
+      await chooseSidebarOwner(page, "owner:profile-ada");
+      await gateway.waitForRequest("sessions.list", { match: { ownerId: "profile-ada" } });
+      const row = page.locator(
+        '.sidebar-recent-sessions__group--inline-owner .sidebar-recent-session[data-session-key="agent:main:ada"]',
+      );
+      const title = row.locator(".sidebar-recent-session__name");
+      await row.waitFor({ state: "visible" });
+      await page.mouse.move(900, 400);
+      const restingWidth = await title.evaluate((element) => element.clientWidth);
+      for (const state of ["hover", "focus"] as const) {
+        if (state === "hover") {
+          await row.hover();
+        } else {
+          await row.locator("[data-sidebar-session-archive]").focus();
+          await page.mouse.move(900, 400);
+        }
+        const titleBox = await title.boundingBox();
+        const actionsBox = await row.locator(".session-row-actions").boundingBox();
+        if (!titleBox || !actionsBox) {
+          throw new Error("Expected visible owner title and actions");
+        }
+        if (captureUiProofEnabled && state === "hover") {
+          const frame = await takeControlUiScreenshotFrame(page, row, [title], {
+            elements: [row],
+            animations: "disabled",
+          });
+          writeFileSync(
+            path.join(suite.artifactDir, "inline-owner-row.png"),
+            frame.elements[0]!.png,
+          );
+          writeFileSync(
+            path.join(suite.artifactDir, "inline-owner-layout.json"),
+            JSON.stringify({ titleBox, actionsBox, restingWidth }, null, 2),
+          );
+        }
+        expect(titleBox.width).toBeLessThan(restingWidth);
+        expect(titleBox.x + titleBox.width).toBeLessThanOrEqual(actionsBox.x);
+      }
+    } finally {
+      await suite.closeBrowserContext(context);
+    }
+  });
+
   it("keeps the child-toggle point safe after remote child deletion", async () => {
     const context = await suite.newBrowserContext(createControlUiE2eContextOptions());
     const page = await context.newPage();

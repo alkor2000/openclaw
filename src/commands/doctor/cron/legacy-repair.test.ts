@@ -13,9 +13,10 @@ import {
   saveCronStore,
 } from "../../../cron/store.js";
 import { cronStoreKey } from "../../../cron/store/key.js";
+import { loadCronRows } from "../../../cron/store/row-codec.js";
+import { makeCronStreamSandboxTarget } from "../../../cron/stream-sandbox.test-support.js";
 import type { CronJob } from "../../../cron/types.js";
 import { buildUpdateRehearsalPathEnv } from "../../../infra/update-rehearsal-paths.js";
-import { buildUpdateDoctorEnv } from "../../../infra/update-runner-doctor.js";
 import { closeOpenClawAgentDatabasesAsync } from "../../../state/openclaw-agent-db.js";
 import {
   closeOpenClawStateDatabaseAsync,
@@ -23,6 +24,7 @@ import {
 } from "../../../state/openclaw-state-db.js";
 import { withEnvAsync } from "../../../test-utils/env.js";
 import { withOpenClawTestState } from "../../../test-utils/openclaw-test-state.js";
+import { externalDoctorEnv } from "../../doctor-update.test-support.js";
 import { collectLegacyCronStoreHealthFindings, maybeRepairLegacyCronStore } from "./index.js";
 import {
   applyLegacyCronStoreRepair,
@@ -77,12 +79,7 @@ async function loadRepairStateForStore(storePath: string) {
 }
 
 const updateDoctorEnv = {
-  ...buildUpdateDoctorEnv({
-    allowGatewayServiceRepair: false,
-    allowGatewayActivation: false,
-    serviceRepairPolicy: "external",
-    deferConfiguredPluginInstallRepair: true,
-  }),
+  ...externalDoctorEnv(),
   OPENCLAW_COMPATIBILITY_HOST_VERSION: undefined,
 };
 
@@ -197,10 +194,16 @@ it("preserves current-session delivery through SQLite repair and reload", async 
     { agentId: "main", sessionKey: current.sessionKey! },
     { sessionId: "current-source", updatedAt: 1 },
   );
-  const store = { version: 1 as const, jobs: [current] };
+  const sandbox = {
+    ...job("sandbox-source"),
+    schedule: { kind: "stream" as const, command: ["watch-source"] },
+    streamSandbox: makeCronStreamSandboxTarget(),
+  };
+  const store = { version: 1 as const, jobs: [current, sandbox] };
   await saveCronStore(storePath, store);
   const { cfg, state } = await loadRepairStateForStore(storePath);
 
+  expect(state.rawJobs[1]).toMatchObject(sandbox);
   const repaired = await applyLegacyCronStoreRepair({ cfg, state });
   const reloaded = (await loadCronStore(storePath)).jobs[0]!;
 
@@ -214,6 +217,14 @@ it("preserves current-session delivery through SQLite repair and reload", async 
   await expect(resolveCronDeliveryPreview({ cfg, job: reloaded })).resolves.toEqual({
     label: "announce -> current session",
     detail: "commits to this conversation (no external channel route)",
+  });
+  expect((await loadCronStore(storePath)).jobs[1]).toMatchObject(sandbox);
+  const row = loadCronRows(openOpenClawStateDatabase().db, cronStoreKey(storePath)).find(
+    (entry) => entry.job_id === sandbox.id,
+  );
+  expect(JSON.parse(row?.job_json ?? "null")).toMatchObject({
+    schedule: { kind: "sandbox-stream" },
+    streamSandbox: sandbox.streamSandbox,
   });
 });
 

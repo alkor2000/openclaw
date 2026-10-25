@@ -1,4 +1,4 @@
-import { lstat } from "node:fs/promises";
+import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
@@ -7,8 +7,7 @@ import {
   closeOpenClawStateDatabaseAsync,
 } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { makeQaRuntimeEnvParams } from "./gateway-child-command.test-support.js";
-import { buildQaRuntimeEnv } from "./gateway-child-env.js";
+import { createQaGatewaySetupHarness } from "./gateway-child-setup.test-support.js";
 import {
   assertQaLiveCodexAuthAvailable,
   stageQaLiveAnthropicSetupToken,
@@ -19,17 +18,21 @@ import { stageQaMockAuthProfiles } from "./providers/shared/mock-auth.js";
 import { createTempDirHarness } from "./temp-dir.test-helper.js";
 
 const tempDirs = createTempDirHarness();
+const setup = createQaGatewaySetupHarness();
 
 beforeEach(() => {
   vi.stubEnv("OPENCLAW_QA_LIVE_ANTHROPIC_SETUP_TOKEN", undefined);
   vi.stubEnv("OPENCLAW_LIVE_SETUP_TOKEN_VALUE", undefined);
+  vi.stubEnv("OPENCLAW_QA_LIVE_ANTHROPIC_SETUP_TOKEN_PROFILE", undefined);
 });
 
 afterEach(async () => {
+  await setup.cleanup();
   await closeOpenClawAgentDatabasesAsync();
   await closeOpenClawStateDatabaseAsync();
   await tempDirs.cleanup();
   vi.unstubAllEnvs();
+  vi.restoreAllMocks();
 });
 
 function readAuthProfileStore(stateDir: string, agentId: string) {
@@ -54,14 +57,68 @@ async function stageLive(env: NodeJS.ProcessEnv, cfg: OpenClawConfig = {}) {
 }
 
 describe("QA Gateway auth profile staging", () => {
+  it.each(["explicit", "default"])(
+    "prepares selected providers and auth from the %s JSON5 config",
+    async (source) => {
+      const home = await tempDirs.makeTempDir("qa-json5-home-");
+      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      await mkdir(path.dirname(configPath));
+      await writeFile(
+        configPath,
+        `{
+          // Normal OpenClaw config syntax, not strict JSON.
+          models: { providers: {
+            'custom-openai': {
+              baseUrl: 'https://proxy.example.test/v1',
+              api: 'openai-responses',
+              apiKey: 'qa-json5-key',
+              models: [],
+            },
+            ignored: { baseUrl: 'https://ignored.example.test', models: [] },
+          } },
+        }`,
+      );
+      vi.spyOn(os, "homedir").mockReturnValue(home);
+      const {
+        cfg,
+        stateDir,
+        configPath: childConfigPath,
+      } = await setup.prepare(
+        {
+          providerMode: "live-frontier",
+          primaryModel: "custom-openai/fixture",
+          alternateModel: "custom-openai/fixture",
+        },
+        {
+          OPENCLAW_CONFIG_PATH: undefined,
+          OPENCLAW_QA_LIVE_PROVIDER_CONFIG_PATH: source === "explicit" ? configPath : undefined,
+        },
+      );
+      expect(JSON.parse(await readFile(childConfigPath, "utf8")).models.providers).toEqual({
+        "custom-openai": {
+          baseUrl: "https://proxy.example.test/v1",
+          api: "openai-responses",
+          apiKey: "qa-json5-key",
+          models: [],
+        },
+      });
+      expect(cfg.plugins?.allow).toContain("openai");
+      for (const agentId of ["main", "qa"]) {
+        expect(
+          (await readAuthProfileStore(stateDir, agentId)).profiles["qa-live-custom-openai-env"],
+        ).toMatchObject({ type: "api_key", provider: "custom-openai", key: "qa-json5-key" });
+      }
+    },
+  );
+
   it("stages a live Anthropic setup-token profile for isolated QA workers", async () => {
     const stateDir = await tempDirs.makeTempDir("qa-setup-token-state-");
     const token = `sk-ant-oat01-${"c".repeat(80)}`;
+    vi.stubEnv("OPENCLAW_LIVE_SETUP_TOKEN_VALUE", token);
 
     const cfg = await stageQaLiveAnthropicSetupToken({
       cfg: {},
       stateDir,
-      env: { OPENCLAW_LIVE_SETUP_TOKEN_VALUE: token },
     });
 
     expect(cfg.auth?.profiles?.["anthropic:qa-setup-token"]).toMatchObject({
@@ -115,13 +172,14 @@ describe("QA Gateway auth profile staging", () => {
     for (const agentId of ["main", "qa"]) {
       expect((await readAuthProfileStore(stateDir, agentId)).profiles).toEqual({});
     }
-    const env = buildQaRuntimeEnv({
-      ...makeQaRuntimeEnvParams(baseEnv),
-      stateDir,
-      providerMode: "live-frontier",
-    });
+    const { env } = await setup.prepare(
+      {
+        providerMode: "live-frontier",
+      },
+      baseEnv,
+    );
     expect(env.CODEX_API_KEY).toBe("synthetic-qa-api-key");
-    expect(env).not.toHaveProperty("OPENCLAW_QA_CODEX_API_KEY_HANDOFF");
+    expect("OPENCLAW_QA_CODEX_API_KEY_HANDOFF" in env).toBe(false);
   });
 
   it.each([

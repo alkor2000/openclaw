@@ -21,7 +21,11 @@ import * as operationAdmission from "../../infra/sqlite-worker-operation-admissi
 import { setGatewayPluginMetadataSnapshot } from "../../plugins/current-plugin-metadata-snapshot.js";
 import { retainGatewayPluginMetadata } from "../../plugins/plugin-metadata-lifecycle.js";
 import { resolvePluginMetadataSnapshotAsync } from "../../plugins/plugin-metadata-snapshot.js";
-import * as sessionLifecycle from "../../sessions/session-lifecycle-admission.js";
+import * as sessionControllerLifecycle from "../../sessions/session-controller.lifecycle.js";
+import {
+  getRpcSource,
+  getRpcSourceIdentity,
+} from "../../sessions/session-controller.rpc-sources.js";
 import { resolveOpenClawAgentSqlitePath } from "../../state/openclaw-agent-db.paths.js";
 import { requireOpenClawStateDatabaseIdentity } from "../../state/openclaw-state-db-cache.js";
 import { openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
@@ -48,6 +52,24 @@ import { prepareChatSendSession } from "./chat-send-session.js";
 
 type Admission = Awaited<ReturnType<typeof admitChatSend>>;
 type Session = Awaited<ReturnType<typeof prepareChatAdmission>>["session"];
+type SubmittedInput = Awaited<ReturnType<typeof sessionAccessor.readSessionSubmittedInput>>;
+type SubmittedInputScope = Parameters<typeof sessionAccessor.readSessionSubmittedInput>[0];
+function submittedInputReader(message: SubmittedInput) {
+  function read(
+    scope: SubmittedInputScope,
+    key: string,
+    options: { includeSource: true },
+  ): Promise<{ message: NonNullable<SubmittedInput>; source: "transcript" } | undefined>;
+  function read(scope: SubmittedInputScope, key: string): Promise<SubmittedInput>;
+  async function read(
+    _scope: SubmittedInputScope,
+    _key: string,
+    options?: { includeSource: true },
+  ) {
+    return message && options?.includeSource ? { message, source: "transcript" as const } : message;
+  }
+  return read;
+}
 function admissionFixture(cfg: OpenClawConfig, runId: string) {
   const scope = { agentId: "main", sessionKey: `agent:main:dashboard:${runId}` };
   const context = createDirectChatContext({ getRuntimeConfig: () => cfg });
@@ -83,7 +105,7 @@ function cleanupAdmission(admitted: Admission | undefined, runId: string) {
   clearAgentRunContext(runId);
 }
 function lifecycleRelease(session: Session) {
-  return sessionLifecycle.getSessionWorkAdmissionRelease({
+  return sessionControllerLifecycle.captureSessionControllerSettlement({
     scope: session.storePath,
     identities: [session.sessionKey, session.entry?.sessionId],
   });
@@ -273,8 +295,8 @@ it.each(["unchanged", "caller revoked", "session replaced"] as const)(
       using diagnostics = startChatSendDiagnostics(log);
       const queued = createDeferred();
       const begin = createDeferred();
-      const beginAdmission = sessionLifecycle.beginSessionWorkAdmission;
-      using delayedAdmission = vi.spyOn(sessionLifecycle, "beginSessionWorkAdmission");
+      const beginAdmission = sessionControllerLifecycle.beginSessionEffect;
+      using delayedAdmission = vi.spyOn(sessionControllerLifecycle, "beginSessionEffect");
       delayedAdmission.mockImplementationOnce(async (params) => {
         queued.resolve();
         await begin.promise;
@@ -388,10 +410,12 @@ it.each(["unchanged", "caller revoked", "session replaced"] as const)(
           change === "unchanged",
         );
         if (change === "unchanged") {
-          expect(context.chatAbortControllers.get(runId)?.sessionId).toBe(entry.sessionId);
+          expect(getRpcSourceIdentity(getRpcSource(runId)!)).toMatchObject({
+            sessionId: entry.sessionId,
+          });
           expect(respond).not.toHaveBeenCalled();
         } else {
-          expect(context.chatAbortControllers.size).toBe(0);
+          expect(getRpcSource(runId)).toBeUndefined();
           expect(respond.mock.calls[0]?.[2]?.message).toContain(
             change === "caller revoked"
               ? "Original chat caller revoked"
@@ -557,7 +581,7 @@ it("releases rejected upload reservations so corrected input can reuse its key",
           await expect(admission).resolves.toMatchObject({ ok: false });
         }
         expect(context.dedupe.has(blocked.session.pendingChatSendKey)).toBe(false);
-        expect(context.chatAbortControllers.size).toBe(0);
+        expect(getRpcSource(runId)).toBeUndefined();
         const corrected = await f.prepare({
           context,
           params: { idempotencyKey: runId },
@@ -576,12 +600,12 @@ it("releases rejected upload reservations so corrected input can reuse its key",
     },
     { gateway: { uploads: { enabled: false } } },
   ));
-it.each(["known-source", "new-terminal", "new-receipt"] as const)(
+it.each(["new-terminal", "new-receipt"] as const)(
   "refuses a conflicting or unprepared %s after admission waits",
   (source) =>
     withAdmissionTest("chat-admission-retry-comparison", async (f) => {
       const { scope, runId, context } = f;
-      f.seed(source === "known-source" ? { restartRecoveryTerminalRunIds: [runId] } : {});
+      f.seed();
       const admission = await f.prepare();
       const { session } = admission;
       if (source === "new-terminal") {
@@ -592,20 +616,19 @@ it.each(["known-source", "new-terminal", "new-receipt"] as const)(
         });
       }
       const comparison = vi.spyOn(sessionAccessor, "readSessionSubmittedInput");
-      if (source === "known-source") {
-        comparison.mockResolvedValueOnce({ role: "user", timestamp: 100, content: "Hello" });
-      }
-      comparison.mockResolvedValue({
-        role: "user",
-        timestamp: 100,
-        content: "Hello",
-        __openclaw: { humanMentions: [{ profileId: "bob", start: 0, end: 5 }] },
-      });
-      const begin = sessionLifecycle.beginSessionWorkAdmission;
+      comparison.mockImplementation(
+        submittedInputReader({
+          role: "user",
+          timestamp: 100,
+          content: "Hello",
+          __openclaw: { humanMentions: [{ profileId: "bob", start: 0, end: 5 }] },
+        }),
+      );
+      const begin = sessionControllerLifecycle.beginSessionEffect;
       const publication =
         source === "new-receipt"
           ? vi
-              .spyOn(sessionLifecycle, "beginSessionWorkAdmission")
+              .spyOn(sessionControllerLifecycle, "beginSessionEffect")
               .mockImplementation(async (params) => {
                 const lease = await begin(params);
                 context.dedupe.delete(pendingChatSendDedupeKey(runId));
@@ -634,16 +657,18 @@ it.each(["known-source", "new-terminal", "new-receipt"] as const)(
               : {
                   code: "INVALID_REQUEST",
                   message: expect.stringContaining("already used for different input"),
-                  ...(source === "known-source"
-                    ? { details: { reason: "chat-request-conflict" } }
-                    : {}),
                 },
           ),
         );
-        expect(context.chatAbortControllers.size).toBe(0);
+        expect(getRpcSource(runId)).toBeUndefined();
         expect(context.dedupe.has(pendingChatSendDedupeKey(runId))).toBe(false);
         expect(context.dedupe.size).toBe(source === "new-receipt" ? 1 : 0);
-        expect(lifecycleRelease(session)).toBeUndefined();
+        expect(
+          sessionControllerLifecycle.isSessionControllerWorkActive(session.storePath, [
+            session.sessionKey,
+            session.entry?.sessionId,
+          ]),
+        ).toBe(false);
       } finally {
         publication?.mockRestore();
         comparison.mockRestore();
@@ -762,11 +787,11 @@ it.each([
       expect(result.ok).toBe(accepted);
       if (accepted && result.ok) {
         expect(respond).not.toHaveBeenCalled();
-        expect(context.chatAbortControllers.size).toBe(1);
+        expect(getRpcSource(runId)).toBeDefined();
         expect(Boolean(result.value.restartSafeAdmission)).toBe(change === "retired placement");
       } else {
         expect(respond).toHaveBeenCalledOnce();
-        expect(context.chatAbortControllers.size).toBe(0);
+        expect(getRpcSource(runId)).toBeUndefined();
       }
       expect(context.dedupe.has(pendingChatSendDedupeKey(runId))).toBe(false);
       expect(sessionAccessor.loadSessionEntry(scope)).toEqual(initialEntry);
@@ -788,10 +813,34 @@ it.each([
       await Promise.allSettled([pending]);
       cleanupAdmission(admitted, runId);
     }
-    expect(context.chatAbortControllers.size).toBe(0);
+    expect(getRpcSource(runId)).toBeUndefined();
     expect(lifecycleRelease(session)).toBeUndefined();
     if (admitted?.ok) {
       expect(admitted.value.gatewayWorkAdmission.isActive()).toBe(false);
     }
   }),
 );
+it("names the changed store key when refusing a send prepared against stale storage", () =>
+  withAdmissionTest("chat-admission-store-key-changed", async (f) => {
+    f.seed();
+    const admission = await f.prepare();
+    const { sessionTarget } = admission.session;
+    const respond = vi.fn();
+    const outcome = await admitChatSend({
+      ...admission,
+      session: {
+        ...admission.session,
+        sessionTarget: { ...sessionTarget, storeKey: `${sessionTarget.storeKey}:replaced` },
+      },
+      respond,
+    });
+    expect(outcome.ok).toBe(false);
+    expect(respond).toHaveBeenCalledWith(
+      false,
+      undefined,
+      expect.objectContaining({
+        message: "Error: Session storage changed while starting work (store key). Retry.",
+      }),
+    );
+    expect(getRpcSource(f.runId)).toBeUndefined();
+  }));

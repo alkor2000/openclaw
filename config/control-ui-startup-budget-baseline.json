@@ -1,5 +1,5 @@
 {
-  "startupJsGzipBytes": 338803,
-  "reason": "Integrated main after schema and syntax-highlighting deferrals measures 338803 B at startup; cap at 338900 B with the existing 64 B build-variance allowance.",
-  "updatedAt": "2026-10-17"
+  "startupJsGzipBytes": 270085,
+  "reason": "Consolidated asset delivery on main 39ceca404cec preserves the shared plugin-inline-view contract. Same-host production builds reduce startup from 273896 to 270085 B gzip and from seven to five JS requests, retaining one startup CSS request. Ratchet to the measured integrated head.",
+  "updatedAt": "2026-10-25"
 }

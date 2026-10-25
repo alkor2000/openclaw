@@ -11,8 +11,11 @@ import {
   runExclusiveSqliteSessionWrite,
 } from "../config/sessions/session-accessor.sqlite-scope.js";
 import type { SessionEntry } from "../config/sessions/types.js";
-import { createGatewayActiveWorkSnapshot } from "../infra/gateway-active-work.js";
-import { beginSessionWorkAdmission } from "../sessions/session-lifecycle-admission.js";
+import {
+  createGatewayActiveWorkSnapshot,
+  waitForGatewayActiveWork,
+} from "../infra/gateway-active-work.js";
+import { beginSessionEffect } from "../sessions/session-controller.lifecycle.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
 import { ensureProfileForEmail } from "../state/user-profiles.js";
@@ -166,7 +169,12 @@ test.for([
       error: { message: "Runtime unavailable" },
     });
     expect(await successor).toMatchObject({ ok: true });
-    expect(createGatewayActiveWorkSnapshot()).toMatchObject({ idle: true, blockers: [] });
+    expect(createGatewayActiveWorkSnapshot().counts.sessionMutations).toBe(0);
+    // Client closure does not settle detached connect work.
+    expect(await waitForGatewayActiveWork(5_000)).toMatchObject({
+      drained: true,
+      snapshot: { idle: true, blockers: [] },
+    });
   },
 );
 
@@ -376,7 +384,7 @@ test("sessions.create rechecks Fast Mode before interrupting reset work", async 
   await seedMain("sess-fast-race", { fastMode: false });
   let interrupted = false;
   let releaseAdmission = () => {};
-  const admission = await beginSessionWorkAdmission({
+  const admission = await beginSessionEffect({
     scope: storePath,
     identities: [key, "sess-fast-race"],
     assertAllowed: () => undefined,
@@ -432,7 +440,7 @@ test("sessions.create rejects a Fast Mode change completed by draining work befo
     runId: "fast-drain-run",
   });
   const interrupted = createDeferredCore();
-  const admission = await beginSessionWorkAdmission({
+  const admission = await beginSessionEffect({
     scope: storePath,
     identities: [key, initialEntry.sessionId],
     assertAllowed: () => undefined,

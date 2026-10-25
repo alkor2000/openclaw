@@ -11,6 +11,7 @@ import {
   stageActivePluginRegistry,
 } from "../plugins/runtime.js";
 import { getActiveGatewayRootWorkCount } from "../process/gateway-work-admission.js";
+import { rpcSourceTesting } from "../sessions/session-lifecycle-admission.test-support.js";
 import { trackAsyncWork } from "../shared/async-work-scope.js";
 import { createChannelTestPluginBase, createTestRegistry } from "../test-utils/channel-plugins.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
@@ -24,6 +25,7 @@ import { createGatewayInstanceRuntime } from "./server-instance-runtime.js";
 import type { GatewayRequestContext, GatewayRequestHandlers } from "./server-methods/types.js";
 import { createSyntheticPluginRuntimeClient } from "./server-plugin-runtime-client.js";
 import { getGatewayRecoveryRuntime } from "./server-recovery-runtime-context.js";
+import { createRpcSourceForTest, claimRpcSourceForTest } from "./test-helpers.rpc-source.js";
 
 function createContext(): GatewayRequestContext {
   return {
@@ -31,8 +33,6 @@ function createContext(): GatewayRequestContext {
     deps: {},
     getRuntimeConfig: () => ({}),
     logGateway: { warn: vi.fn(), error: vi.fn() },
-    chatAbortControllers: new Map(),
-    chatQueuedTurns: new Map(),
     dedupe: new Map(),
   } as unknown as GatewayRequestContext;
 }
@@ -146,10 +146,9 @@ it("uses the typed recovery path and fails closed when the owning instance close
     ok: true,
     payload: { runId: "active", status: "accepted" },
   });
-  context.chatAbortControllers.set("active", {
-    controller: new AbortController(),
-    executionStarted: true,
-  } as never);
+  const activeSource = createRpcSourceForTest({}, { runId: "active" });
+  await claimRpcSourceForTest(activeSource);
+  rpcSourceTesting.set("active", activeSource);
   await expect(
     recovery.dispatchAgent({ message: "test", idempotencyKey: "active" }, undefined, {
       onExecutionStarted,
@@ -344,6 +343,20 @@ it.each(["unsubscribe", "resolve", "close"] as const)(
     expect(onRequested).not.toHaveBeenCalled();
   },
 );
+
+it("reads current approval config only while its Gateway instance is open", () => {
+  const initial = { gateway: { publicOrigin: "https://before.example.com" } };
+  const next = { gateway: { publicOrigin: "https://after.example.com" } };
+  let current = initial;
+  const context = { ...createContext(), getRuntimeConfig: () => current };
+  const runtime = createRuntime({ context });
+  const getRuntimeConfig = runtime.nativeApprovals.getRuntimeConfig;
+  expect(getRuntimeConfig()).toBe(initial);
+  current = next;
+  expect(getRuntimeConfig()).toBe(next);
+  runtime.close();
+  expect(() => getRuntimeConfig()).toThrow("Gateway instance approval runtime is closed");
+});
 
 it("rejects methods outside each closed internal principal", async () => {
   const runtime = createRuntime();

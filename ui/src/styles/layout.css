@@ -2029,64 +2029,47 @@ openclaw-settings-save-indicator:empty {
   outline-offset: -2px;
 }
 
-/* A single selected owner's sessions sit directly under the owner picker:
-   titles start at the picker's leading edge, so the link inset only offsets
-   the list's negative inline margin. Status moves to the trailing edge
-   instead of shifting titles, and an empty status slot takes no room. */
+/* A single selected owner's sessions sit directly under the owner picker.
+   The link owns hover clearance; status keeps its own trailing slot. */
 .sidebar-recent-sessions__group--inline-owner
-  .sidebar-recent-session:not(.sidebar-recent-session--child)
-  > .sidebar-recent-session__link
-  > .sidebar-session-indicator {
-  position: absolute;
-  inset-inline-end: calc(6px + (24px - var(--sidebar-lead)) / 2);
-  top: 50%;
-  transform: translateY(-50%);
+  .sidebar-recent-session:not(.sidebar-recent-session--child) {
+  > .sidebar-recent-session__link > .sidebar-session-indicator {
+    position: absolute;
+    inset-inline-end: calc(6px + (24px - var(--sidebar-lead)) / 2);
+    top: 50%;
+    transform: translateY(-50%);
 
-  &:empty {
-    display: none;
+    &:empty {
+      display: none;
+    }
   }
-}
 
-/* Keep activity at the row edge, after hover actions and the child toggle.
-   Empty indicators leave the full title width available. */
-.sidebar-recent-sessions__group--inline-owner
-  .sidebar-recent-session:not(.sidebar-recent-session--child):has(
-    > .sidebar-recent-session__link > .sidebar-session-indicator:not(:empty)
-  ) {
-  --sidebar-session-state-reserve: 24px;
+  &:has(> .sidebar-recent-session__link > .sidebar-session-indicator:not(:empty)) {
+    --sidebar-session-state-reserve: 24px;
+  }
+
+  .shell:not(.shell--mobile-nav) & > .sidebar-recent-session__link {
+    padding-inline-start: 6px;
+  }
+
+  .shell:not(.shell--mobile-nav) &:is(:hover, :focus-within),
+  .shell--mobile-nav & {
+    > .sidebar-recent-session__link {
+      padding-inline-end: calc(
+        var(--session-row-actions-reserve) + var(--sidebar-session-action-extra-space, 0px)
+      );
+    }
+
+    .sidebar-recent-session__text,
+    .sidebar-recent-session__title-row {
+      padding-right: 0;
+    }
+  }
 }
 
 /* No section header separates the rows from the owner picker. */
 .sidebar-recent-sessions > .sidebar-recent-sessions__group--inline-owner:first-child {
   margin-top: calc(4px - var(--sidebar-group-gap));
-}
-
-.shell:not(.shell--mobile-nav)
-  .sidebar-recent-sessions__group--inline-owner
-  .sidebar-recent-session:not(.sidebar-recent-session--child)
-  > .sidebar-recent-session__link {
-  padding-inline-start: 6px;
-}
-
-/* Row actions overlay the link's trailing edge (on hover, or always on the
-   mobile drawer); reserve that space on the link instead of the title so the
-   text and metadata stay clear of them. Status has its own fixed row slot. */
-.shell:not(.shell--mobile-nav)
-  .sidebar-recent-sessions__group--inline-owner
-  .sidebar-recent-session:not(.sidebar-recent-session--child):is(:hover, :focus-within),
-.shell--mobile-nav
-  .sidebar-recent-sessions__group--inline-owner
-  .sidebar-recent-session:not(.sidebar-recent-session--child) {
-  > .sidebar-recent-session__link {
-    padding-inline-end: calc(
-      var(--session-row-actions-reserve) + var(--sidebar-session-action-extra-space, 0px)
-    );
-  }
-
-  .sidebar-recent-session__text,
-  .sidebar-recent-session__title-row {
-    padding-right: 0;
-  }
 }
 
 .sidebar-child-session-toggle {
@@ -2269,21 +2252,46 @@ openclaw-settings-save-indicator:empty {
   padding-right: 2px;
 }
 
-.sidebar-recent-session:not(.sidebar-recent-session--child) > .sidebar-recent-session__aside {
-  position: absolute;
-  inset: 50% calc(4px + var(--sidebar-session-state-reserve, 0px)) auto auto;
-  transform: translateY(-50%);
-  pointer-events: none;
-}
-
-.sidebar-recent-session:not(.sidebar-recent-session--child, .sidebar-recent-session--single-line)
-  > .sidebar-recent-session__link {
-  padding-block: 1px;
-}
-
-.sidebar-recent-session:not(.sidebar-recent-session--child, .sidebar-recent-session--single-line)
+.sidebar-recent-session:not(.sidebar-recent-session--child) {
   > .sidebar-recent-session__aside {
-  top: calc(1px + max(24px, var(--sidebar-title-line-height)) / 2);
+    position: absolute;
+    inset: 50% calc(4px + var(--sidebar-session-state-reserve, 0px)) auto auto;
+    transform: translateY(-50%);
+    pointer-events: none;
+  }
+
+  /* Keep modifier weights so the inline-owner link remains authoritative. */
+  &:where(:not(.sidebar-recent-session--single-line)) {
+    > .sidebar-recent-session__link {
+      padding-block: 1px;
+    }
+
+    > .sidebar-recent-session__aside {
+      top: calc(1px + max(24px, var(--sidebar-title-line-height)) / 2);
+    }
+
+    &:is(:hover, :focus-within) .sidebar-recent-session__title-row {
+      padding-right: calc(
+        var(--session-row-actions-reserve) + var(--sidebar-session-action-extra-space, 0px)
+      );
+    }
+  }
+
+  &:where(.sidebar-recent-session--single-line):is(:hover, :focus-within) {
+    .sidebar-recent-session__text {
+      padding-right: calc(
+        var(--session-row-actions-reserve) + var(--sidebar-session-action-extra-space, 0px)
+      );
+    }
+
+    /* Hover actions replace trailing PR badges; leading state and second-line metadata stay visible. */
+    :is(
+      .session-row-badge--pull-request,
+      .session-row-badges:has(> openclaw-tooltip:only-child > .session-row-badge--pull-request)
+    ) {
+      display: none;
+    }
+  }
 }
 
 .sidebar-recent-session--child > .sidebar-recent-session__aside {
@@ -2312,32 +2320,6 @@ openclaw-settings-save-indicator:empty {
     :has(> .sidebar-child-session-toggle)
   ) {
   --sidebar-session-action-extra-space: var(--sidebar-child-session-toggle-width);
-}
-
-.sidebar-recent-session:not(
-    .sidebar-recent-session--child,
-    .sidebar-recent-session--single-line
-  ):is(:hover, :focus-within)
-  .sidebar-recent-session__title-row {
-  padding-right: calc(
-    var(--session-row-actions-reserve) + var(--sidebar-session-action-extra-space, 0px)
-  );
-}
-
-.sidebar-recent-session--single-line:not(.sidebar-recent-session--child):is(:hover, :focus-within)
-  .sidebar-recent-session__text {
-  padding-right: calc(
-    var(--session-row-actions-reserve) + var(--sidebar-session-action-extra-space, 0px)
-  );
-}
-
-/* Hover actions replace trailing PR badges; leading state and second-line metadata stay visible. */
-.sidebar-recent-session--single-line:not(.sidebar-recent-session--child):is(:hover, :focus-within)
-  :is(
-    .session-row-badge--pull-request,
-    .session-row-badges:has(> openclaw-tooltip:only-child > .session-row-badge--pull-request)
-  ) {
-  display: none;
 }
 
 .nav-collapse-toggle__icon {

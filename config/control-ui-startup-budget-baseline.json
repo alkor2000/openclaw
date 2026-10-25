@@ -1,5 +1,5 @@
 {
-  "startupJsGzipBytes": 325081,
-  "reason": "Solid 2 action/optimistic runtime adoption, W-SOLID2-RECIPES; offset tracked by HF-STARTUP-BUDGET",
-  "updatedAt": "2026-10-21"
+  "startupJsGzipBytes": 270103,
+  "reason": "Cross-route dependency isolation on d5503615074 removes unrelated route code while leaving Cron source unchanged; same-host final startup is 270103 B gzip, 122 B over base.",
+  "updatedAt": "2026-10-25"
 }

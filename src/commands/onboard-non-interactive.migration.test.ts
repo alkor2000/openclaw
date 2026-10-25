@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import * as configIo from "../config/io.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { summarizeMigrationItems } from "../plugin-sdk/migration.js";
 import type {
@@ -124,4 +125,50 @@ it("stages, promotes, and acknowledges an explicit import", async () => {
     fs.access(path.join(stateDir, "migration", "hermes", reportDir!, "onboarding-promotion.json")),
   ).rejects.toThrow();
   expect(ensureWorkspaceAndSessions).not.toHaveBeenCalled();
+});
+
+it("refuses a newly unreadable target after migration planning", async () => {
+  const stateDir = tempRoots.make("openclaw-noninteractive-read-failure-");
+  const source = path.join(stateDir, "hermes-home");
+  const workspace = path.join(stateDir, "workspace");
+  await fs.mkdir(source, { recursive: true });
+  await fs.writeFile(path.join(source, "AGENTS.md"), "Imported agents.\n");
+  vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
+  vi.stubEnv("OPENCLAW_CONFIG_PATH", path.join(stateDir, "openclaw.json"));
+  const read = vi.spyOn(configIo, "readConfigFileSnapshot");
+  const unreadable = '{"$include":"missing.json"}';
+  provider.plan.mockImplementation(async (): Promise<MigrationPlan> => {
+    await fs.writeFile(configPath(), unreadable);
+    const actual = await vi.importActual<typeof configIo>("../config/io.js");
+    read.mockImplementation(actual.readConfigFileSnapshot);
+    return withSummary({
+      providerId: "hermes",
+      source,
+      target: workspace,
+      items: [
+        {
+          id: "workspace:AGENTS.md",
+          kind: "workspace",
+          action: "copy",
+          status: "planned",
+          source: path.join(source, "AGENTS.md"),
+          target: path.join(workspace, "AGENTS.md"),
+        },
+      ],
+    });
+  });
+  try {
+    const result = runNonInteractiveSetup(
+      { nonInteractive: true, workspace, importFrom: "hermes", importSource: source },
+      createThrowingTestRuntime(),
+    );
+    await expect(result).rejects.toThrow("Failed to read include file: missing.json");
+    await expect(result).rejects.not.toThrow("doctor --fix");
+    expect(provider.apply).not.toHaveBeenCalled();
+    expect(provider.plan).toHaveBeenCalledOnce();
+    expect(configStore.has(configPath())).toBe(false);
+    expect(await fs.readFile(configPath(), "utf8")).toBe(unreadable);
+  } finally {
+    read.mockRestore();
+  }
 });

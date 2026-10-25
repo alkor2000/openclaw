@@ -3,6 +3,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import type { UpdateRunRecord } from "../../infra/update-run-record.js";
+import { createUpdateRunRecordFixture } from "../../infra/update-run-record.test-support.js";
 import { writeSkill } from "../../skills/test-support/e2e-test-helpers.js";
 import { withEnvAsync } from "../../test-utils/env.js";
 import {
@@ -10,7 +11,13 @@ import {
   baseStatusOverviewSurface,
   createStatusScanResultFixture,
 } from "../status.test-support.ts";
-import { mocks, runStatusAllReport, setupStatusAllReportTest } from "./report-data.test-support.js";
+import {
+  mocks,
+  runStatusAllReport,
+  reportText,
+  expectReport,
+  setupStatusAllReportTest,
+} from "./report-data.test-support.js";
 
 const localGatewaySnapshot = {
   gatewayReachable: false,
@@ -23,12 +30,9 @@ function localOverview() {
   return {
     cfg: {},
     gatewaySnapshot: { ...localGatewaySnapshot },
-    secretDiagnostics: [],
     tailscaleMode: "off",
     tailscaleDns: null,
     agentStatus: { agents: [], defaultId: null },
-    channels: { rows: [], details: [] },
-    channelIssues: [],
     osSummary: { label: "test" },
   };
 }
@@ -43,52 +47,47 @@ describe("statusAllCommand report data", () => {
       "../status-overview-rows.ts",
     );
     mocks.buildStatusAllOverviewRows.mockImplementationOnce(rows.buildStatusAllOverviewRows);
-    const scan = createStatusScanResultFixture();
-    const output = (
-      await runStatusAllReport({
-        overview: {
-          ...scan,
-          gatewaySnapshot: baseStatusGatewaySnapshot,
-          runtimeDegradation: {
-            degradedSecretOwners: [
-              {
-                ownerKind: "capability",
-                ownerId: "tts",
-                state: "unavailable",
-                degradationState: "cold",
-                paths: ["tts.providers.elevenlabs.apiKey"],
-                reason: "secret reference was not found",
-              },
-              {
-                ownerKind: "provider",
-                ownerId: "openai",
-                state: "unavailable",
-                degradationState: "stale",
-                paths: ["models.providers.openai.apiKey"],
-                reason: "secret provider failed",
-              },
-            ],
-            degradedPlugins: [],
-          },
-          secretDiagnostics: [
-            "status --all: tts.providers.elevenlabs.apiKey is unavailable in this command path; continuing with degraded read-only config.",
-            "channels.discord.accounts.ops.token: token=synthetic-secret",
+    const output = await reportText({
+      overview: {
+        runtimeDegradation: {
+          degradedSecretOwners: [
+            {
+              ownerKind: "capability",
+              ownerId: "tts",
+              state: "unavailable",
+              degradationState: "cold",
+              paths: ["tts.providers.elevenlabs.apiKey"],
+              reason: "secret reference was not found",
+            },
+            {
+              ownerKind: "provider",
+              ownerId: "openai",
+              state: "unavailable",
+              degradationState: "stale",
+              paths: ["models.providers.openai.apiKey"],
+              reason: "secret provider failed",
+            },
           ],
+          degradedPlugins: [],
         },
-      })
-    ).join("\n");
-    expect(output).toContain("Secrets: 3 diagnostics");
-    expect(output).toContain("! Secret diagnostics (3)");
-    expect(output).toContain(
-      "cold capability:tts (tts.providers.elevenlabs.apiKey): secret reference was not found",
+        secretDiagnostics: [
+          "status --all: tts.providers.elevenlabs.apiKey is unavailable in this command path; continuing with degraded read-only config.",
+          "channels.discord.accounts.ops.token: token=synthetic-secret",
+        ],
+      },
+    });
+    expectReport(
+      output,
+      [
+        "Secrets: 3 diagnostics",
+        "! Secret diagnostics (3)",
+        "cold capability:tts (tts.providers.elevenlabs.apiKey): secret reference was not found",
+        "stale provider:openai (models.providers.openai.apiKey): secret provider failed",
+        "channels.discord.accounts.ops.token: ***",
+        "Retry: openclaw secrets reload",
+      ],
+      ["synthetic-secret", "✓ Secret diagnostics (0)"],
     );
-    expect(output).toContain(
-      "stale provider:openai (models.providers.openai.apiKey): secret provider failed",
-    );
-    expect(output).toContain("channels.discord.accounts.ops.token: ***");
-    expect(output).toContain("Retry: openclaw secrets reload");
-    expect(output).not.toContain("synthetic-secret");
-    expect(output).not.toContain("✓ Secret diagnostics (0)");
   });
 
   const success = "✅ OpenClaw updated to 2026.9.2 (from 2026.9.1).";
@@ -127,25 +126,15 @@ describe("statusAllCommand report data", () => {
       );
       mocks.buildStatusAllOverviewRows.mockImplementationOnce(rows.buildStatusAllOverviewRows);
       const failed = phase === "failed";
-      const completed: UpdateRunRecord = {
-        runId: "6631ecee-adbf-41e8-a0e3-1b88b28b0a59",
-        createdAtMs: 1,
-        updatedAtMs: 2,
-        trigger: "cli",
-        phase: "finished",
-        status: failed ? "failed" : "succeeded",
-        reason: failed ? "post-update-failed" : null,
-        origin: {},
-        target: {},
-        before: { version: "2026.9.1" },
-        after: { version: "2026.9.2" },
-        steps: [],
-        verification: {},
-        repair: [],
-        confirmedAtMs: null,
-        finishedAtMs: 2,
-        downtimeMs: null,
-      };
+      const completed: UpdateRunRecord = createUpdateRunRecordFixture(
+        "6631ecee-adbf-41e8-a0e3-1b88b28b0a59",
+        {
+          status: failed ? "failed" : "succeeded",
+          reason: failed ? "post-update-failed" : null,
+          before: { version: "2026.9.1" },
+          after: { version: "2026.9.2" },
+        },
+      );
       if (phase) {
         mocks.history.mockResolvedValue({
           lastRun: completed,
@@ -187,7 +176,6 @@ describe("statusAllCommand report data", () => {
       }
       const report = await runStatusAllReport({
         overview: {
-          ...baseStatusOverviewSurface,
           ...localOverview(),
           update: { ...baseStatusOverviewSurface.update, registry: { latestVersion: "9999.1.1" } },
           gatewaySnapshot: {
@@ -384,11 +372,6 @@ describe("statusAllCommand report data", () => {
     const scan = createStatusScanResultFixture();
     const lines = await runStatusAllReport({
       overview: {
-        ...scan,
-        skipColdStartNetworkChecks: false,
-        gatewaySnapshot: baseStatusGatewaySnapshot,
-        runtimeDegradation: null,
-        channelsStatus: null,
         configDiagnostics: {
           path: "/tmp/openclaw.json",
           issues: [{ path: "gateway.port", message: "invalid" }],
@@ -458,13 +441,15 @@ describe("statusAllCommand report data", () => {
       "render Overview",
     ]);
     const output = lines.join("\n");
-    expect(output).toContain("Bootstrap file");
-    expect(output).toContain("PRESENT");
-    expect(output).toContain("ABSENT");
-    expect(output).toContain("Config diagnostics:");
-    expect(output).toContain("Config file is invalid: /tmp/openclaw.json");
-    expect(output).toContain("gateway.port: invalid");
-    expect(output).toContain("Fix: openclaw doctor --fix");
+    expectReport(output, [
+      "Bootstrap file",
+      "PRESENT",
+      "ABSENT",
+      "Config diagnostics:",
+      "Config file is invalid: /tmp/openclaw.json",
+      "gateway.port: invalid",
+      "Fix: openclaw doctor --fix",
+    ]);
     expect(output.indexOf("Config diagnostics:")).toBeLessThan(
       output.indexOf("OpenClaw status --all"),
     );

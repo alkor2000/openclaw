@@ -258,11 +258,8 @@ describe("runCli exit behavior", () => {
       readConfigFileSnapshotMock.mockResolvedValueOnce({ exists: true, valid: true, sourceConfig });
       probeGatewayConfiguredModelMock.mockImplementationOnce(async (options) =>
         options.url === "ws://127.0.0.1:18789" && !options.originScopedDeviceAuth
-          ? { kind: "reachable-unverified", detail: "missing scope: operator.read" }
-          : {
-              kind: "missing-configured-model",
-              detail: "Gateway default agent has no configured model",
-            },
+          ? "reachable-unverified"
+          : "missing-configured-model",
       );
 
       await runBareCli();
@@ -374,11 +371,8 @@ describe("runCli exit behavior", () => {
         : { httpUrl: "http://127.0.0.1:18789/", wsUrl: "ws://127.0.0.1:18789" },
     );
     probeGatewayConfiguredModelMock
-      .mockResolvedValueOnce({ kind: "reachable-unverified", detail: "config.get: unauthorized" })
-      .mockResolvedValueOnce({
-        kind: "missing-configured-model",
-        detail: "Gateway default agent has no configured model",
-      });
+      .mockResolvedValueOnce("reachable-unverified")
+      .mockResolvedValueOnce("missing-configured-model");
 
     await runBareCli();
 
@@ -394,10 +388,7 @@ describe("runCli exit behavior", () => {
       agents: { defaults: { model: { primary: "openai/local-only-model" } } },
       gateway: { mode: "remote", remote: { url, token: "unverified-remote-auth" } },
     });
-    probeGatewayConfiguredModelMock.mockResolvedValueOnce({
-      kind: "reachable-unverified",
-      detail: "config.get: unauthorized",
-    });
+    probeGatewayConfiguredModelMock.mockResolvedValueOnce("reachable-unverified");
 
     await runBareCli();
 
@@ -412,10 +403,7 @@ describe("runCli exit behavior", () => {
     primeBareRootConfig({
       gateway: { mode: "remote", remote: { url, token: "restart-remote-auth" } },
     });
-    probeGatewayConfiguredModelMock.mockResolvedValueOnce({
-      kind: "unreachable",
-      detail: "gateway restarting",
-    });
+    probeGatewayConfiguredModelMock.mockResolvedValueOnce("unreachable");
 
     await runBareCli();
 
@@ -543,7 +531,7 @@ describe("runCli exit behavior", () => {
       startedAtMs: 1,
       completedAtMs: 2,
     });
-    probeGatewayConfiguredModelMock.mockResolvedValueOnce({ kind: "unreachable" });
+    probeGatewayConfiguredModelMock.mockResolvedValueOnce("unreachable");
 
     await runBareCli();
 

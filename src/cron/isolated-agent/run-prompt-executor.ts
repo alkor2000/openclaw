@@ -1,10 +1,6 @@
 /** Executes one isolated cron prompt with model fallback candidates. */
 import { resolveGroupToolPolicy } from "../../agents/agent-tools.policy.js";
 import { resolveCliBackendConfig } from "../../agents/cli-backends.js";
-import {
-  cliBackendAcceptsAuthProfileForwarding,
-  resolveCliExecutionAuthProfileId,
-} from "../../agents/cli-execution-auth.js";
 import { resolveCliRuntimeToolsAllow } from "../../agents/cli-runner/tool-policy.js";
 import { settleCliSessionResult } from "../../agents/cli-session-store.js";
 import {
@@ -57,6 +53,7 @@ import {
   createCronCandidateExecutionResolver,
   prepareCronCandidateAuthSelection,
   prepareCronCliCandidateAuth,
+  resolveCronCliAuthProfile,
 } from "./run-candidate-runtime.js";
 import { finalizeCronPromptForResolvedTools } from "./run-delivery-trace.js";
 import {
@@ -81,6 +78,18 @@ const cronEmbeddedRuntimeLoader = createLazyImportLoader<CronEmbeddedRuntime>(
   () => import("./run-embedded.runtime.js"),
 );
 
+// A CLI child in its parent's workspace runs native tools no tool check sees, so
+// its process also ends when the parent resets.
+function resolveCliChildAbortSignal(
+  runSignal: AbortSignal | undefined,
+  parentSignal: AbortSignal | undefined,
+): AbortSignal | undefined {
+  if (!parentSignal) {
+    return runSignal;
+  }
+  return runSignal ? AbortSignal.any([runSignal, parentSignal]) : parentSignal;
+}
+
 function hasCliSessionReuseMetadata(binding: CliSessionBinding): boolean {
   return Object.entries(binding).some(([key, value]) => key !== "sessionId" && value !== undefined);
 }
@@ -97,14 +106,7 @@ export function createCronPromptExecutor(
 ) {
   const trigger = params.trigger === "event" ? "event" : "cron";
   const cronFallbacksOverride =
-    params.modelFallbacksOverride ??
-    resolveCronFallbacksOverride({
-      cfg: params.cfg,
-      job: params.job,
-      agentId: params.agentId,
-      useSubagentFallbacks: params.useSubagentFallbacks,
-      inheritDefaultFallbacksForAgentStringModel: params.inheritDefaultFallbacksForAgentStringModel,
-    });
+    params.modelFallbacksOverride ?? resolveCronFallbacksOverride(params);
   const fastModeStartedAtMs = Date.now();
   const fastModeAutoProgressState: FastModeAutoProgressState = {
     offAnnounced: false,
@@ -215,6 +217,10 @@ export function createCronPromptExecutor(
       }),
       operatorAuthority: params.operatorAuthority,
       admissionSource: params.admissionSource,
+      // A child running in its parent's workspace loses every effect once that parent resets.
+      ...(params.occurrence.childParent?.binding
+        ? { assertSourceCurrent: params.occurrence.childParent.assertCurrent }
+        : {}),
       deliveryAttemptFence: params.deliveryAttemptFence,
       cfg: params.cfgWithAgentDefaults,
       agentId: params.agentId,
@@ -397,6 +403,7 @@ export function createCronPromptExecutor(
           agentId: params.agentId,
           sessionKey: params.runSessionKey,
           preparedSessionEntry: params.cronSession.sessionEntry,
+          inheritedSandbox: params.occurrence.childParent?.sandbox,
         });
         assertCronCandidateSandboxPlacement({
           ...sandboxPlacement,
@@ -466,6 +473,9 @@ export function createCronPromptExecutor(
             messageChannel,
             agentAccountId: params.resolvedDelivery.accountId,
             extraSystemPrompt: params.deliverySystemPrompt,
+            extraSystemPromptTurnContext: params.deliverySystemPrompt
+              ? { start: 0, text: params.deliverySystemPrompt }
+              : undefined,
             sourceReplyDeliveryMode: sourceDelivery.sourceReplyDeliveryMode,
             requireExplicitMessageTarget: sourceDelivery.messageTool.requireExplicitTarget,
             messageToolFinalByDefault: sourceDelivery.messageTool.finalByDefault,
@@ -489,11 +499,6 @@ export function createCronPromptExecutor(
               userTurnTranscriptRecorder.hasPersisted() || userTurnTranscriptRecorder.isBlocked(),
           }) satisfies Partial<Parameters<CronEmbeddedRuntime["runEmbeddedAgent"]>[0]>;
         if (cliExecution) {
-          const allowCliAuthProfileForwarding = cliBackendAcceptsAuthProfileForwarding({
-            provider: executionProvider,
-            config: params.cfgWithAgentDefaults,
-            agentId: params.agentId,
-          });
           // Keep CLI work visible to recovery until execution and settlement finish.
           const deferredLifecycle = createDeferredEmbeddedRunLifecycleManager({
             runId,
@@ -501,7 +506,10 @@ export function createCronPromptExecutor(
             sessionId: params.cronSession.sessionEntry.sessionId,
             sessionKey: params.runSessionKey,
             sessionFile: params.runSessionKey,
-            abortSignal: params.abortSignal,
+            abortSignal: resolveCliChildAbortSignal(
+              params.abortSignal,
+              params.occurrence.childParent?.signal,
+            ),
           });
           try {
             const cliAbortSignal = deferredLifecycle.signal;
@@ -517,30 +525,22 @@ export function createCronPromptExecutor(
                 const cliSessionBinding = params.cronSession.isNewSession
                   ? undefined
                   : await getCliSessionBinding(params.cronSession.sessionEntry, executionProvider);
-                const resolveForwardedProfile = (
-                  selected: Parameters<typeof resolveCliExecutionAuthProfileId>[0]["selected"],
-                ) =>
-                  allowCliAuthProfileForwarding
-                    ? resolveCliExecutionAuthProfileId({
-                        cliExecutionProvider: executionProvider,
-                        authProfileProvider: providerOverride,
-                        config: params.cfgWithAgentDefaults,
-                        agentDir: params.agentDir,
-                        sessionBinding: cliSessionBinding,
-                        selected,
-                      })
-                    : Promise.resolve(undefined);
+                const candidateAuthInput = {
+                  params,
+                  sessionTarget,
+                  executionProvider,
+                  provider: providerOverride,
+                  binding: cliSessionBinding,
+                };
                 // A recorded account runs only when this backend forwards exactly that account.
                 const candidateAuth = inference
                   ? {
-                      authProfileId: await inference.resolveCliAuthProfile(resolveForwardedProfile),
+                      authProfileId: await inference.resolveCliAuthProfile((selected) =>
+                        resolveCronCliAuthProfile({ ...candidateAuthInput, selected }),
+                      ),
                     }
                   : await prepareCronCliCandidateAuth({
-                      params,
-                      sessionTarget,
-                      executionProvider,
-                      provider: providerOverride,
-                      binding: cliSessionBinding,
+                      ...candidateAuthInput,
                       selected: readCandidateAuthProfile?.().cli,
                     });
                 const { authProfileId } = candidateAuth;

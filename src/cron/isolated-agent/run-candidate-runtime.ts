@@ -94,20 +94,19 @@ export function prepareCronCandidateAuthSelection(
   };
 }
 
-/** Resolve the actual CLI account and retain its session restriction through dispatch. */
-export async function prepareCronCliCandidateAuth(input: {
+/** Resolve the actual CLI account using the candidate backend forwarding contract. */
+export async function resolveCronCliAuthProfile(input: {
   params: Pick<
     CronRunExecutionParams,
     "cfgWithAgentDefaults" | "agentId" | "agentDir" | "cronSession"
   >;
-  sessionTarget: Parameters<typeof bindRuntimeAuthProfileExecution>[1];
   executionProvider: string;
   provider: string;
   binding: Parameters<typeof resolveCliExecutionAuthProfileId>[0]["sessionBinding"];
   selected: Parameters<typeof resolveCliExecutionAuthProfileId>[0]["selected"];
 }) {
   const { params } = input;
-  const authProfileId = cliBackendAcceptsAuthProfileForwarding({
+  return cliBackendAcceptsAuthProfileForwarding({
     provider: input.executionProvider,
     config: params.cfgWithAgentDefaults,
     agentId: params.agentId,
@@ -121,6 +120,16 @@ export async function prepareCronCliCandidateAuth(input: {
         selected: input.selected,
       })
     : undefined;
+}
+
+/** Retain the selected account's session restriction through dispatch. */
+export async function prepareCronCliCandidateAuth(
+  input: Parameters<typeof resolveCronCliAuthProfile>[0] & {
+    sessionTarget: Parameters<typeof bindRuntimeAuthProfileExecution>[1];
+  },
+) {
+  const { params } = input;
+  const authProfileId = await resolveCronCliAuthProfile(input);
   return bindRuntimeAuthProfileExecution(
     { authProfileId },
     input.sessionTarget,

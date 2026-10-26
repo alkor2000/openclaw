@@ -117,8 +117,7 @@ export async function prepareEmbeddedAttemptToolBase(params: {
   const requireExplicitMessageTarget =
     attempt.requireExplicitMessageTarget ?? isSubagentSessionKey(attempt.sessionKey);
   const forceDirectMessageTool = messageToolOwnsVisibleReply(attempt);
-  const toolRunContext = buildEmbeddedAttemptToolRunContext({
-    ...attempt,
+  const toolRunContext = buildEmbeddedAttemptToolRunContext(attempt, {
     forceMessageTool: forceDirectMessageTool,
     trace: params.runTrace,
   });
@@ -392,8 +391,6 @@ export async function prepareEmbeddedAttemptToolBase(params: {
         inputProvenance: attempt.inputProvenance,
         disableMessageTool: attempt.disableMessageTool,
         forceMessageTool: attempt.forceMessageTool,
-        enableHeartbeatTool: attempt.enableHeartbeatTool,
-        forceHeartbeatTool: attempt.forceHeartbeatTool,
         inheritedToolAllowlistRef: inheritedToolAllowlist,
         additionalInheritedToolNamesRef,
         cronCreatorToolAllowlistRef: cronCreatorToolAllowlist,

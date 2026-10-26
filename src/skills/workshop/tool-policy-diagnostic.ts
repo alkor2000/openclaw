@@ -174,7 +174,6 @@ export function resolveAllowedPluginToolNames(params: {
     bundledTools: params.toolNames.map((name) => pluginPolicyProbe(name, params.pluginId)),
     config: params.config,
     conversationCapabilityProfile: params.conversationCapabilityProfile,
-    warn: () => {},
   });
   return new Set(tools.map((tool) => tool.name));
 }
@@ -189,7 +188,6 @@ export function resolveSkillWorkshopToolPolicyAvailability(params: {
     bundledTools: [skillWorkshopPolicyProbe],
     config: params.config,
     conversationCapabilityProfile: params.conversationCapabilityProfile,
-    warn: () => {},
     onFilter: (event) => {
       if (
         !exclusion &&

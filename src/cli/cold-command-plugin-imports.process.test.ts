@@ -216,7 +216,7 @@ it.each([
   { label: "legacy commands-only root", kind: "legacy", owned: true, legacyPeer: false },
 ] as const)(
   "resolves $label without broadening plugin discovery",
-  async ({ label, kind, owned, legacyPeer }) => {
+  async ({ kind, owned, legacyPeer }) => {
     const root = directories.make("openclaw-cli-discovery-");
     const fixture = writeCliDiscoveryFixture(root, kind);
     const legacy = legacyPeer

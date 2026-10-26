@@ -217,7 +217,7 @@ it.each([
 ] as const)(
   "resolves $label without broadening plugin discovery",
   async ({ label, kind, owned, legacyPeer }) => {
-    const root = path.join(tempRoot, label);
+    const root = directories.make("openclaw-cli-discovery-");
     const fixture = writeCliDiscoveryFixture(root, kind);
     const legacy = legacyPeer
       ? writeCliDiscoveryFixture(path.join(root, "legacy-peer"), "legacy")

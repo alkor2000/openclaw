@@ -4,11 +4,20 @@ import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import "./test-helpers/fast-bash-tools.js";
 import "./test-helpers/fast-coding-tools.js";
 import "./test-helpers/fast-openclaw-tools.js";
+import { logWarn } from "../logger.js";
 import { createWorkerPlacementTools } from "../worker/worker-placement-tools.js";
-import { createOpenClawCodingToolsInternal as buildTools } from "./agent-tools.js";
+import {
+  createOpenClawCodingToolsInternal as buildTools,
+  createOpenClawCodingToolsInternalAsync,
+} from "./agent-tools.js";
 import type { AnyAgentTool } from "./agent-tools.types.js";
 import * as coreCodingTools from "./core-coding-tools.js";
 import { prepareCoreToolPolicy, projectAgentToolDefinition } from "./prepared-tool-surface.js";
+
+vi.mock("../logger.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../logger.js")>();
+  return { ...actual, logWarn: vi.fn(actual.logWarn) };
+});
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 afterEach(() => vi.restoreAllMocks());
@@ -77,4 +86,27 @@ it("retains Gateway tools while replacing a placed session tool's schema and exe
   expect(spawn.parameters).not.toHaveProperty("properties.action");
   await expect(spawn.execute("spawn-placed", { task: "synthetic task" })).resolves.toEqual(result);
   expect(execute).toHaveBeenCalledExactlyOnceWith("spawn-placed", { task: "synthetic task" });
+});
+
+it("logs unknown allow entries once during async tool assembly", async () => {
+  const entry = "unknown_assembly_allow_warning";
+  const options = {
+    ...baseOptions(),
+    config: { tools: { allow: ["read", entry] } },
+    toolConstructionPlan: {
+      includeBaseCodingTools: true,
+      includeShellTools: false,
+      includeChannelTools: false,
+      includeOpenClawTools: false,
+      includePluginTools: false,
+    },
+  };
+  const expected = `tools: tools.allow allowlist contains unknown entries (${entry}). These entries won't match any tool unless the plugin is enabled.`;
+  for (let assembly = 0; assembly < 2; assembly++) {
+    const tools = await createOpenClawCodingToolsInternalAsync(options);
+    expect(tools.map((tool) => tool.name)).toEqual(["read"]);
+    expect(vi.mocked(logWarn).mock.calls.filter(([message]) => message === expected)).toHaveLength(
+      1,
+    );
+  }
 });

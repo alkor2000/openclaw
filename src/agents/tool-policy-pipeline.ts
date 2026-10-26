@@ -7,13 +7,12 @@ import { isFrozenClawToolAllowPolicy } from "../claws/tool-policy-runtime.js";
 import { rememberBoundedKey } from "../infra/dedupe.js";
 import type { AnyAgentTool } from "./agent-tools.types.js";
 import { isKnownCoreToolId } from "./tool-catalog.js";
-import { auditToolPolicyFilter, labelForRuleKind } from "./tool-policy-audit.js";
-import { createToolPolicyMatcher, filterToolsByPolicy } from "./tool-policy-match.js";
+import { auditToolPolicyFilter } from "./tool-policy-audit.js";
+import { filterToolsByPolicy } from "./tool-policy-match.js";
 import {
   analyzeAllowlistByToolType,
   buildPluginToolGroups,
   expandPolicyWithPluginGroups,
-  expandToolGroups,
   normalizeToolPolicyName,
   type DeclaredToolAllowlistContext,
   type ToolPolicyLike,
@@ -123,7 +122,8 @@ export function buildDefaultToolPolicyPipelineSteps(params: {
 export function applyToolPolicyPipeline<TTool extends { name: string }>(params: {
   tools: TTool[];
   toolMeta: (tool: TTool) => { pluginId: string } | undefined;
-  warn: (message: string) => void;
+  /** Omit for silent policy probes so they do not consume diagnostic deduplication. */
+  warn?: (message: string) => void;
   steps: ToolPolicyPipelineStep[];
   declaredToolAllowlist?: DeclaredToolAllowlistContext;
   onFilter?: (event: ToolPolicyFilterEvent<TTool>) => void;
@@ -148,7 +148,7 @@ export function applyToolPolicyPipeline<TTool extends { name: string }>(params: 
 
     const policy = step.policy;
     const frozenAllow = isFrozenClawToolAllowPolicy(policy);
-    if (step.stripPluginOnlyAllowlist) {
+    if (step.stripPluginOnlyAllowlist && params.warn) {
       // Plugin-only allowlists are valid for deferred tools; warn only for entries that cannot match.
       // Read declarations per layer because callbacks can update the next layer.
       const resolved = analyzeAllowlistByToolType(
@@ -175,32 +175,22 @@ export function applyToolPolicyPipeline<TTool extends { name: string }>(params: 
         const warningEntries = [...warnableGatedCoreEntries, ...otherEntries];
         if (warningEntries.length > 0) {
           const entries = warningEntries.join(", ");
-          const suffix = describeUnknownAllowlistSuffix({
-            hasGatedCoreEntries: warnableGatedCoreEntries.length > 0,
-            hasOtherEntries: otherEntries.length > 0,
-            unavailableCoreToolReason: step.unavailableCoreToolReason,
-          });
+          const hasGatedCoreEntries = warnableGatedCoreEntries.length > 0;
+          const hasOtherEntries = otherEntries.length > 0;
+          const unavailableCoreToolReason = step.unavailableCoreToolReason?.trim();
+          const unavailableCoreDetail = unavailableCoreToolReason
+            ? `These entries are shipped core tools but unavailable here: ${unavailableCoreToolReason}.`
+            : "These entries are shipped core tools but unavailable in the current runtime/provider/model/config.";
+          const mixedUnavailableCoreDetail = unavailableCoreToolReason
+            ? `Some entries are shipped core tools but unavailable here: ${unavailableCoreToolReason}; other entries won't match any tool unless the plugin is enabled.`
+            : "Some entries are shipped core tools but unavailable in the current runtime/provider/model/config; other entries won't match any tool unless the plugin is enabled.";
+          const suffix =
+            hasGatedCoreEntries && hasOtherEntries
+              ? mixedUnavailableCoreDetail
+              : hasGatedCoreEntries
+                ? unavailableCoreDetail
+                : "These entries won't match any tool unless the plugin is enabled.";
           const warning = `tools: ${step.label} allowlist contains unknown entries (${entries}). ${suffix}`;
-          if (rememberBoundedKey(seenToolPolicyWarnings, warning, MAX_TOOL_POLICY_WARNING_CACHE)) {
-            params.warn(warning);
-          }
-        }
-      }
-      if (params.tools.length > 0) {
-        const unmatchedDeny = policy.deny?.filter((entry) => {
-          const denial = expandPolicyWithPluginGroups({ deny: [entry] }, pluginGroups);
-          if (
-            step.suppressUnavailableCoreToolWarning &&
-            expandToolGroups(denial?.deny).some(isKnownCoreToolId)
-          ) {
-            return false;
-          }
-          const allowed = createToolPolicyMatcher(denial);
-          // Earlier layers may already have removed a valid match from `filtered`.
-          return params.tools.every((tool) => allowed(tool.name));
-        });
-        if (unmatchedDeny?.length) {
-          const warning = `tools: ${labelForRuleKind(step.label, "deny")} entries matched no tool in this resolved surface (${unmatchedDeny.join(", ")}).`;
           if (rememberBoundedKey(seenToolPolicyWarnings, warning, MAX_TOOL_POLICY_WARNING_CACHE)) {
             params.warn(warning);
           }
@@ -228,23 +218,4 @@ export function applyToolPolicyPipeline<TTool extends { name: string }>(params: 
     });
   }
   return filtered;
-}
-
-function describeUnknownAllowlistSuffix(params: {
-  hasGatedCoreEntries: boolean;
-  hasOtherEntries: boolean;
-  unavailableCoreToolReason?: string;
-}): string {
-  const unavailableCoreToolReason = params.unavailableCoreToolReason?.trim();
-  const unavailableCoreDetail = unavailableCoreToolReason
-    ? `These entries are shipped core tools but unavailable here: ${unavailableCoreToolReason}.`
-    : "These entries are shipped core tools but unavailable in the current runtime/provider/model/config.";
-  const mixedUnavailableCoreDetail = unavailableCoreToolReason
-    ? `Some entries are shipped core tools but unavailable here: ${unavailableCoreToolReason}; other entries won't match any tool unless the plugin is enabled.`
-    : "Some entries are shipped core tools but unavailable in the current runtime/provider/model/config; other entries won't match any tool unless the plugin is enabled.";
-  return params.hasGatedCoreEntries && params.hasOtherEntries
-    ? mixedUnavailableCoreDetail
-    : params.hasGatedCoreEntries
-      ? unavailableCoreDetail
-      : "These entries won't match any tool unless the plugin is enabled.";
 }

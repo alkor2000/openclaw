@@ -474,7 +474,7 @@ export async function prepareCliBundleMcpConfig(params: {
         workspaceDir: params.workspaceDir,
         capabilityProfile: params.nativeMcpPolicy.capabilityProfile,
         runtimeToolsAllow: params.nativeMcpPolicy.runtimeToolsAllow,
-        warn: params.warn ?? (() => {}),
+        warn: params.warn,
       });
       effectiveConfig = {
         mcpServers: {

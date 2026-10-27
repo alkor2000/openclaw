@@ -87,7 +87,7 @@ export function resetSessionManagerMocks(
   sessionManager.resetLeafAsync.mockReset();
   sessionManager.setNextUserMessagePersistence.mockReset();
   sessionManager.buildSessionContext.mockReset().mockReturnValue({ messages });
-  // Unbound managers read their current local view, including later orphan repairs.
+  // Orphan repair reads the model window; it follows per-test buildSessionContext overrides.
   Object.assign(sessionManager, {
     [sessionManagerReadInitialContext]: async () => sessionManager.buildSessionContext(),
   });

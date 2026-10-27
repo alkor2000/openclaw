@@ -562,6 +562,8 @@ export function createCronPromptExecutor(
                 const candidateResult = await runCliAgent({
                   ...candidateAuth,
                   ...buildCommonRunParams(),
+                  // The CLI backend marks internal provenance as non-user input.
+                  inputProvenance: params.inputProvenance,
                   diagnosticOwner,
                   sessionEntry: params.cronSession.sessionEntry,
                   contextWindow: params.cronSession.sessionEntry.contextWindow,

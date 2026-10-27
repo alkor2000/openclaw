@@ -449,7 +449,7 @@ it("steers a spawned Claude child for its requester and refuses other sources", 
     lifecycle.handoffToCli();
     const fixture = path.join(root, "claude-child.mjs");
     await writeFile(fixture, CLI);
-    const prepared = await buildAnthropicCliBackend().prepareExecution?.({
+    const prepared = await buildAnthropicCliBackend().prepareExecutionV2?.({
       workspaceDir: root,
       provider: "claude-cli",
       modelId: context.normalizedModel,

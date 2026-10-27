@@ -5,9 +5,11 @@ import { removePairingQrContent } from "../../lib/chat/pairing-qr.ts";
 import {
   isChatTranscriptMetadata,
   isProgressCard,
+  isMessageReactionSummary,
 } from "../../lib/protocol-validators.generated/transcript.js";
 import { listen } from "../../lib/reactive/listener.ts";
 import * as json from "../../lib/snapshot-json.ts";
+import { projectChatMessageReactions } from "./chat-message-reactions-snapshot.ts";
 import {
   getSessionCacheValue,
   MAX_CACHED_CHAT_SESSIONS,
@@ -44,13 +46,15 @@ import { deleteStoredChatSnapshot } from "./session-snapshot-invalidation.ts";
 import {
   consumePrewarmedChatSnapshot,
   discardPrewarmedChatSnapshot,
+  loadChatHistoryStateValidator,
   peekPrewarmedChatSnapshot,
+  prewarmedHistoryStateValidator,
+  readSharedPrewarm,
 } from "./session-snapshot-prewarm.ts";
-const CHAT_SNAPSHOT_PROJECTION_VERSION = 3;
+const CHAT_SNAPSHOT_PROJECTION_VERSION = 5;
 const CHAT_SNAPSHOT_MESSAGE_LIMIT = 80;
 const CHAT_SNAPSHOT_WRITE_DELAY_MS = 500;
 const CHAT_SNAPSHOT_IDLE_TIMEOUT_MS = 1000;
-const parsedPrewarms = new WeakMap<object, Promise<ChatSessionSnapshot | null>>();
 
 const nonnegative = json.refine(json.number, (value) => value >= 0);
 const sessionKeySchema = json.refine(json.text, (value) => value.length > 0);
@@ -77,21 +81,47 @@ const paginationSchema = {
       : completePaginationSchema.parse(value);
   },
 };
+const permissionModeSchema = json.enumeration(["read-only", "guarded", "workspace", "full"]);
 const snapshotSchema = json.object(
   {
     composer: json.optional(
-      json.nullable(json.object({ id: json.text, provider: json.text, name: json.text })),
+      json.nullable(
+        json.object({
+          id: json.text,
+          provider: json.text,
+          name: json.text,
+          reasoning: json.optional(json.boolean),
+          speed: json.optional(
+            json.object({
+              active: json.boolean,
+              currentOverride: json.enumeration(["", "on", "off", "auto", "ultrafast"]),
+              label: json.text,
+              supported: json.boolean,
+            }),
+          ),
+          thinkingLevel: json.optional(json.text),
+          thinkingDefault: json.optional(json.text),
+          thinkingLevels: json.optional(
+            json.array(json.object({ id: json.text, label: json.text }), 30),
+          ),
+          permissionMode: json.optional(permissionModeSchema),
+          defaultPermissionMode: json.optional(permissionModeSchema),
+        }),
+      ),
     ),
     board: json.optional(
       json.nullable(json.object({ snapshot: json.unknown, receivedAtMs: nonnegative }, true)),
     ),
     widgetHeights: json.optional(
       json.refine(
-        json.record(json.refine(json.number, (height) => height >= 48 && height <= 8000)),
+        json.record(json.refine(json.number, (height) => height >= 1 && height <= 8000)),
         (heights) => Object.keys(heights).length <= 100,
       ),
     ),
     transcriptMetadata: json.optional(json.checked(isChatTranscriptMetadata)),
+    messageReactions: json.optional(
+      json.record(json.array(json.checked(isMessageReactionSummary))),
+    ),
     progressCard: json.optional(json.nullable(json.checked(isProgressCard))),
     deltaCursor: json.optional(json.text),
     // Only persisted warm metadata needs its full validator; read admission loads it below.
@@ -148,7 +178,6 @@ const activeStores = new Set<SessionSnapshotStore>();
 async function parseSnapshotRecord(
   value: unknown,
   sessionKey?: string,
-  onBoard?: (board: ChatSessionSnapshot["board"]) => void,
 ): Promise<SessionSnapshotRecord | null> {
   const parsed = json.parseSnapshot(recordSchema, value);
   if (!parsed || (sessionKey && parsed.sessionKey !== sessionKey)) {
@@ -156,10 +185,9 @@ async function parseSnapshotRecord(
   }
   const historyState = parsed.snapshot.historyState;
   if (historyState !== undefined) {
-    // Do not hold board restoration behind the lazy transcript validator.
-    onBoard?.(parsed.snapshot.board);
-    const { isChatHistoryState } =
-      await import("../../lib/protocol-validators.generated/history-state.js");
+    // A repeated dynamic import can yield past dispatch even after prewarm evaluated it.
+    const isChatHistoryState =
+      prewarmedHistoryStateValidator ?? (await loadChatHistoryStateValidator());
     if (!isChatHistoryState(historyState)) {
       return null;
     }
@@ -171,7 +199,6 @@ async function readSnapshotRecord(
   sessionKey: string,
   value: unknown,
   isCurrent: () => boolean,
-  onBoard?: (board: ChatSessionSnapshot["board"]) => void,
 ): Promise<ChatSessionSnapshot | null> {
   if (
     value === undefined ||
@@ -181,7 +208,7 @@ async function readSnapshotRecord(
   ) {
     return null;
   }
-  const record = await parseSnapshotRecord(value, sessionKey, onBoard);
+  const record = await parseSnapshotRecord(value, sessionKey);
   if (!isCurrent()) {
     return null;
   }
@@ -190,18 +217,6 @@ async function readSnapshotRecord(
     await resetSessionSnapshotDatabase();
   }
   return record?.snapshot ?? null;
-}
-
-function readSharedPrewarm(
-  entry: object,
-  read: () => Promise<ChatSessionSnapshot | null>,
-): Promise<ChatSessionSnapshot | null> {
-  let snapshot = parsedPrewarms.get(entry);
-  if (!snapshot) {
-    snapshot = read();
-    parsedPrewarms.set(entry, snapshot);
-  }
-  return snapshot;
 }
 
 export async function readPrewarmedChatSnapshot(
@@ -215,7 +230,7 @@ export async function readPrewarmedChatSnapshot(
     entry.promise.then((value) =>
       readSnapshotRecord(entry.cacheKey, value, () => !entry.cancelled),
     ),
-  );
+  ).promise;
   return snapshot && !entry.cancelled && peekPrewarmedChatSnapshot() === entry ? snapshot : null;
 }
 
@@ -251,6 +266,15 @@ function createSnapshotRecord(
             ? { totalMessages: projected.pagination.totalMessages }
             : {}),
         },
+      };
+    }
+    if (projected.messageReactions) {
+      projected = {
+        ...projected,
+        messageReactions: projectChatMessageReactions(
+          projected.messages,
+          new Map(Object.entries(projected.messageReactions)),
+        ),
       };
     }
     // Pairing credentials stay in the live projection, never the browser's disk cache.
@@ -472,7 +496,7 @@ export class SessionSnapshotStore implements ChatCacheObserver {
       const record: SidebarRecord = {
         sessionKey: key,
         savedAt: Date.now(),
-        projectionVersion: 1,
+        projectionVersion: 3,
         model: structuredClone(model),
       };
       if (sidebarRecordBytes(record) > 512 * 1024) {
@@ -506,18 +530,27 @@ export class SessionSnapshotStore implements ChatCacheObserver {
     }
   }
 
-  async read(
-    sessionKey: string,
-    onBoard?: (board: ChatSessionSnapshot["board"]) => void,
-  ): Promise<ChatSessionSnapshot | null> {
+  readReady(sessionKey: string): ChatSessionSnapshot | undefined {
+    const entry = peekPrewarmedChatSnapshot();
+    const snapshot = entry?.prepared?.snapshot;
+    if (entry?.cacheKey !== sessionKey || entry.cancelled || !snapshot) {
+      return undefined;
+    }
+    consumePrewarmedChatSnapshot(sessionKey);
+    setSessionCacheValue(this.hydratedSnapshots, sessionKey, new WeakRef(snapshot));
+    return snapshot;
+  }
+
+  async read(sessionKey: string): Promise<ChatSessionSnapshot | null> {
     const scope = this.captureReadScope(sessionKey);
     try {
       const prewarm = consumePrewarmedChatSnapshot(sessionKey);
       const read = () =>
         (prewarm?.promise ?? readStoredChatSnapshotRecord(sessionKey)).then((value) =>
-          readSnapshotRecord(sessionKey, value, scope.isCurrent, onBoard),
+          readSnapshotRecord(sessionKey, value, scope.isCurrent),
         );
-      const snapshot = await (prewarm ? readSharedPrewarm(prewarm, read) : read());
+      const prepared = prewarm ? readSharedPrewarm(prewarm, read) : undefined;
+      const snapshot = await (prepared?.promise ?? read());
       if (!snapshot || !scope.isCurrent()) {
         return null;
       }

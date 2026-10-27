@@ -115,8 +115,6 @@ type SessionPatchProjectionParams = {
   operatorAuthority?: AdmittedRunOperatorAuthority;
   /** Resolved spawn identity supplied only by the trusted creation owner. */
   preparedModelSelection?: ModelRef;
-  /** Creation snapshots selected models, including the configured default. */
-  pinModelSelection?: boolean;
 };
 
 type SessionPatchProjectionResult =
@@ -272,8 +270,7 @@ function* projectSessionPatchSteps(
     });
   }
 
-  const existing =
-    params.existingEntry && projectCanonicalSessionEntryShape({ ...params.existingEntry });
+  const existing = params.existingEntry && projectCanonicalSessionEntryShape(params.existingEntry);
   // A read acknowledgement or an icon/color change is not session activity: ageing the
   // row here would move the session to the top of recency order, so only the patch commits.
   const recencyNeutral = isSessionUnreadAckOnlyPatch(patch) || isSessionIconColorOnlyPatch(patch);
@@ -556,7 +553,7 @@ function* projectSessionPatchSteps(
       if (!resolved.ok) {
         return invalid(resolved.error);
       }
-      selection = { ...resolved, isDefault: !params.pinModelSelection && resolved.isDefault };
+      selection = resolved;
     }
     if (selection) {
       const prepared = prepareSessionPatchModelSelection({

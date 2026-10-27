@@ -99,7 +99,7 @@ async function persist(store: SessionSnapshotStore, cacheKey: string, value: Cha
   store.write(cacheKey, value);
   await store.flush();
 }
-const envelope = (cacheKey: string, value: ChatSessionSnapshot, projectionVersion = 3) => ({
+const envelope = (cacheKey: string, value: ChatSessionSnapshot, projectionVersion = 5) => ({
   projectionVersion,
   sessionKey: cacheKey,
   savedAt: 1,
@@ -159,7 +159,18 @@ async function readRawRecord(
 describe("persistent chat session snapshots", () => {
   it("restores model display data with the conversation, isolated from another account", async () => {
     const writer = new SessionSnapshotStore();
-    const remembered = { id: "model", provider: "openai", name: "Remembered model" };
+    const remembered: NonNullable<ChatSessionSnapshot["composer"]> = {
+      id: "model",
+      provider: "openai",
+      name: "Remembered model",
+      reasoning: true,
+      speed: { active: false, currentOverride: "off", label: "Standard", supported: true },
+      thinkingLevel: "high",
+      thinkingDefault: "medium",
+      thinkingLevels: [{ id: "high", label: "High" }],
+      permissionMode: "full",
+      defaultPermissionMode: "workspace",
+    };
     await persist(writer, sessionKey, { ...snapshot(), composer: remembered });
     expect((await readSnapshot())?.composer).toEqual(remembered);
     const otherKey = resolveChatSnapshotKey(
@@ -304,17 +315,15 @@ describe("persistent chat session snapshots", () => {
     expect(await new SessionSnapshotStore().read(sessionKey)).toBeNull();
   });
 
-  it("does not present a cached board after its pending read is invalidated", async () => {
+  it("does not return a cached board after its pending read is invalidated", async () => {
     await seed({
       ...boardSnapshot(sessionKey, "retired conversation"),
       historyState: { stateRevision: {}, commands: [] },
     });
     const reader = new SessionSnapshotStore();
-    const presentBoard = vi.fn();
-    const reading = reader.read(sessionKey, presentBoard);
+    const reading = reader.read(sessionKey);
     reader.forget(sessionKey);
     expect(await reading).toBeNull();
-    expect(presentBoard).not.toHaveBeenCalled();
   });
 
   it("persists board removal before any transcript is in memory", async () => {
@@ -355,14 +364,14 @@ describe("persistent chat session snapshots", () => {
     },
   );
 
-  it("restores legacy sidebar presence defaults", async () => {
+  it("defaults omitted sidebar presence preferences in the current projection", async () => {
     const store = makeStore(undefined, true);
     const sidebarKey = `${key("").split("\u0000")[0]}\u0000sidebar:operator`;
     expect(await store.writeSidebar(sidebarKey, sidebarSnapshot, parseSidebarSnapshot)).toBe(true);
     await putRawRecord(
       {
         sessionKey: sidebarKey,
-        projectionVersion: 1,
+        projectionVersion: 3,
         savedAt: Date.now(),
         model: { ...sidebarSnapshot, peoplePresenceFilter: undefined, offlineUsers: undefined },
       },
@@ -445,17 +454,14 @@ describe("persistent chat session snapshots", () => {
     expect(await new SessionSnapshotStore().read(privateKey)).toBeNull();
   });
 
-  it.each(["direct", "prewarmed"])(
-    "discards a superseded unbounded projection (%s)",
-    async (mode) => {
-      await persist(writer, sessionKey, snapshot("current"));
-      await putRawRecord(envelope(sessionKey, snapshot("old"), 2));
-      if (mode === "prewarmed") {
-        void prewarmChatSnapshot(sessionKey);
-      }
-      expect(await new SessionSnapshotStore().read(sessionKey)).toBeNull();
-    },
-  );
+  it.each(["direct", "prewarmed"])("discards the previous projection (%s)", async (mode) => {
+    await persist(writer, sessionKey, snapshot("current"));
+    await putRawRecord(envelope(sessionKey, snapshot("old"), 4));
+    if (mode === "prewarmed") {
+      void prewarmChatSnapshot(sessionKey);
+    }
+    expect(await new SessionSnapshotStore().read(sessionKey)).toBeNull();
+  });
 
   it("purges all legacy unscoped history rather than adopting an unknown account", async () => {
     const privateKey = "agent:main:dashboard:incognito-old";
@@ -587,11 +593,7 @@ describe("persistent chat session snapshots", () => {
     if (corruption !== "metadata") {
       expect(reader.readSavedAt(valid)).not.toBeNull();
       expect(reader.readSavedAt(corrupt)).not.toBeNull();
-      const presentBoard = vi.fn();
-      expect(await reader.read(corrupt, presentBoard)).toBeNull();
-      if (corruption === "board") {
-        expect(presentBoard).not.toHaveBeenCalled();
-      }
+      expect(await reader.read(corrupt)).toBeNull();
     } else {
       expect(reader.readSavedAt(corrupt)).toBeNull();
     }

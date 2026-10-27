@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { PassThrough } from "node:stream";
 import type {
-  CliBackendExecuteContextV2,
   CliBackendLiveSessionCapability,
   CliBackendLiveSessionHandle,
   CliBackendToolPermissionResult,
@@ -12,7 +11,7 @@ import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { hasClaudeRawToolInvocation } from "./cli-output.js";
 import type { ClaudeCliExecuteContext, ClaudeCliSecretInput } from "./cli-process.js";
-import { prepareClaudeCliTransportArgs } from "./cli-runtime-args.js";
+import { createClaudeCliUserInput, prepareClaudeCliTransportArgs } from "./cli-runtime-args.js";
 import {
   readReplayedTaskId,
   recordRunningDescendants,
@@ -70,8 +69,8 @@ type ClaudeCliSession = {
   taskOwners: Map<string, string | false>;
   // Native notification results identify task runs rather than task IDs.
   taskRuns: Map<string, string>;
-  // Running Agent/Workflow tasks and subagent-owned work, at any depth, until notified.
-  runningDescendants: Set<string>;
+  // Running Agent/Workflow tasks and subagent-owned work, with their launching task.
+  runningDescendants: Map<string, string | undefined>;
 };
 const sessions = new WeakMap<CliBackendLiveSessionHandle, ClaudeCliSession>();
 
@@ -237,16 +236,6 @@ async function handleRequest(
   throw new Error("Unknown Claude CLI hook callback.");
 }
 
-function createUserInput(context: CliBackendExecuteContextV2, text: string, uuid: string) {
-  return {
-    type: "user",
-    message: { role: "user", content: text },
-    parent_tool_use_id: null,
-    uuid,
-    ...(context.sessionId ? { session_id: context.sessionId } : {}),
-  };
-}
-
 function rejectInjectedInputs(turn: ClaudeCliTurn, error: Error) {
   for (const input of turn.injectedInputs.values()) {
     input.started.reject(error);
@@ -278,7 +267,7 @@ async function injectInput(
     }
     turn.injectedInputs.set(uuid, { text, started });
     turn.submittedInputUuids.add(uuid);
-    written = session.transport.send(createUserInput(turn.context, text, uuid));
+    written = session.transport.send(createClaudeCliUserInput(turn.context, text, uuid));
     // Host admission cleanup may await after the synchronous write.
     void written.catch(() => {});
   });
@@ -354,8 +343,9 @@ async function acceptMessage(session: ClaudeCliSession, message: Record<string, 
   }
   const turn = session.currentTurn;
   let taskId: string | undefined;
+  let parentRuns = false;
   if (message.type === "system") {
-    recordRunningDescendants(session.runningDescendants, message);
+    parentRuns = recordRunningDescendants(session.runningDescendants, message);
     const input = turn && (!session.hasInputLifecycle || turn.inputStarted) ? turn : undefined;
     const inputUuid = input?.inputUuid ?? "";
     if (message.subtype === "background_tasks_changed") {
@@ -365,11 +355,17 @@ async function acceptMessage(session: ClaudeCliSession, message: Record<string, 
             continue;
           }
           const id = recordTaskOwnership(session, task, inputUuid);
+          const parentTaskId = id ? session.runningDescendants.get(id) : undefined;
           if (
             id &&
             input &&
             !input.interrupted &&
             session.taskOwners.get(id) === input.inputUuid &&
+            // Only children of held background work extend the input; foreground
+            // descendants still retire with their parent turn.
+            (parentTaskId === undefined ||
+              input.pendingBackgroundTaskIds.has(parentTaskId) ||
+              input.pendingBackgroundTaskIds.has(id)) &&
             (task.task_type === "local_agent" ||
               task.task_type === "local_workflow" ||
               (task.task_type === "local_bash" && input.foregroundTaskIds.has(id)))
@@ -468,8 +464,8 @@ async function acceptMessage(session: ClaudeCliSession, message: Record<string, 
     turn.taskNotifications.set(replayedTaskId, "replayed");
   }
   if (message.type === "system" && message.subtype === "task_notification" && taskId) {
-    if (message.status === "stopped") {
-      // Stopped work has no notification query to wait for.
+    if (message.status === "stopped" || parentRuns) {
+      // Stopped work, and work a running subagent answers, has no notification query here.
       turn.pendingBackgroundTaskIds.delete(taskId);
       turn.foregroundTaskIds.delete(taskId);
       turn.taskNotifications.delete(taskId);
@@ -557,7 +553,7 @@ function createSession(capability?: CliBackendLiveSessionCapability): ClaudeCliS
     closed: false,
     taskOwners: new Map(),
     taskRuns: new Map(),
-    runningDescendants: new Set(),
+    runningDescendants: new Map(),
     handle: {
       generation: randomUUID(),
       fingerprint: capability?.fingerprint ?? randomUUID(),
@@ -728,7 +724,10 @@ export async function* executeClaudeCli(
           await session.handle.waitForExit();
         },
       });
-      await transport.send(createUserInput(context, context.prompt, turn.inputUuid));
+      const hostGenerated = context.promptOrigin === "host";
+      await transport.send(
+        createClaudeCliUserInput(context, context.prompt, turn.inputUuid, hostGenerated),
+      );
       context.registerMessageInjection?.({
         isAvailable: () =>
           session.hasInputLifecycle &&

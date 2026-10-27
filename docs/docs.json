@@ -2286,6 +2286,10 @@
                     ]
                   },
                   {
+                    "group": "Decision models",
+                    "pages": ["providers/liquid-ai"]
+                  },
+                  {
                     "group": "Speech and audio",
                     "pages": [
                       "providers/azure-speech",
@@ -3246,6 +3250,7 @@
                 "group": "Release notes",
                 "pages": [
                   "releases/index",
+                  "releases/2026.10.7",
                   "releases/2026.10.6",
                   "releases/2026.10.5",
                   "releases/2026.10.4",

@@ -1,5 +1,6 @@
 import {
   cliBackendAcceptsAuthProfileForwarding,
+  resolveCliExecutionAuthProfile,
   resolveCliExecutionAuthProfileId,
 } from "../../agents/cli-execution-auth.js";
 import { buildCliMcpDelegationCapabilityBinding } from "../../agents/cli-runner/mcp-grant-context.js";
@@ -20,7 +21,7 @@ import {
   hasNewGeneratedMediaTaskForSessionKey,
 } from "../../agents/media-generation-activity.js";
 import { findModelInCatalog } from "../../agents/model-catalog-lookup.js";
-import { recordModelFallbackStop } from "../../agents/model-fallback-stop.js";
+import { createUnrecordedScheduledAccountRefusal } from "../../agents/scheduled-unrecorded-account.js";
 import { normalizeChatType } from "../../channels/chat-type.js";
 import { readConfiguredModelAuthProfileProvider } from "../../config/sessions/auth-profile-override-provenance.js";
 import { bindRuntimeAuthProfileExecution } from "../../config/sessions/session-entry-current-runtime.js";
@@ -215,6 +216,19 @@ export async function runCliFallbackCandidate(
             activeSessionEntry: sessionEntry,
           });
         const scheduledInference = params.scheduledInference;
+        const selectedCliProfile =
+          !scheduledInference && allowCliAuthProfileForwarding
+            ? await resolveCliExecutionAuthProfile({
+                cliExecutionProvider: params.cliExecutionProvider,
+                authProfileProvider: params.provider,
+                config: params.runtimeConfig,
+                agentDir: params.candidateRun.agentDir,
+                selected: readConfiguredModelAuthProfileProvider(params.candidateRun, sessionEntry)
+                  ? params.providerScopedAuthProfile
+                  : params.candidateRun,
+                sessionBinding: cliSessionBinding,
+              })
+            : undefined;
         // The CLI owner must see explicit pins before provider scoping can discard them.
         // A recorded account runs only when this backend forwards exactly that account.
         const authProfileId = scheduledInference
@@ -231,25 +245,18 @@ export async function runCliFallbackCandidate(
                 : undefined,
             )
           : allowCliAuthProfileForwarding
-            ? await resolveCliExecutionAuthProfileId({
-                cliExecutionProvider: params.cliExecutionProvider,
-                authProfileProvider: params.provider,
-                config: params.runtimeConfig,
-                agentDir: params.candidateRun.agentDir,
-                selected: readConfiguredModelAuthProfileProvider(params.candidateRun, sessionEntry)
-                  ? params.providerScopedAuthProfile
-                  : params.candidateRun,
-                sessionBinding: cliSessionBinding,
-              })
+            ? selectedCliProfile?.kind === "forwarded"
+              ? selectedCliProfile.profileId
+              : undefined
             : resolveRunAuthProfile(params.candidateRun, params.cliExecutionProvider, {
                 config: params.runtimeConfig,
               }).authProfileId;
         if (turn.followupRun.run.scheduledAutomation && !scheduledInference && authProfileId) {
-          const refusal = new Error(
-            "Automation has no recorded inference account. Explicitly select its account with a model@profile update before running it.",
-          );
-          recordModelFallbackStop(refusal);
-          throw refusal;
+          throw createUnrecordedScheduledAccountRefusal({
+            runtime: params.cliExecutionProvider,
+            modelRef: `${params.provider}/${params.model}`,
+            profileId: authProfileId,
+          });
         }
         const executionAuth = scheduledInference
           ? {}
@@ -257,7 +264,7 @@ export async function runCliFallbackCandidate(
               { authProfileId },
               sessionTarget,
               initialSessionEntry,
-              authProfileId,
+              selectedCliProfile?.profileId ?? authProfileId,
             );
         const diagnosticOwner = params.deferredLifecycle.handoffToCli();
         // A forked child carries the parent's binding with a one-shot fork marker;

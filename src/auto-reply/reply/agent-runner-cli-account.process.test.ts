@@ -66,7 +66,7 @@ const SELF_FIXTURE_CLI_SOURCE = fileURLToPath(
 const CONFIGURED_PROFILE = "anthropic:configured-fixture";
 const CLI_PROFILE = "google:cli-fixture";
 const OTHER_CLI_PROFILE = "google:other-fixture";
-const runtime = "google-gemini-cli";
+const NATIVE_PROFILE = "anthropic:claude-cli";
 const model = "fixture-model";
 const noActivity = async () => {};
 const fixtureBackends = resolveGlobalMap<string, CliBackendPlugin[]>(
@@ -92,14 +92,26 @@ it.each([
   { kind: "chat", stage: "placement", pin: "user", accountScope: "same-provider" },
   { kind: "chat", stage: "placement", pin: "user-link", accountScope: "same-provider" },
   { kind: "chat", stage: "placement", pin: "user", accountScope: "selected-profile" },
+  { kind: "chat", stage: "before-execution", pin: null, accountScope: "native-user" },
+  { kind: "chat", stage: "before-execution", pin: null, accountScope: "native-user-link" },
+  { kind: "chat", stage: "before-execution", pin: "user-link", accountScope: "native-user" },
+  { kind: "cron-event", stage: "before-execution", pin: null, accountScope: "native-user" },
 ] as const)(
   "protects $kind $pin intent at $stage ($accountScope) before actual CLI launch",
   async ({ kind, stage, pin, accountScope }) => {
-    const configuredProvider = accountScope === "cross-provider" ? "anthropic" : "google";
-    const configuredModel = accountScope === "cross-provider" ? "primary-fixture" : model;
-    const configuredProfile = accountScope === "cross-provider" ? CONFIGURED_PROFILE : CLI_PROFILE;
+    const nativeLogin = accountScope === "native-user" || accountScope === "native-user-link";
+    const runtime = nativeLogin ? "claude-cli" : "google-gemini-cli";
+    const destinationProvider = nativeLogin ? "anthropic" : "google";
+    const configuredProvider =
+      nativeLogin || accountScope === "cross-provider" ? "anthropic" : "google";
+    const configuredModel = configuredProvider === "anthropic" ? "primary-fixture" : model;
+    const configuredProfile = nativeLogin
+      ? NATIVE_PROFILE
+      : accountScope === "cross-provider"
+        ? CONFIGURED_PROFILE
+        : CLI_PROFILE;
     const replacementPin =
-      accountScope === "cross-provider"
+      nativeLogin || accountScope === "cross-provider"
         ? CONFIGURED_PROFILE
         : accountScope === "same-provider"
           ? OTHER_CLI_PROFILE
@@ -147,11 +159,11 @@ it.each([
             workspace: state.workspaceDir,
             model: {
               primary: `${configuredProvider}/${configuredModel}@${configuredProfile}`,
-              fallbacks: [`google/${model}`],
+              fallbacks: [`${destinationProvider}/${model}`],
             },
             models: {
               "anthropic/primary-fixture": { agentRuntime: { id: "claude-cli" } },
-              [`google/${model}`]: { agentRuntime: { id: runtime } },
+              [`${destinationProvider}/${model}`]: { agentRuntime: { id: runtime } },
             },
           },
         },
@@ -167,17 +179,17 @@ it.each([
               {
                 baseUrl: "https://fixture.invalid",
                 api: "openai-completions" as const,
-                models: [
-                  {
-                    id,
-                    name: id,
+                models: (nativeLogin && provider === "anthropic" ? [id, model] : [id]).map(
+                  (modelId) => ({
+                    id: modelId,
+                    name: modelId,
                     reasoning: false,
                     input: ["text" as const],
                     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
                     contextWindow: 8192,
                     maxTokens: 1024,
-                  },
-                ],
+                  }),
+                ),
               },
             ]),
           ),
@@ -194,6 +206,9 @@ it.each([
             [CONFIGURED_PROFILE]: { provider: "anthropic", mode: "api_key" as const },
             [CLI_PROFILE]: { provider: "google", mode: "api_key" as const },
             [OTHER_CLI_PROFILE]: { provider: "google", mode: "api_key" as const },
+            ...(nativeLogin
+              ? { [NATIVE_PROFILE]: { provider: "claude-cli", mode: "token" as const } }
+              : {}),
           },
           order: { google: [CLI_PROFILE], anthropic: [CONFIGURED_PROFILE] },
         },
@@ -216,6 +231,15 @@ it.each([
               provider: "google",
               key: "synthetic-other-key",
             },
+            ...(nativeLogin
+              ? {
+                  [NATIVE_PROFILE]: {
+                    type: "token" as const,
+                    provider: "claude-cli",
+                    token: "synthetic-native-token",
+                  },
+                }
+              : {}),
           },
         },
         agentDir,
@@ -233,6 +257,13 @@ it.each([
         sessionId: target.sessionId,
         lifecycleRevision: "11111111-1111-4111-8111-111111111111",
         updatedAt: Date.now(),
+        ...(nativeLogin
+          ? {
+              authProfileOverride: NATIVE_PROFILE,
+              authProfileOverrideSource:
+                accountScope === "native-user-link" ? ("user-link" as const) : ("user" as const),
+            }
+          : {}),
       };
       await replaceSessionEntry(target, entry);
       const builder = createTestPluginRegistry();
@@ -263,7 +294,8 @@ it.each([
         const preparedCliBackends: string[] = [];
         const destination: CliBackendPlugin = {
           id: runtime,
-          modelProvider: "google",
+          modelProvider: destinationProvider,
+          autoSelectAuthProfile: nativeLogin ? false : undefined,
           nativeToolMode: "none",
           runtimeArtifact: {
             kind: "bundled-package-tree",
@@ -285,6 +317,14 @@ it.each([
           // The production auth selector/materializer still owns all credential decisions.
           prepareExecution: async (context) => {
             preparedCliBackends.push(runtime);
+            if (nativeLogin && context.modelId === "primary-fixture") {
+              expect(context.authProfileId).toBeUndefined();
+              throw new FailoverError("Synthetic primary billing refusal", {
+                reason: "billing",
+                provider: "anthropic",
+                model: "primary-fixture",
+              });
+            }
             capturedAuthProfile = context.authProfileId;
             return {
               beforeExecution: async () => {
@@ -329,7 +369,7 @@ it.each([
               });
             },
           };
-          fixtureBackends.set(command, [destination, primary]);
+          fixtureBackends.set(command, nativeLogin ? [destination] : [destination, primary]);
         }
         setActivePluginRegistry(
           builder.registry,
@@ -387,7 +427,7 @@ it.each([
                   blockReplyBreak: "message_end",
                   timeoutMs: 10_000,
                   skillsSnapshot: { prompt: "", skills: [] },
-                  thinkingCatalog: [{ provider: "google", id: model, input: ["text"] }],
+                  thinkingCatalog: [{ provider: destinationProvider, id: model, input: ["text"] }],
                 },
               };
               // Actual provenance producer; this supplies configured candidate facts, not
@@ -462,7 +502,7 @@ it.each([
                 turn,
                 candidateRun: followupRun.run,
                 runtimeConfig: cfg,
-                provider: "google",
+                provider: destinationProvider,
                 model,
                 runId,
                 runLane: "test:chat-cli-account",
@@ -494,7 +534,7 @@ it.each([
                 isFinalFallbackAttempt: true,
                 classifyResult: (result) =>
                   classifyEmbeddedAgentRunResultForModelFallback({
-                    provider: "google",
+                    provider: destinationProvider,
                     model,
                     result,
                   }),
@@ -506,9 +546,13 @@ it.each([
                 cliExecutionProvider: runtime,
                 lifecycleGeneration: getAgentEventLifecycleGeneration(),
                 onSessionWriter: () => {},
-                providerScopedAuthProfile: resolveRunAuthProfile(followupRun.run, "google", {
-                  config: cfg,
-                }),
+                providerScopedAuthProfile: resolveRunAuthProfile(
+                  followupRun.run,
+                  destinationProvider,
+                  {
+                    config: cfg,
+                  },
+                ),
               });
             } finally {
               await manager.complete();
@@ -584,7 +628,7 @@ it.each([
                 expect(ctx.runSessionKey).toBe(sessionKey);
                 expect(ctx.usesDetachedRunSession).toBe(false);
                 expect(ctx.cronSession.storePath).toBe(target.storePath);
-                expect(ctx.liveSelection.authProfileId).toBe(CONFIGURED_PROFILE);
+                expect(ctx.liveSelection.authProfileId).toBe(configuredProfile);
                 const generation = getAgentEventLifecycleGeneration();
                 const lifecycle = createAgentLifecycleTerminalBackstop({
                   runId,
@@ -690,7 +734,7 @@ it.each([
           return;
         }
         if (stage === "before-execution") {
-          expect(capturedAuthProfile).toBe(CLI_PROFILE);
+          expect(capturedAuthProfile).toBe(nativeLogin ? undefined : CLI_PROFILE);
         }
         const barrierEntry = await readSessionEntryInWorker(
           { ...target, readConsistency: "latest" },
@@ -748,10 +792,10 @@ it.each([
           expect(outcome.ok, "unchanged control must reach real prepared CLI").toBe(true);
           expect(launches).toHaveLength(1);
           if (kind === "cron-event") {
-            expect(cronWinner).toBe("google");
+            expect(cronWinner).toBe(destinationProvider);
             expect(preparedCliBackends).toEqual(["claude-cli", runtime]);
           }
-          expect(capturedAuthProfile).toBe(CLI_PROFILE);
+          expect(capturedAuthProfile).toBe(nativeLogin ? undefined : CLI_PROFILE);
           if (outcome.ok) {
             expect(outcome.value.payloads).toContainEqual(
               expect.objectContaining({ text: "Synthetic CLI reply." }),

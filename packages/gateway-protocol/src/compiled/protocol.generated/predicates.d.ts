@@ -517,6 +517,11 @@ export function isMentionsChangedEvent(
 ): value is import("typebox").Static<
   typeof import("../../schema-modules.js").MentionsChangedEventSchema
 >;
+export function isMentionsFailedEvent(
+  value: unknown,
+): value is import("typebox").Static<
+  typeof import("../../schema-modules.js").MentionsFailedEventSchema
+>;
 export function isUsersBackgroundGetParams(
   value: unknown,
 ): value is import("typebox").Static<
@@ -901,6 +906,11 @@ export function isTalkClientTranscriptParams(
   value: unknown,
 ): value is import("typebox").Static<
   typeof import("../../schema-modules.js").TalkClientTranscriptParamsSchema
+>;
+export function isTalkClientSayParams(
+  value: unknown,
+): value is import("typebox").Static<
+  typeof import("../../schema-modules.js").TalkClientSayParamsSchema
 >;
 export function isTalkClientSteerParams(
   value: unknown,
@@ -1504,6 +1514,9 @@ export function isCronRemoveParams(
 export function isCronRunParams(
   value: unknown,
 ): value is import("typebox").Static<typeof import("../../schema-modules.js").CronRunParamsSchema>;
+export function isCronBindParams(
+  value: unknown,
+): value is import("typebox").Static<typeof import("../../schema-modules.js").CronBindParamsSchema>;
 export function isCronRunsParams(
   value: unknown,
 ): value is import("typebox").Static<typeof import("../../schema-modules.js").CronRunsParamsSchema>;

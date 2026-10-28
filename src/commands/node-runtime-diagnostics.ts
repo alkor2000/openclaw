@@ -1,6 +1,7 @@
 /** Read-only Node findings shared by Doctor and status commands. */
 import { nodeRuntimeFailure } from "../../node-sqlite.mjs";
 import {
+  formatNodeSecurityWarning,
   formatUnsupportedNodeVersionMessage,
   parseNodeReleaseVersion,
   SUPPORTED_NODE_VERSIONS,
@@ -33,6 +34,7 @@ export async function collectNodeRuntimeFindings(
   const cliRuntime = await detectRuntime();
   if (cliRuntime.kind === "node" && cliRuntime.sqliteProbe) {
     const failure = nodeRuntimeFailure(cliRuntime.version, cliRuntime.sqliteProbe);
+    const securityWarning = failure ? null : formatNodeSecurityWarning(cliRuntime.version);
     // Lifecycle advice belongs to standalone Doctor, never status or updater admission.
     const includeLifecycleAdvice =
       mode === "doctor" &&
@@ -45,7 +47,7 @@ export async function collectNodeRuntimeFindings(
     const now = Date.now();
     const endOfLife = release ? now >= Date.parse(`${release.eol}T00:00:00Z`) : false;
     const installOwner =
-      failure || endOfLife
+      failure || securityWarning || endOfLife
         ? await readInstallOwner(
             await resolveOpenClawPackageRoot({
               moduleUrl: import.meta.url,
@@ -53,17 +55,19 @@ export async function collectNodeRuntimeFindings(
             }),
           )
         : null;
-    if (failure) {
+    if (failure || securityWarning) {
       findings.push({
         checkId: CHECK_ID,
-        severity: "error",
+        severity: failure ? "error" : "warning",
         source: "cli",
-        message: failure,
-        requirement: SUPPORTED_NODE_VERSIONS,
+        message: failure ?? `SECURITY WARNING: ${securityWarning}`,
+        requirement: failure ? SUPPORTED_NODE_VERSIONS : "recommended Node security patches",
         target: cliRuntime.execPath ?? undefined,
         fixHint: installOwner
           ? formatInstallOwnerMessage(installOwner)
-          : formatUnsupportedNodeVersionMessage(cliRuntime.version),
+          : failure
+            ? formatUnsupportedNodeVersionMessage(cliRuntime.version)
+            : "Upgrade the Node.js runtime to the recommended security patch level. Compatible older Node remains usable.",
       });
     }
     if (release) {
@@ -99,7 +103,9 @@ export async function collectNodeRuntimeFindings(
       if (runtime.status === "probe-failed") {
         throw runtime.error;
       }
-      if (runtime.status === "unsupported") {
+      const securityWarning =
+        runtime.status === "supported" ? formatNodeSecurityWarning(runtime.version) : null;
+      if (runtime.status === "unsupported" || securityWarning) {
         const layout = await summarizeGatewayServiceLayout(command);
         const owner = await readInstallOwner(
           layout?.packageRootReal ?? layout?.packageRoot ?? null,
@@ -108,15 +114,21 @@ export async function collectNodeRuntimeFindings(
           checkId: CHECK_ID,
           severity: "warning",
           source: "gateway-service",
-          message: `Gateway service Node ${runtime.version ?? "unknown"} is unsupported. Required: ${SUPPORTED_NODE_VERSIONS}.`,
-          requirement: SUPPORTED_NODE_VERSIONS,
+          message: securityWarning
+            ? `SECURITY WARNING: Recorded Gateway service runtime: ${securityWarning}`
+            : `Gateway service Node ${runtime.version ?? "unknown"} is unsupported. Required: ${SUPPORTED_NODE_VERSIONS}.`,
+          requirement: securityWarning
+            ? "recommended Node security patches"
+            : SUPPORTED_NODE_VERSIONS,
           fixHint: owner
             ? formatInstallOwnerMessage(owner)
-            : [
-                ...(runtime.capabilityError ? [runtime.capabilityError] : []),
-                formatUnsupportedNodeVersionMessage(runtime.version),
-                "After switching Node, refresh a managed Gateway with `openclaw gateway install --force`; for an externally managed service, have its deployment owner update the launcher.",
-              ].join("\n"),
+            : securityWarning
+              ? "Upgrade the service Node.js runtime, then refresh the managed Gateway runtime selection and restart it. Compatible older Node remains usable."
+              : [
+                  ...(runtime.capabilityError ? [runtime.capabilityError] : []),
+                  formatUnsupportedNodeVersionMessage(runtime.version),
+                  "After switching Node, refresh a managed Gateway with `openclaw gateway install --force`; for an externally managed service, have its deployment owner update the launcher.",
+                ].join("\n"),
         });
       }
     }

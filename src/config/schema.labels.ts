@@ -20,6 +20,7 @@ import { STORAGE_FIELD_LABELS } from "./zod-schema.storage.js";
 import { TELEMETRY_FIELD_LABELS } from "./zod-schema.telemetry.js";
 
 export const FIELD_LABELS: Record<string, string> = {
+  "security.preset": "Security Preset",
   ...META_FIELD_LABELS,
   ...BROWSER_FIELD_LABELS,
   ...ENVIRONMENT_FIELD_LABELS,
@@ -181,6 +182,12 @@ export const FIELD_LABELS: Record<string, string> = {
   "tools.toolSearch": "Tool Search",
   "tools.toolSearch.enabled": "Enable Tool Search",
   "tools.toolSearch.mode": "Tool Search Surface",
+  "tools.toolSearch.include": "Tool Search Include Selectors",
+  "tools.toolSearch.include[].source": "Included Tool Source",
+  "tools.toolSearch.include[].name": "Included Tool Name",
+  "tools.toolSearch.exclude": "Tool Search Exclude Selectors",
+  "tools.toolSearch.exclude[].source": "Excluded Tool Source",
+  "tools.toolSearch.exclude[].name": "Excluded Tool Name",
   "tools.toolSearch.searchDefaultLimit": "Tool Search Default Results",
   "tools.toolSearch.maxSearchLimit": "Tool Search Max Results",
   "tools.codeMode": "Code Mode",
@@ -396,7 +403,6 @@ export const FIELD_LABELS: Record<string, string> = {
   "agents.defaults.compaction.notifyUser": "Compaction Notify User",
   "agents.defaults.compaction.memoryFlush": "Compaction Memory Flush",
   "agents.defaults.compaction.memoryFlush.enabled": "Compaction Memory Flush Enabled",
-  "agents.defaults.compaction.memoryFlush.model": "Compaction Memory Flush Model Override",
   "agents.defaults.compaction.memoryFlush.softThresholdTokens":
     "Compaction Memory Flush Soft Threshold",
   "agents.defaults.compaction.memoryFlush.forceFlushTranscriptBytes":
@@ -462,6 +468,7 @@ export const FIELD_LABELS: Record<string, string> = {
   ui: "UI",
   "ui.seamColor": "Accent Color",
   "ui.prefs.accent": "User Accent Color",
+  "ui.prefs.locale": "Interface language",
   tui: "Terminal UI",
   "tui.footer": "Terminal UI Footer",
   "tools.exec.timeoutSeconds": "Exec Timeout (Seconds)",
@@ -618,7 +625,7 @@ export const FIELD_LABELS: Record<string, string> = {
   "plugins.load.paths": "Plugin Load Paths",
   "plugins.slots": "Plugin Slots",
   "plugins.slots.memory": "Memory Plugin",
-  "plugins.slots.contextEngine": "Context Engine Plugin",
+  "plugins.slots.contextEngine": "Context Engine ID",
   "plugins.entries": "Plugin Entries",
   "plugins.entries.*.enabled": "Plugin Enabled",
   "plugins.entries.*.hooks": "Plugin Hook Policy",

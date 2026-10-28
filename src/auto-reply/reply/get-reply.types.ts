@@ -26,7 +26,6 @@ import type { MsgContext } from "../templating.js";
 import type { VerboseLevel } from "../thinking.js";
 import type { CommandSessionMetadataChange } from "./command-session-metadata.js";
 import type { PreparedReplyConversation } from "./prompt-session-context.js";
-import type { QueuedFollowupReplyDelivery } from "./queue/types.js";
 import type { ReplyOptionsWithOperationRunState } from "./reply-operation-run-state.js";
 import type { ReplySourceBinding } from "./reply-source-binding.types.js";
 import type {
@@ -54,7 +53,13 @@ export type ReplyRunVerbosity = {
 type InternalReplySessionOptions = {
   /** Dispatch-owned command requester binding; never part of the public plugin API. */
   withCommandNativeSubagents?: <T>(
-    binding: { agentId: string; sessionKey: string; entry: SessionEntry },
+    binding: {
+      agentId: string;
+      sessionKey: string;
+      entry: SessionEntry;
+      storePath?: string;
+      commandBody?: string;
+    },
     run: (
       create:
         | import("../../plugins/runtime/native-subagent-context.js").NativeSubagentCommandFactory
@@ -103,9 +108,7 @@ type InternalReplySessionOptions = {
   resolveReplyDelivery?: ReplyDeliveryObserver;
   /** Distinguishes committed source-tool custody from ordinary transcript presentation. */
   resolveReplyDeliveryFacts?: ReplyDeliveryFactsObserver;
-  /** Heartbeat-owner policy: only an admitted current source permits implicit message replies. */
-  requireExplicitMessageTarget?: boolean;
-  /** Retire the run's bundle MCP runtime at settlement. Set by one-shot isolated runs (isolated heartbeats) whose session ID is never reused. */
+  /** Retire the run's bundle MCP runtime at settlement. Set by one-shot isolated runs whose session ID is never reused. */
   cleanupBundleMcpOnRunEnd?: boolean;
   /** Defers child completion until the waiting status or explicit silent handoff settles. */
   onPendingContinuation?: (settlement?: PendingContinuationSettlement) => void;
@@ -127,8 +130,6 @@ type InternalReplySessionOptions = {
   requestedSessionId?: string;
   resumeRequestedSession?: boolean;
   sessionPromptSourceReplyDeliveryMode?: GetReplyOptions["sourceReplyDeliveryMode"];
-  /** Delivers queued replies only through their originating Gateway admission. */
-  onQueuedFollowupReplyBatch?: QueuedFollowupReplyDelivery;
   /** Overrides persisted queue mode for this reply only. */
   queueModeOverride?: QueueMode;
   /** Dispatch-owned operation used to defer hooks until durable run admission. */

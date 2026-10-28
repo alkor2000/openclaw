@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import { Command } from "commander";
 import { afterEach, expect, it, vi } from "vitest";
+import { createWizardPrompter } from "../../test/helpers/wizard-prompter.js";
 import { requireValidConfigFileSnapshot } from "../commands/config-validation.js";
 import { readConfigFileSnapshot } from "../config/io.js";
 import { defaultRuntime, ExitError, type RuntimeEnv } from "../runtime.js";
@@ -65,7 +66,18 @@ async function validateConfig(host: RuntimeEnv, json: boolean) {
 
 it.each([
   ["config validate", (host) => validateConfig(host, false)],
-  ["JSON config validate", (host) => validateConfig(host, true), true],
+  [
+    "JSON config validate",
+    (host) => validateConfig(host, true),
+    true,
+    ["config", "validate", "--json"],
+  ],
+  [
+    "baseline setup",
+    async (host) => (await import("../commands/setup.js")).setupCommand({ json: true }, host),
+    true,
+    ["setup", "--baseline", "--json"],
+  ],
   ["gateway restart readiness", ready(["gateway", "restart"])],
   ["command readiness", ready()],
   ["JSON command readiness", ready(), true],
@@ -75,12 +87,16 @@ it.each([
     async (host) =>
       ensureValidConfigSnapshotForCli(await readConfigFileSnapshot({ observe: false }), host),
   ],
-] satisfies [string, (host: RuntimeEnv) => unknown, boolean?][])(
+] satisfies [string, (host: RuntimeEnv) => unknown, boolean?, string[]?][])(
   "%s reports unavailable metadata without suggesting config repair",
-  async (_name, run, json?: boolean) =>
+  async (_name, run, json?: boolean, argv?: string[]) =>
     withConfig(unreadableConfig, async (host) => {
       if (json) {
-        process.argv = [process.execPath, "openclaw", "config", "get", "gateway", "--json"];
+        process.argv = [
+          process.execPath,
+          "openclaw",
+          ...(argv ?? ["config", "get", "gateway", "--json"]),
+        ];
       }
       await expect(run(host)).rejects.toMatchObject({ name: "ExitError", code: 1 });
       const diagnostic = [
@@ -125,3 +141,19 @@ it.each([
     expect(diagnostic).not.toContain("config could not be read");
   }),
 );
+
+it("stops classic setup on a read failure before consent or mutation", async () =>
+  withConfig(unreadableConfig, async (host) => {
+    const { runSetupWizard } = await import("../wizard/setup.js");
+    const prompter = createWizardPrompter();
+    await expect(runSetupWizard({ acceptRisk: true }, host, prompter)).rejects.toMatchObject({
+      name: "ExitError",
+      code: 1,
+    });
+    expect(prompter.outro).toHaveBeenCalledWith(expect.stringContaining(missingInclude));
+    expect(prompter.outro).toHaveBeenCalledWith(expect.stringContaining(unreadable));
+    expect(vi.mocked(prompter.outro).mock.calls.flat().join("\n")).not.toContain("doctor --fix");
+    expect(prompter.select).not.toHaveBeenCalled();
+    expect(prompter.confirm).not.toHaveBeenCalled();
+    expect(prompter.note).not.toHaveBeenCalled();
+  }));

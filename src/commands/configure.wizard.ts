@@ -1,12 +1,15 @@
 import nodePath from "node:path";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { note } from "../../packages/terminal-core/src/note.js";
+import { terminalText } from "../../packages/terminal-core/src/safe-text.js";
 import {
   listAgentIds,
   tryResolveAmbientOwnerAgentId,
   tryResolveLegacyCompatibilityAgentId,
 } from "../agents/agent-scope-config.js";
 import { describeCodexNativeWebSearch } from "../agents/codex-native-web-search.shared.js";
+import { formatCliCommand } from "../cli/command-format.js";
+import { formatConfigReadFailureForCli } from "../cli/config-validation-output.js";
 import { readConfigFileSnapshotForWrite, resolveGatewayPort } from "../config/config.js";
 import { logConfigUpdated } from "../config/logging.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -23,7 +26,6 @@ import { createClackPrompter } from "../wizard/clack-prompter.js";
 import { WizardCancelledError } from "../wizard/prompts.js";
 import { writeWizardConfigFile } from "../wizard/setup.shared.js";
 import { removeChannelConfigWizard } from "./configure.channels.js";
-import { checkConfigureConfigSnapshot } from "./configure.config.js";
 import { maybeInstallDaemon, type DaemonSetupOutcome } from "./configure.daemon.js";
 import { promptAuthConfig } from "./configure.gateway-auth.js";
 import {
@@ -46,6 +48,7 @@ import {
   probeGatewayReachable,
   resolveAdvertisedControlUiLinks,
   resolveLocalControlUiProbeLinks,
+  summarizeExistingConfig,
   waitForGatewayReachable,
 } from "./onboard-helpers.js";
 import { promptRemoteGatewayConfig } from "./onboard-remote.js";
@@ -143,7 +146,7 @@ async function promptWebToolsConfig(
       if (enableCodexNative) {
         configureManagedProvider = await prompts.confirm({
           message: existingSearch?.provider
-            ? `Change the separate web search provider (currently ${existingSearch.provider})?`
+            ? terminalText`Change the separate web search provider (currently ${existingSearch.provider})?`
             : "Also configure a separate web search provider for other models?",
           initialValue: Boolean(existingSearch?.provider),
         });
@@ -227,7 +230,10 @@ export async function runConfigureWizard(opts: { sections?: WizardSection[] }) {
 
     const prepared = await readConfigFileSnapshotForWrite();
     const snapshot = prepared.snapshot;
-    if (!checkConfigureConfigSnapshot(snapshot, runtime)) {
+    const readFailure = formatConfigReadFailureForCli(snapshot);
+    if (readFailure) {
+      outro(readFailure);
+      runtime.exit(1);
       return;
     }
     // Keep only path ownership across the interactive wizard. Each commit re-reads under
@@ -243,6 +249,28 @@ export async function runConfigureWizard(opts: { sections?: WizardSection[] }) {
     const baseConfig: OpenClawConfig = snapshot.valid
       ? (snapshot.sourceConfig ?? snapshot.config)
       : {};
+
+    if (snapshot.exists) {
+      const title = snapshot.valid ? "Existing config detected" : "Invalid config";
+      note(summarizeExistingConfig(baseConfig), title);
+      if (!snapshot.valid && snapshot.issues.length > 0) {
+        note(
+          [
+            ...snapshot.issues.map((iss) => terminalText`- ${iss.path}: ${iss.message}`),
+            "",
+            "Docs: https://docs.openclaw.ai/gateway/configuration",
+          ].join("\n"),
+          "Config issues",
+        );
+      }
+      if (!snapshot.valid) {
+        outro(
+          `Config invalid. Run \`${formatCliCommand("openclaw doctor --fix")}\` to apply supported repairs, then re-run configure.`,
+        );
+        runtime.exit(1);
+        return;
+      }
+    }
 
     const selectedSections = opts.sections;
     const shouldPromptGatewayRunMode =
@@ -307,8 +335,8 @@ export async function runConfigureWizard(opts: { sections?: WizardSection[] }) {
             hint: !remoteUrl
               ? "No remote URL configured yet"
               : remoteProbe?.ok
-                ? `Gateway reachable (${remoteUrl})`
-                : `Configured but unreachable (${remoteUrl})`,
+                ? terminalText`Gateway reachable (${remoteUrl})`
+                : terminalText`Configured but unreachable (${remoteUrl})`,
           },
         ],
       });
@@ -425,7 +453,7 @@ export async function runConfigureWizard(opts: { sections?: WizardSection[] }) {
         if (hasExistingContent) {
           note(
             [
-              `Existing workspace detected at ${workspaceDir}`,
+              terminalText`Existing workspace detected at ${workspaceDir}`,
               "Existing files are preserved. Missing templates may be created, never overwritten.",
             ].join("\n"),
             "Existing workspace",
@@ -683,13 +711,13 @@ export async function runConfigureWizard(opts: { sections?: WizardSection[] }) {
       ? "Gateway: auth unavailable (check skipped)"
       : gatewayProbe.ok
         ? "Gateway: reachable"
-        : `Gateway: not detected${gatewayProbe.detail ? ` (${gatewayProbe.detail})` : ""}`;
+        : terminalText`Gateway: not detected${gatewayProbe.detail ? ` (${gatewayProbe.detail})` : ""}`;
     const windowsFirewallLines = formatWindowsGatewayFirewallGuidance({ bind });
 
     note(
       [
-        `Web UI: ${displayLinks.httpUrl}`,
-        `Gateway WS: ${displayLinks.wsUrl}`,
+        terminalText`Web UI: ${displayLinks.httpUrl}`,
+        terminalText`Gateway WS: ${displayLinks.wsUrl}`,
         gatewayStatusLine,
         ...windowsFirewallLines,
         "Docs: https://docs.openclaw.ai/web/control-ui",

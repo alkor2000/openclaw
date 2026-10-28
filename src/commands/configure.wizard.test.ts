@@ -61,10 +61,19 @@ describe("runConfigureWizard", () => {
       ...EMPTY_CONFIG_SNAPSHOT,
       exists: true,
       valid: false,
-      issues: [{ path: "browser.actionTimeoutTypoMs", message: "Unknown key" }],
+      issues: [
+        {
+          path: "browser.\u001b[31mactionTimeoutTypoMs\u001b[0m\u202e",
+          message: "Unknown\nkey\tvalue",
+        },
+      ],
     });
     const runtime = mocks.runtime;
     await runConfigureWizard({});
+    expect(mocks.note).toHaveBeenCalledWith(
+      "- browser.actionTimeoutTypoMs: Unknown\\nkey\\tvalue\n\nDocs: https://docs.openclaw.ai/gateway/configuration",
+      "Config issues",
+    );
     expect(mocks.clackOutro).toHaveBeenCalledWith(
       "Config invalid. Run `openclaw doctor --fix` to apply supported repairs, then re-run configure.",
     );
@@ -206,8 +215,8 @@ describe("runConfigureWizard", () => {
     await expect(runConfigureWizard({ sections: ["workspace"] })).rejects.toThrow(
       "config path changed since last load",
     );
-    expect(mocks.replaceConfigFile).toHaveBeenCalledOnce();
-    expect(mocks.readConfigFileSnapshot).toHaveBeenCalledTimes(2);
+    expect(mocks.replaceConfigFile).not.toHaveBeenCalled();
+    expect(mocks.readConfigFileSnapshot).toHaveBeenCalledOnce();
     expect(mocks.writeConfigFile).not.toHaveBeenCalled();
   });
 

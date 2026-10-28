@@ -11,28 +11,12 @@ vi.mock("./windows-user-sid.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./windows-user-sid.js")>()),
   readWindowsUserSid: windowsSid,
 }));
+// mock-isolation: Native ancestry would otherwise read real host PIDs behind the synthetic table.
+vi.mock("@openclaw/proc-safe/identity", () => ({ readProcessAncestry: () => null }));
 vi.mock("../shared/pid-alive.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../shared/pid-alive.js")>()),
   isPidDefinitelyDead: () => false,
 }));
-// Synthetic package identities keep Windows path classification independent of the host.
-vi.mock("node:fs", async (importOriginal) => {
-  const fs = await importOriginal<typeof import("node:fs")>();
-  const io = {
-    readFileSync: (file: string) =>
-      JSON.stringify({
-        name:
-          file.replaceAll("\\", "/").replace(/^[A-Za-z]:/, "") === "/app/package.json"
-            ? "openclaw"
-            : "unrelated-service",
-      }),
-    realpathSync: (file: string) => file,
-    statSync: () => ({ isDirectory: () => false }),
-    readdirSync: () => [],
-    readlinkSync: () => "/app",
-  };
-  return { ...fs, ...io, default: { ...fs, ...io } };
-});
 import { inspectOtherOpenClawProcesses } from "./openclaw-process-census.js";
 
 const self = process.pid;

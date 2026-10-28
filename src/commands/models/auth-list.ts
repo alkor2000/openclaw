@@ -1,5 +1,5 @@
 import { timestampMsToIsoString } from "@openclaw/normalization-core/number-coercion";
-import { sanitizeTerminalText } from "../../../packages/terminal-core/src/safe-text.js";
+import { terminalText } from "../../../packages/terminal-core/src/safe-text.js";
 import {
   ensureAuthProfileStoreAsync,
   externalCliDiscoveryForProviderAuth,
@@ -104,17 +104,16 @@ export async function modelsAuthListCommand(
     return;
   }
 
-  const logLine = (line: string) => runtime.log(sanitizeTerminalText(line));
-  logLine(`Agent: ${agentId}`);
-  logLine(`Auth state store: ${authStatePath}`);
+  runtime.log(terminalText`Agent: ${agentId}`);
+  runtime.log(terminalText`Auth state store: ${authStatePath}`);
   if (provider) {
-    logLine(`Provider: ${provider}`);
+    runtime.log(terminalText`Provider: ${provider}`);
   }
   if (profiles.length === 0) {
-    logLine("Profiles: (none)");
+    runtime.log("Profiles: (none)");
     return;
   }
-  logLine("Profiles:");
+  runtime.log("Profiles:");
   for (const profile of profiles) {
     const details = [`${profile.provider}/${profile.type}`];
     if (profile.expiresAt) {
@@ -138,8 +137,8 @@ export async function modelsAuthListCommand(
         `disabled${profile.disabledReason ? `:${profile.disabledReason}` : ""} until ${profile.disabledUntil}`,
       );
     }
-    logLine(
-      `- ${profile.label} [${details.join("; ")}]${profile.recoveryHint ? ` — ${profile.recoveryHint}` : ""}`,
+    runtime.log(
+      terminalText`- ${profile.label} [${details.join("; ")}]${profile.recoveryHint ? ` — ${profile.recoveryHint}` : ""}`,
     );
   }
 }

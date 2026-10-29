@@ -180,7 +180,6 @@ async function submitRealTurn(input: {
     hasBaselineTools: () => session.getActiveToolNames().length > 0,
     applyPromptBuildToolsAllow: () => ["lookup"],
     setActiveSessionSystemPrompt: (text) => session.setBaseSystemPrompt(text),
-    setLeasedSteering: () => {},
   });
   using promptStateLease = retainEmbeddedSessionPromptState(attempt.sessionId);
   const promptState = promptStateLease.state;
@@ -223,9 +222,7 @@ async function submitRealTurn(input: {
     toolResultPromptProjectionState: promptState.toolResults,
     trajectoryRecorder: null,
     transcriptLeafId: assembly.transcriptLeafId,
-    leasedSteering: assembly.leasedSteering,
     onFinalPromptText: () => {},
-    onSteeringAcknowledged: () => {},
     assertHostActive: assembly.assertHostActive,
     withTranscriptWrite: (write) => withSessionManagerWrite(manager, write),
     persistToolResultProjections: async () => {},

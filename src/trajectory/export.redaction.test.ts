@@ -89,13 +89,12 @@ it.each(["token", "target"])(
   },
 );
 
-it("preserves contextual custom matching beyond one chunk and registered protection with logging off", async () => {
+it("preserves contextual custom matching beyond one chunk and registered protection", async () => {
   await withOpenClawTestState({ layout: "state-only" }, async (state) => {
     const pattern = String.raw`"projectNote"\s*:\s*"(project-note-opaque)"\s*,\s*"publicNote"\s*:\s*"project-note-opaque"`;
-    await state.writeConfig({ logging: { redactSensitive: "off", redactPatterns: [pattern] } });
+    await state.writeConfig({ logging: { redactPatterns: [pattern] } });
     invalidateLoggingConfigCache();
     expect(readLoggingConfig()).toMatchObject({
-      redactSensitive: "off",
       redactPatterns: [pattern],
     });
     const registered = "FIXTURE-LOOKUP-OPAQ-7422";

@@ -550,8 +550,8 @@ retain whole-installation behavior for homogeneous eligible families; mixed
 selections require `--family`.
 
 Mixed installations support matched backup/restore and compatible updates.
-Whole-installation backups containing any PostgreSQL store require offline
-custody. [Archive restore](#restore-all-postgresql-stores) imports captured
+Whole-installation archives containing PostgreSQL stores can be created while the
+Gateway runs; restore requires offline custody. [Archive restore](#restore-all-postgresql-stores) imports captured
 PostgreSQL stores into fresh namespaces and publishes matching local anchors.
 Updates require candidate proof of family-override support as well as support
 for each selected or retained PostgreSQL family.
@@ -660,11 +660,16 @@ the original data; never edit metadata or discard an anchor to force admission.
 
 ### Capture both server data and local state
 
-Stop the Gateway and embedded writers before capturing PostgreSQL. Then run:
+Run this while the Gateway is up or stopped:
 
 ```bash
 openclaw backup create --output ~/Backups/openclaw --verify
 ```
+
+With the Gateway running, each PostgreSQL store is exported from its own
+`REPEATABLE READ READ ONLY` snapshot while the Gateway keeps serving; stores are
+not captured at one shared instant. Sequence allocation facts are read inside
+that snapshot, so a restored store never reissues a captured row ID.
 
 The archive combines local files and SQLite images with each actual PostgreSQL
 store's matched **format-2 envelope**: original anchor, portable SQLite export image, and manifest
@@ -676,7 +681,10 @@ SecretRef values separately during recovery.
 User backups apply the owning stores' sanitization rules. They are not the
 exact unsanitized captures used for updater recovery. SQLite and PostgreSQL Git
 exports apply the same `--exclude-secrets` policy, including credential tables,
-machine-state keys, and generated model-catalog credentials. Keep Logbook images, cold
+machine-state keys, generated model-catalog credentials, and identified bundled
+plugin credential namespaces. Nonsecret plugin state and blobs remain in redacted
+exports; see [Git backup redaction](/cli/backup#versioned-git-backups)
+for the credential scopes and restore requirements. Keep Logbook images, cold
 transcript blobs, workspaces, config includes, and local state with the database
 backup. Neither a server dump alone nor a copied anchor covers the installation.
 
@@ -818,6 +826,21 @@ family overrides also require successful candidate admission of the complete
 selection; global PostgreSQL support alone is insufficient. A target without
 that proof is refused. A raw package-manager downgrade does not provide this
 guard.
+
+Agent schema admission recognizes the local PostgreSQL anchor and reads the
+matching server store's version without migrating it. An older server schema can
+therefore reach the stopped-writer migration phase; a newer schema or mismatched
+anchor identity still refuses the update.
+
+Update Doctor and `openclaw update repair` select the configured engines before
+reading maintenance state. Doctor inspects configured PostgreSQL agents without
+opening them as runtime stores, then applies their forward migrations with writers
+stopped. Transcript migration detection uses the selected engine's catalog. The local
+anchors remain identity files; SQLite repair and reclamation leave them untouched.
+Gateway startup still requires the completed PostgreSQL migration.
+The delegated update Doctor installs the same one-shot database role as standalone
+Doctor before maintenance, so its PostgreSQL reads and cleanup can finish. This
+repair must be present in the candidate runtime; Gateway access remains worker-only.
 
 Before mutation, the updater captures exact PostgreSQL rows, sequence allocation
 state, schema facts, and matching anchors alongside local SQLite state and config.

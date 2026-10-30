@@ -336,6 +336,8 @@ it.each([
       expect(fs.statSync(young.root).mtimeMs).toBe(mtime);
     }
     expect(log).toContain("Skipped SQLite snapshot reclamation");
+    expect(log).toContain(path.basename(unknown.root));
+    expect(log).toContain(path.basename(unknownFile));
     expect(fs.readFileSync(young.location).equals(bytes)).toBe(true);
     expect(fs.readFileSync(unknown.location).equals(bytes)).toBe(true);
     expect(fs.readFileSync(unknownFile, "utf8")).toBe("preserve");

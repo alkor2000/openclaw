@@ -131,7 +131,7 @@ export function beginSqliteSnapshotRetirement(
           payload.push(location);
         }
       } else {
-        throw new Error("Unrecognized snapshot artifact");
+        throw new Error(`Unrecognized snapshot artifact: ${location}`);
       }
     }
     if (newest >= cutoff) {

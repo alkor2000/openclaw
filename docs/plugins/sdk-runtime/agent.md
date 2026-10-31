@@ -10,6 +10,14 @@ sidebarTitle: "Agent and sessions"
 
 The agent, session, transcript, and sandbox surfaces of `api.runtime`, plus the request-bound capabilities a plugin command handler receives. Part of the [Plugin runtime helpers](/plugins/sdk-runtime) reference.
 
+## CLI agent selection
+
+Use `resolveAgentOperationAgentId(config)` from
+`openclaw/plugin-sdk/agent-scope-runtime` for CLI operations without an explicit
+agent. It honors the configured system agent in explicit multi-agent rosters,
+while preserving sole-agent and supported legacy defaults. This does not change
+session or Gateway surfaces that require an explicit agent owner.
+
 ## Plugin command runtime helpers
 
 Plugin command handlers receive request-bound capabilities through

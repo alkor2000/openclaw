@@ -839,6 +839,26 @@ describe("memory-wiki cli", () => {
   describe("memory-wiki agent-scoped cli", () => {
     const appConfig = { agents: { entries: { support: {}, marketing: {} } } };
 
+    it.each([
+      { agentId: "support", flags: [] },
+      { agentId: "marketing", flags: ["--agent", "marketing"] },
+    ])("selects $agentId with a configured system agent", async ({ agentId, flags }) => {
+      const { rootDir, config } = await createCliVault({ config: { vault: { scope: "agent" } } });
+      const output = await runWiki(
+        config,
+        ["status", "--json", ...flags],
+        {
+          agents: {
+            ownership: "explicit",
+            defaults: { systemAgent: { agentId: "support" } },
+            entries: appConfig.agents.entries,
+          },
+        },
+        true,
+      );
+      expect(JSON.parse(output)).toMatchObject({ agentId, vaultPath: path.join(rootDir, agentId) });
+    });
+
     it("gives actionable agent-selection guidance for a multi-agent roster", async () => {
       const { config } = await createCliVault({ config: { vault: { scope: "agent" } } });
       await expect(

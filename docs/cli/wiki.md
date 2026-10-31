@@ -64,7 +64,8 @@ openclaw wiki ingest ./campaign-notes.md --agent marketing
 ```
 
 When `--agent` is omitted, CLI operations use the configured default agent,
-matching other agent-scoped CLI families. Pass the flag to select a different
+including `agents.defaults.systemAgent.agentId` in an explicit multi-agent
+configuration, matching other agent-scoped CLI families. Pass the flag to select a different
 agent. Unknown agent ids fail before the vault operation starts. If no default
 can be resolved, the error tells you to pass `--agent <id>` or configure an
 agent. The option does not change the selected path when `vault.scope` is

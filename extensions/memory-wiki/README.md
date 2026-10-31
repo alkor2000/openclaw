@@ -109,7 +109,8 @@ expansion keep their existing behavior.
 Wiki tools and compiled prompt/corpus supplements resolve the active runtime
 agent on each call. In bridge mode, an agent vault imports only public memory
 artifacts whose `agentIds` includes that agent; unowned and other-agent
-artifacts are skipped. CLI operations use the configured default agent unless
+artifacts are skipped. CLI operations use the configured operation owner, including
+`agents.defaults.systemAgent.agentId` in explicit multi-agent configurations, unless
 the command passes `--agent <agentId>`; Gateway operations in multi-agent
 setups require `agentId` on the `wiki.*` RPC request.
 

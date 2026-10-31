@@ -12,6 +12,8 @@ import {
 } from "../agents/agent-scope.js";
 import { resolvePersistedSessionStoreOwnerForKey } from "../config/sessions/session-store-owner.js";
 
+export { resolveAgentOperationAgentId } from "../agents/agent-scope-config.js";
+
 export {
   resolveAgentConfig,
   resolveAgentDir,
